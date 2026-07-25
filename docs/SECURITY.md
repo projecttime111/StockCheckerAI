@@ -46,7 +46,6 @@ Real user registrations require email verification by default:
 ```env
 APP_AUTH_REQUIRE_EMAIL_VERIFICATION=true
 APP_PUBLIC_URL=https://your-vercel-app.vercel.app
-BACKEND_PUBLIC_URL=https://your-render-backend.onrender.com
 EMAIL_PROVIDER=local
 EMAIL_FROM=StockPilot AI <noreply@example.com>
 ```
@@ -81,7 +80,7 @@ NEXT_PUBLIC_GOOGLE_CLIENT_ID=your-google-oauth-web-client-id
 
 `GOOGLE_CLIENT_ID` belongs to the Spring Boot backend deployment. `NEXT_PUBLIC_GOOGLE_CLIENT_ID` belongs to the Next.js deployment. The backend rejects missing, invalid, unverified, or wrong-audience Google tokens. If a Google email already exists as a password account, the verified Google subject is linked to that same account instead of creating a duplicate user.
 
-In Google Cloud Console, add only trusted frontend origins such as `https://stockcheckerai.vercel.app` and local development origins such as `http://localhost:3000` when needed. Do not put Google client secrets in this app; the current flow uses public web client IDs plus backend ID-token verification.
+In Google Cloud Console, add only trusted frontend origins such as `https://your-project.vercel.app` and local development origins such as `http://localhost:3000` when needed. Do not put Google client secrets in this app; the current flow uses public web client IDs plus backend ID-token verification.
 
 Automated guardrails live in `TenantIsolationGuardrailTest`. The test scans backend source for:
 

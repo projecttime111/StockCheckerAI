@@ -82,7 +82,6 @@ $env:DATABASE_PASSWORD="stockpilot"
 $env:APP_DEMO_SEED_ENABLED="false"
 $env:APP_DEV_TOOLS_ENABLED="false"
 $env:CACHE_TYPE="simple"
-$env:STORAGE_MODE="local"
 $env:LOCAL_STORAGE_ROOT="uploads"
 .\mvnw.cmd spring-boot:run -Dspring-boot.run.profiles=dev
 ```

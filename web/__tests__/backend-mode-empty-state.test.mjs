@@ -21,6 +21,16 @@ test("backend mode keeps demo API behind the env flag", () => {
   assert.doesNotMatch(home, /redirect\("\/"\)/);
 });
 
+test("production backend mode rejects a missing or insecure API URL", () => {
+  const api = read("lib/api.ts");
+
+  assert.match(api, /NODE_ENV === "production" && !DEMO_MODE/);
+  assert.match(api, /NEXT_PUBLIC_API_URL is required for a production backend-mode build/);
+  assert.match(api, /process\.env\.VERCEL === "1"/);
+  assert.match(api, /NEXT_PUBLIC_API_URL must use HTTPS for a Vercel production backend-mode build/);
+  assert.ok(api.includes('.replace(/\\/+$/, "")'));
+});
+
 test("local registration returns users to login while production keeps verification enabled", () => {
   const register = read("app/register/page.tsx");
   const localConfig = read("../backend/src/main/resources/application.yml");

@@ -83,6 +83,12 @@ Start the local stack:
 docker compose up --build
 ```
 
+To run the backend directly with the ignored root `.env` file:
+
+```bash
+./backend/scripts/run-with-root-env.sh
+```
+
 Backend API: `http://localhost:8080`
 
 API docs: `http://localhost:8080/swagger-ui.html`
@@ -117,6 +123,16 @@ cd backend
 
 On macOS/Linux, use `./mvnw` instead of `.\mvnw.cmd`.
 
+If macOS resolves an older Java first, point the current terminal at a JDK 21 or
+newer installation before starting the backend. This machine's Homebrew JDK can
+be selected with:
+
+```bash
+export JAVA_HOME="$(brew --prefix openjdk)/libexec/openjdk.jdk/Contents/Home"
+export PATH="$(brew --prefix openjdk)/bin:$PATH"
+java -version
+```
+
 If Windows resolves Java 8 first, set Java 21 for the current terminal before running backend commands:
 
 ```powershell
@@ -136,7 +152,6 @@ Email verification is disabled by default for local development, so a new accoun
 ```powershell
 $env:APP_AUTH_REQUIRE_EMAIL_VERIFICATION="true"
 $env:APP_PUBLIC_URL="https://your-vercel-app.vercel.app"
-$env:BACKEND_PUBLIC_URL="https://your-render-backend.onrender.com"
 $env:EMAIL_PROVIDER="resend"
 $env:EMAIL_FROM="StockPilot AI <noreply@yourdomain.com>"
 $env:RESEND_API_KEY="your-resend-api-key"
@@ -154,7 +169,7 @@ For Vercel, also set:
 NEXT_PUBLIC_GOOGLE_CLIENT_ID=your-google-oauth-web-client-id
 ```
 
-Add your Vercel domain, for example `https://stockcheckerai.vercel.app`, as an authorized JavaScript origin in Google Cloud Console. Without these variables, email/password still works, but Google sign-in is shown as not configured.
+Add your final Vercel domain, for example `https://your-project.vercel.app`, as an authorized JavaScript origin in Google Cloud Console. Without these variables, email/password still works, but Google sign-in is shown as not configured.
 
 For test-only local shortcuts, `APP_AUTH_REQUIRE_EMAIL_VERIFICATION=false` restores immediate login after registration. Do not disable verification in production.
 
@@ -418,7 +433,7 @@ See `docs/RBAC_COMPARISON.md` for the comparison between the enterprise RBAC pro
 
 ## Production Deployment Checklist
 
-For Neon PostgreSQL, including separate pooled runtime/direct migration URLs and the repeat-safe demo seed command, see [Neon PostgreSQL Deployment](docs/NEON_DEPLOYMENT.md).
+For the clean GitHub → Render → Vercel deployment flow, the exact backend/frontend variables, Neon URL handling, and smoke checks, see [Production Deployment](docs/NEON_DEPLOYMENT.md).
 
 - Set `SPRING_PROFILES_ACTIVE=prod` on the backend host. Production configuration requires explicit database, JWT, CORS, public URL, and email values and forces demo seeding, dev tools, and public Swagger off.
 - Replace all demo secrets and rotate JWT signing key.

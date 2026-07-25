@@ -75,7 +75,6 @@ app:
     email-cooldown-seconds: ${APP_AUTH_EMAIL_COOLDOWN_SECONDS:60}
     google-client-id: ${GOOGLE_CLIENT_ID:}
   public-url: ${APP_PUBLIC_URL:http://localhost:3000}
-  backend-public-url: ${BACKEND_PUBLIC_URL:http://localhost:8080}
   email:
     provider: ${EMAIL_PROVIDER:local}
     from: ${EMAIL_FROM:StockPilot AI <noreply@example.com>}
@@ -83,12 +82,8 @@ app:
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000,http://127.0.0.1:3000}
   storage:
-    mode: ${STORAGE_MODE:local}
     local-root: ${LOCAL_STORAGE_ROOT:uploads}
-    minio-endpoint: ${MINIO_ENDPOINT:http://localhost:9000}
-    minio-bucket: ${MINIO_BUCKET:stockpilot-imports}
   ai:
-    provider: ${AI_PROVIDER:local}
     llm-endpoint: ${LLM_ENDPOINT:}
     llm-api-key: ${LLM_API_KEY:}
   demo:

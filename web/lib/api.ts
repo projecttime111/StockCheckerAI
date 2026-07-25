@@ -1,7 +1,18 @@
 import { demoApi } from "./demoApi";
 
-export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 export const DEMO_MODE = process.env.NEXT_PUBLIC_DEMO_MODE === "true";
+const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/\/+$/, "");
+
+if (process.env.NODE_ENV === "production" && !DEMO_MODE) {
+  if (!configuredApiUrl) {
+    throw new Error("NEXT_PUBLIC_API_URL is required for a production backend-mode build");
+  }
+  if (process.env.VERCEL === "1" && !configuredApiUrl.startsWith("https://")) {
+    throw new Error("NEXT_PUBLIC_API_URL must use HTTPS for a Vercel production backend-mode build");
+  }
+}
+
+export const API_URL = configuredApiUrl ?? "http://localhost:8080";
 
 export function isDemoMode() {
   return DEMO_MODE;

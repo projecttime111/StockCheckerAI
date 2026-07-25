@@ -67,7 +67,6 @@ services:
       RABBITMQ_PASSWORD: stockpilot
       MANAGEMENT_HEALTH_REDIS_ENABLED: "true"
       MANAGEMENT_HEALTH_RABBIT_ENABLED: "true"
-      STORAGE_MODE: local
       LOCAL_STORAGE_ROOT: /app/uploads
       JWT_SECRET: change-me-to-a-very-long-random-secret-before-production
       CORS_ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
