@@ -46,3 +46,15 @@ services:
         value: "false"
       - key: LOCAL_STORAGE_ROOT
         value: /app/uploads
+      - key: SENTRY_ENABLED
+        value: "false"
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_ENVIRONMENT
+        value: production
+      - key: SENTRY_TRACES_SAMPLE_RATE
+        value: "0.0"
+      - key: LOG_LEVEL_ROOT
+        value: INFO
+      - key: LOG_LEVEL_APP
+        value: INFO

@@ -240,8 +240,17 @@ Add only when needed:
 | `IMPORT_MAX_UPLOAD_SIZE` | Defaults to upload max size |
 | `LLM_ENDPOINT` | Optional provider endpoint; blank keeps local behavior |
 | `LLM_API_KEY` | Optional provider key; blank keeps local behavior |
+| `LOG_LEVEL_ROOT` | Default `INFO`; keep this level in production |
+| `LOG_LEVEL_APP` | Default `INFO`; temporarily use `DEBUG` only while investigating |
+| `SENTRY_ENABLED` | Default `false`; set `true` only after adding a backend Sentry DSN |
+| `SENTRY_DSN` | Optional backend Sentry project DSN |
+| `SENTRY_ENVIRONMENT` | Default `local`; use `production` on Render |
+| `SENTRY_RELEASE` | Optional deployed commit SHA or release label |
+| `SENTRY_TRACES_SAMPLE_RATE` | Default `0.0`; error reporting works without tracing |
 
 The copyable backend checklist is [`.env.neon.example`](../.env.neon.example).
+For log locations, request-ID debugging, and optional Sentry setup, see
+[Production Logging and Error Monitoring](PRODUCTION_LOGGING.md).
 
 ### Email not ready yet
 
@@ -283,6 +292,11 @@ same public Web client ID in Render's `GOOGLE_CLIENT_ID`.
 
 Do not add a trailing slash to `NEXT_PUBLIC_API_URL`. Never add `DATABASE_URL`,
 database credentials, `JWT_SECRET`, or `RESEND_API_KEY` to Vercel.
+
+Sentry is optional and disabled when its DSNs are blank. If it is enabled, use the
+frontend variables and private source-map upload values documented in
+[Production Logging and Error Monitoring](PRODUCTION_LOGGING.md). Never expose
+`SENTRY_AUTH_TOKEN` as a `NEXT_PUBLIC_` variable.
 
 Add the variables to **Production** (and Preview only if preview deployments must
 call the production API), then redeploy. Vercel applies changed environment
@@ -387,7 +401,9 @@ uploaded file.
 7. Confirm browser network requests go to Render, never `localhost` or Neon.
 8. Register, verify the email, log in, create a product, and refresh.
 9. Confirm the product remains after refresh and a Render restart.
-10. Check Render logs for Flyway completion and Neon connection errors.
+10. Check Render logs for Flyway completion and Neon connection errors. For an API
+    failure, copy `X-Request-Id` from the browser response and search that value in
+    the Render log explorer.
 
 If the Render health check fails, inspect the first startup exception. The most
 common causes are a non-JDBC database URL, wrong Neon role/password, missing

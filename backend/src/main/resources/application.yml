@@ -44,6 +44,20 @@ server:
   error:
     include-stacktrace: never
 
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.stockpilot.ai: ${LOG_LEVEL_APP:INFO}
+    org.hibernate.SQL: ${LOG_LEVEL_HIBERNATE_SQL:WARN}
+
+sentry:
+  enabled: ${SENTRY_ENABLED:false}
+  dsn: ${SENTRY_DSN:}
+  environment: ${SENTRY_ENVIRONMENT:local}
+  release: ${SENTRY_RELEASE:}
+  traces-sample-rate: ${SENTRY_TRACES_SAMPLE_RATE:0.0}
+  send-default-pii: false
+
 management:
   endpoints:
     web:

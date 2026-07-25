@@ -433,14 +433,14 @@ See `docs/RBAC_COMPARISON.md` for the comparison between the enterprise RBAC pro
 
 ## Production Deployment Checklist
 
-For the clean GitHub → Render → Vercel deployment flow, the exact backend/frontend variables, Neon URL handling, and smoke checks, see [Production Deployment](docs/NEON_DEPLOYMENT.md).
+For the clean GitHub → Render → Vercel deployment flow, the exact backend/frontend variables, Neon URL handling, and smoke checks, see [Production Deployment](docs/NEON_DEPLOYMENT.md). For request IDs, log locations, safe exception handling, and optional Sentry setup, see [Production Logging and Error Monitoring](docs/PRODUCTION_LOGGING.md).
 
 - Set `SPRING_PROFILES_ACTIVE=prod` on the backend host. Production configuration requires explicit database, JWT, CORS, public URL, and email values and forces demo seeding, dev tools, and public Swagger off.
 - Replace all demo secrets and rotate JWT signing key.
 - Use managed PostgreSQL with automated backups and PITR.
 - Configure Redis persistence/HA if used for production cache.
 - Replace local object storage with MinIO/S3 and lifecycle policies.
-- Configure structured logs, metrics scraping, and alerting.
+- Configure alert rules and longer-term log retention; structured production logs and optional Sentry error reporting are available.
 - Enforce HTTPS and strict CORS origins.
 - Add email verification and password reset.
 - Add invitation/user management UI.
