@@ -31,7 +31,7 @@ public class PortalService {
     private final Repositories.SalesOrderRepository salesOrders;
     private final Repositories.SalesOrderItemRepository salesOrderItems;
     private final Repositories.SalesInvoiceRepository salesInvoices;
-    private final Repositories.CustomerPaymentRepository payments;
+    private final OutstandingService outstanding;
     private final StockLedgerService stockLedger;
     private final AuditService audit;
 
@@ -44,7 +44,7 @@ public class PortalService {
         Repositories.SalesOrderRepository salesOrders,
         Repositories.SalesOrderItemRepository salesOrderItems,
         Repositories.SalesInvoiceRepository salesInvoices,
-        Repositories.CustomerPaymentRepository payments,
+        OutstandingService outstanding,
         StockLedgerService stockLedger,
         AuditService audit
     ) {
@@ -56,7 +56,7 @@ public class PortalService {
         this.salesOrders = salesOrders;
         this.salesOrderItems = salesOrderItems;
         this.salesInvoices = salesInvoices;
-        this.payments = payments;
+        this.outstanding = outstanding;
         this.stockLedger = stockLedger;
         this.audit = audit;
     }
@@ -117,12 +117,8 @@ public class PortalService {
     public Map<String, Object> outstanding() {
         var tenantId = TenantContext.tenantId();
         var customer = currentCustomer();
-        var invoiced = salesInvoices.findByTenantId(tenantId).stream()
-            .filter(invoice -> customer.id.equals(invoice.customerId))
-            .map(invoice -> invoice.totalAmount)
-            .reduce(BigDecimal.ZERO, BigDecimal::add);
-        var paid = payments.totalPaymentsForCustomer(tenantId, customer.id);
-        return Map.of("customerId", customer.id, "customerName", customer.name, "outstanding", customer.openingBalance.add(invoiced).subtract(paid == null ? BigDecimal.ZERO : paid));
+        return Map.of("customerId", customer.id, "customerName", customer.name,
+            "outstanding", outstanding.customerOutstanding(tenantId, customer.id));
     }
 
     public List<ApiDtos.PortalInvoice> invoices() {

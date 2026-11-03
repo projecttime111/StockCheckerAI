@@ -31,6 +31,10 @@ public class FinancialAdjustment extends TenantOwnedEntity {
     public BigDecimal totalAmount = BigDecimal.ZERO;
     public String sourceExternalId;
     public String sourceFingerprint;
+    @Enumerated(EnumType.STRING)
+    public DomainEnums.ReturnClassification returnClassification = DomainEnums.ReturnClassification.FINANCIAL_ONLY;
+    @Enumerated(EnumType.STRING)
+    public DomainEnums.ReturnResolutionStatus returnResolutionStatus;
     @JdbcTypeCode(SqlTypes.JSON)
     public Map<String, Object> rawMetadata = new LinkedHashMap<>();
 }

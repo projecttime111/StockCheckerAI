@@ -8,6 +8,7 @@ import com.stockpilot.ai.service.DashboardService;
 import com.stockpilot.ai.service.DeadStockActionService;
 import com.stockpilot.ai.service.ReorderEngineService;
 import com.stockpilot.ai.service.StockLedgerService;
+import com.stockpilot.ai.service.OutstandingService;
 import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -36,7 +37,7 @@ public class ReportsController {
     private final Repositories.SupplierRepository suppliers;
     private final Repositories.SalesInvoiceRepository salesInvoices;
     private final Repositories.PurchaseInvoiceRepository purchaseInvoices;
-    private final Repositories.CustomerPaymentRepository customerPayments;
+    private final OutstandingService outstanding;
     private final Repositories.AuditLogRepository auditLogs;
     private final AuditService auditService;
 
@@ -50,7 +51,7 @@ public class ReportsController {
         Repositories.SupplierRepository suppliers,
         Repositories.SalesInvoiceRepository salesInvoices,
         Repositories.PurchaseInvoiceRepository purchaseInvoices,
-        Repositories.CustomerPaymentRepository customerPayments,
+        OutstandingService outstanding,
         Repositories.AuditLogRepository auditLogs,
         AuditService auditService
     ) {
@@ -63,7 +64,7 @@ public class ReportsController {
         this.suppliers = suppliers;
         this.salesInvoices = salesInvoices;
         this.purchaseInvoices = purchaseInvoices;
-        this.customerPayments = customerPayments;
+        this.outstanding = outstanding;
         this.auditLogs = auditLogs;
         this.auditService = auditService;
     }
@@ -130,13 +131,14 @@ public class ReportsController {
     private String customersCsv() {
         var tenantId = TenantContext.tenantId();
         var builder = new StringBuilder("customer_id,name,phone,email,gstin,credit_limit,outstanding\n");
-        customers.findByTenantIdOrderByNameAsc(tenantId).forEach(row -> append(builder, row.id, row.name, row.phone, row.email, row.gstin, row.creditLimit, customerOutstanding(row.id)));
+        customers.findByTenantIdOrderByNameAsc(tenantId).forEach(row -> append(builder, row.id, row.name, row.phone, row.email, row.gstin, row.creditLimit, outstanding.customerOutstanding(tenantId, row.id)));
         return builder.toString();
     }
 
     private String suppliersCsv() {
-        var builder = new StringBuilder("supplier_id,name,phone,email,gstin,credit_days,opening_balance\n");
-        suppliers.findByTenantIdOrderByNameAsc(TenantContext.tenantId()).forEach(row -> append(builder, row.id, row.name, row.phone, row.email, row.gstin, row.creditDays, row.openingBalance));
+        var tenantId = TenantContext.tenantId();
+        var builder = new StringBuilder("supplier_id,name,phone,email,gstin,credit_days,opening_balance,current_payable\n");
+        suppliers.findByTenantIdOrderByNameAsc(tenantId).forEach(row -> append(builder, row.id, row.name, row.phone, row.email, row.gstin, row.creditDays, row.openingBalance, outstanding.supplierPayable(tenantId, row.id)));
         return builder.toString();
     }
 
@@ -164,17 +166,6 @@ public class ReportsController {
         return builder.toString();
     }
 
-    private BigDecimal customerOutstanding(java.util.UUID customerId) {
-        var tenantId = TenantContext.tenantId();
-        var customer = customers.findByTenantIdAndId(tenantId, customerId).orElseThrow(() -> ApiErrors.notFound("Customer not found"));
-        var invoiced = salesInvoices.findByTenantId(tenantId).stream()
-            .filter(invoice -> customerId.equals(invoice.customerId))
-            .map(invoice -> invoice.totalAmount)
-            .reduce(BigDecimal.ZERO, BigDecimal::add);
-        var paid = customerPayments.totalPaymentsForCustomer(tenantId, customerId);
-        return customer.openingBalance.add(invoiced).subtract(paid == null ? BigDecimal.ZERO : paid);
-    }
-
     private void append(StringBuilder builder, Object... values) {
         for (int i = 0; i < values.length; i++) {
             if (i > 0) {
@@ -190,6 +181,14 @@ public class ReportsController {
             return "";
         }
         var text = String.valueOf(value);
+        // Quoting CSV syntax alone does not stop spreadsheet formula evaluation.
+        if (value instanceof CharSequence && !text.isEmpty()) {
+            var significant = text.stripLeading();
+            if ((!significant.isEmpty() && "=+-@".indexOf(significant.charAt(0)) >= 0)
+                || text.chars().anyMatch(c -> c == '\t' || c == '\r' || c == '\n')) {
+                text = "'" + text;
+            }
+        }
         if (text.contains("\"") || text.contains(",") || text.contains("\n") || text.contains("\r")) {
             return "\"" + text.replace("\"", "\"\"") + "\"";
         }

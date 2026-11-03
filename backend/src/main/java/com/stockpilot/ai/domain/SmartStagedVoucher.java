@@ -8,6 +8,7 @@ import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -46,4 +47,12 @@ public class SmartStagedVoucher extends TenantOwnedEntity {
     public DomainEnums.SmartMatchStatus matchStatus = DomainEnums.SmartMatchStatus.UNKNOWN;
     @Enumerated(EnumType.STRING)
     public DomainEnums.SmartReviewStatus reviewStatus = DomainEnums.SmartReviewStatus.PENDING;
+    @Enumerated(EnumType.STRING)
+    public DomainEnums.ReturnClassification returnClassification = DomainEnums.ReturnClassification.NOT_A_RETURN;
+    @Enumerated(EnumType.STRING)
+    public DomainEnums.ReturnResolutionStatus returnResolutionStatus;
+    public BigDecimal returnConfidence = BigDecimal.ZERO;
+    public String returnDetectionReason;
+    public UUID returnResolvedBy;
+    public Instant returnResolvedAt;
 }

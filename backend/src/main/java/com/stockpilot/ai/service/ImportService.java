@@ -90,7 +90,7 @@ public class ImportService {
         AuditService auditService,
         EntityManager entityManager,
         @Value("${app.dev-tools.enabled:false}") boolean devToolsEnabled,
-        @Value("${app.import.max-upload-size:150MB}") DataSize maxUploadSize
+        @Value("${app.import.max-upload-size:500MB}") DataSize maxUploadSize
     ) {
         this.adapters = adapters.stream().collect(Collectors.toMap(ErpImportAdapter::sourceType, Function.identity()));
         this.storage = storage;

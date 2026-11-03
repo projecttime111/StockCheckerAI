@@ -28,12 +28,18 @@ import { Field, PrimaryButton, SecondaryButton, TextInput } from "@/components/F
 import { LoadingState } from "@/components/LoadingState";
 import { Panel } from "@/components/Panel";
 import { CashbookReviewPanel } from "@/components/CashbookReviewPanel";
+import { ReturnReviewPanel } from "@/components/ReturnReviewPanel";
+import { TransferReviewPanel } from "@/components/TransferReviewPanel";
+import { VoucherRateReviewForm, VoucherRateAction } from "@/components/VoucherRateReviewForm";
+import { SmartImportSnapshotDates, SavedSnapshotDates, SnapshotDates, snapshotDatesFromSummary, snapshotDatesValid, snapshotDatesMatch } from "@/components/SmartImportSnapshotDates";
 import { api, Page } from "@/lib/api";
 
 type SessionStatus = "CREATED" | "FILES_UPLOADED" | "CLASSIFIED" | "PLAN_READY" | "STAGED" | "NEEDS_REVIEW" | "COMMITTING" | "COMMITTED" | "FAILED" | "CANCELLED";
 type Strategy = "SNAPSHOT_FIRST" | "TRANSACTION_HISTORY" | "HYBRID_RECONCILIATION" | "UNKNOWN";
 type WorkspaceTab = "files" | "staging" | "matching" | "review" | "plan" | "dry-run" | "commit";
-type StockImpactMode = "CREATE_INVOICES_ONLY" | "CREATE_INVOICES_AND_STOCK_MOVEMENTS" | "APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE";
+type StockImpactMode = "CREATE_INVOICES_ONLY" | "APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE";
+type ReturnStockImpactMode = "FINANCIAL_ONLY" | "APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE";
+type StockJournalImpactMode = "DEFER_STOCK_JOURNALS" | "APPLY_CONFIRMED_WAREHOUSE_TRANSFERS_AFTER_SNAPSHOT_DATE";
 type NegativeStockPolicy = "BLOCK" | "SKIP_STOCK_MOVEMENT" | "IMPORT_AS_IS";
 
 type SessionSummary = {
@@ -58,7 +64,11 @@ type SessionFile = {
   dateRangeStart: string;
   dateRangeEnd: string;
   companyName: string;
-  metadata: { duplicateOfFileId?: string };
+  metadata: {
+    duplicateOfFileId?: string;
+    contentCounts?: Record<string, number>;
+    outstandingPartyType?: string;
+  };
 };
 
 type ReviewChoice = {
@@ -78,6 +88,19 @@ type ReviewItem = {
   affectedRows?: number[];
   suggestedAction: string;
   availableChoices?: ReviewChoice[];
+  context?: {
+    eligibleActions?: VoucherRateAction[];
+    voucherType?: string;
+    voucherNumber?: string;
+    voucherDate?: string;
+    partyName?: string;
+    productName?: string;
+    quantity?: number | string;
+    amount?: number | string;
+    rate?: number | string;
+    rateSource?: string;
+    derivedRate?: number | string;
+  };
   resolved?: boolean;
 };
 
@@ -110,6 +133,8 @@ type StagingSummary = {
   warehousesStaged: number;
   unitsStaged: number;
   stockSnapshotsStaged: number;
+  undatedStockSnapshots?: number;
+  undatedOutstandingSnapshots?: number;
   vouchersStaged: number;
   voucherItemsStaged: number;
   creditNotesStaged: number;
@@ -119,6 +144,9 @@ type StagingSummary = {
   creditorRowsStaged: number;
   cashbookEntriesStaged: number;
   stockAgeingRowsStaged: number;
+  stockJournalsDetected?: number;
+  warehouseTransfersDetected?: number;
+  warehouseTransfersReviewRequired?: number;
 };
 
 type MatchingSummary = {
@@ -178,6 +206,20 @@ type StagedCashbook = {
   matchConfidence: number;
   matchReason?: string;
 };
+type StagedTransfer = {
+  id: string;
+  voucherNumber?: string;
+  voucherDate?: string;
+  productName?: string;
+  unitCode?: string;
+  sourceWarehouseName?: string;
+  destinationWarehouseName?: string;
+  normalizedQuantity?: number;
+  classification: string;
+  classificationConfidence?: number;
+  decisionReasons?: string;
+  resolutionStatus: string;
+};
 
 type StagingWorkspace = {
   summary: StagingSummary;
@@ -190,6 +232,7 @@ type StagingWorkspace = {
   vouchers: StagedVoucher[];
   voucherItems: unknown[];
   cashbookEntries: StagedCashbook[];
+  transferCandidates?: StagedTransfer[];
   stockAgeing: unknown[];
   reviewItems: ReviewItem[];
   previewLimit: number;
@@ -206,6 +249,15 @@ type DryRunSummary = Record<string, number | string | boolean> & {
   stockMovementsPreviewed: number;
   stockMovementsSkippedDueToInvoiceOnly: number;
   stockMovementsSkippedBeforeSnapshotDate: number;
+  salesStockMovementsPlanned: number;
+  purchaseStockMovementsPlanned: number;
+  voucherItemsCoveredBySnapshot: number;
+  sameDateVoucherItemsDeferred: number;
+  voucherItemsWithoutSnapshot: number;
+  voucherItemsBlockedByWarehouse: number;
+  movementsBlockedByNegativeStock: number;
+  movementsSkippedByPolicy: number;
+  productLevelSnapshotFallbacks: number;
   voucherItemsReady: number;
   vouchersBlocked: number;
   duplicateVouchersSkipped: number;
@@ -227,11 +279,14 @@ type DryRunSummary = Record<string, number | string | boolean> & {
   paymentsLinkedToPurchaseInvoices: number;
   duplicatePaymentsSkipped: number;
   stockImpactMode: StockImpactMode;
+  returnStockImpactMode: ReturnStockImpactMode;
+  stockJournalImpactMode: StockJournalImpactMode;
 };
 
 type DryRunResponse = {
   available: boolean;
   id?: string;
+  importSessionId?: string;
   status: "NOT_RUN" | "RUNNING" | "COMPLETED" | "FAILED";
   strategy?: Strategy;
   startedAt?: string;
@@ -279,6 +334,17 @@ type CommitSummary = Record<string, number | string | boolean> & {
   duplicatePurchaseVouchersSkipped?: number;
   voucherStockMovementsCreated?: number;
   stockMovementsSkippedDueToInvoiceOnly?: number;
+  salesStockMovementsCreated?: number;
+  purchaseStockMovementsCreated?: number;
+  voucherItemsCoveredBySnapshot?: number;
+  sameDateVoucherItemsDeferred?: number;
+  voucherItemsWithoutSnapshot?: number;
+  voucherItemsDeferred?: number;
+  duplicateStockMovementsSkipped?: number;
+  negativeStockMovementsBlocked?: number;
+  negativeStockMovementsSkipped?: number;
+  negativeStockMovementsImported?: number;
+  productLevelSnapshotFallbacks?: number;
   vouchersDeferredForFuturePhase?: number;
   creditNotesCreated?: number;
   creditNoteItemsCreated?: number;
@@ -305,11 +371,30 @@ type CommitSummary = Record<string, number | string | boolean> & {
   paymentsLinkedToPurchaseInvoices?: number;
   duplicatePaymentsSkipped?: number;
   cashbookRowsManuallyResolved?: number;
+  retailCounterSaleRowsResolved?: number;
   cashbookRowsIgnored?: number;
   manualCustomerPaymentsCreated?: number;
   manualSupplierPaymentsCreated?: number;
   manualPaymentsLinkedToSalesInvoices?: number;
   manualPaymentsLinkedToPurchaseInvoices?: number;
+  stockJournalsProcessed?: number;
+  warehouseTransfersCommitted?: number;
+  transferPairsCreated?: number;
+  transferOutMovementsCreated?: number;
+  transferInMovementsCreated?: number;
+  warehouseTransfersCoveredBySnapshot?: number;
+  sameDateWarehouseTransfersDeferred?: number;
+  warehouseTransfersWithoutBaseline?: number;
+  unresolvedWarehouseTransfers?: number;
+  duplicateWarehouseTransfersSkipped?: number;
+  warehouseTransfersBlockedByNegativeStock?: number;
+  warehouseTransfersSkippedByPolicy?: number;
+  manufacturingJournalsDeferred?: number;
+  adjustmentJournalsDeferred?: number;
+  ambiguousStockJournalsDeferred?: number;
+  manuallyResolvedWarehouseTransfers?: number;
+  ignoredStockJournals?: number;
+  netCompanyStockQuantityChange?: number;
 };
 
 type CommitResponse = {
@@ -317,6 +402,7 @@ type CommitResponse = {
   id?: string;
   dryRunId?: string;
   status: "NOT_COMMITTED" | "COMMITTING" | "COMMITTED" | "FAILED" | "ROLLED_BACK";
+  startedAt?: string;
   committedAt?: string;
   committedBy?: string;
   idempotentRetry?: boolean;
@@ -326,12 +412,14 @@ type CommitResponse = {
 const FILE_TYPES = [
   "INVENTORY_MASTER",
   "ACCOUNTING_MASTER",
+  "MIXED_TALLY_MASTERS",
   "STOCK_SNAPSHOT",
   "SALES_VOUCHERS",
   "PURCHASE_VOUCHERS",
   "CREDIT_NOTES",
   "DEBIT_NOTES",
   "STOCK_JOURNAL",
+  "MIXED_TALLY_VOUCHERS",
   "CASH_BOOK",
   "DEBTOR_CREDITOR_ANALYSIS",
   "STOCK_AGEING",
@@ -357,10 +445,14 @@ export default function SmartImportsPage() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("files");
   const [dryRunStrategy, setDryRunStrategy] = useState<Strategy>("UNKNOWN");
   const [stockImpactMode, setStockImpactMode] = useState<StockImpactMode>("CREATE_INVOICES_ONLY");
+  const [returnStockImpactMode, setReturnStockImpactMode] = useState<ReturnStockImpactMode>("FINANCIAL_ONLY");
+  const [stockJournalImpactMode, setStockJournalImpactMode] = useState<StockJournalImpactMode>("DEFER_STOCK_JOURNALS");
   const [negativeStockPolicy, setNegativeStockPolicy] = useState<NegativeStockPolicy>("BLOCK");
   const [dryRunItemType, setDryRunItemType] = useState("");
   const [dryRunIssue, setDryRunIssue] = useState("");
   const [commitConfirmation, setCommitConfirmation] = useState("");
+  const [pendingCommitSessionId, setPendingCommitSessionId] = useState<string | null>(null);
+  const [dateDraft, setDateDraft] = useState<{ sessionId: string; value: SnapshotDates } | null>(null);
 
   const sessions = useQuery({
     queryKey: ["smart-import-sessions"],
@@ -394,10 +486,17 @@ export default function SmartImportsPage() {
     },
     retry: false
   });
+  const snapshotDates = dateDraft?.sessionId === sessionId ? dateDraft.value : snapshotDatesFromSummary(dryRun.data?.summary);
+  const stockDatesMissing = Number(staging.data?.summary.undatedStockSnapshots ?? 0);
+  const outstandingDatesMissing = Number(staging.data?.summary.undatedOutstandingSnapshots ?? 0);
+  const datesValid = snapshotDatesValid(snapshotDates, stockDatesMissing > 0, outstandingDatesMissing > 0);
+  const datesMatchPreview = snapshotDatesMatch(snapshotDates, dryRun.data?.summary);
   const commitResult = useQuery({
     queryKey: ["smart-import-commit", sessionId],
     enabled: !!sessionId,
     queryFn: () => api<CommitResponse>(`/api/import-sessions/${sessionId}/commit-result`),
+    refetchInterval: (query) => pendingCommitSessionId === sessionId || query.state.data?.status === "COMMITTING" ? 3000 : false,
+    refetchIntervalInBackground: true,
     retry: false
   });
 
@@ -412,6 +511,8 @@ export default function SmartImportsPage() {
       queryClient.invalidateQueries({ queryKey: ["smart-import-staging", id] }),
       queryClient.invalidateQueries({ queryKey: ["smart-import-dry-run", id] }),
       queryClient.invalidateQueries({ queryKey: ["smart-import-dry-run-items", id] }),
+      queryClient.invalidateQueries({ queryKey: ["smart-import-transfer-review", id] }),
+      queryClient.invalidateQueries({ queryKey: ["smart-import-cashbook-review", id] }),
       queryClient.invalidateQueries({ queryKey: ["smart-import-commit", id] })
     ]);
   };
@@ -517,41 +618,67 @@ export default function SmartImportsPage() {
   const runDryRun = useMutation({
     mutationFn: () => {
       if (!sessionId) throw new Error("Select and stage a smart import session");
+      if (!datesValid) throw new Error("Enter and confirm the required snapshot dates");
       return api<DryRunResponse>(`/api/import-sessions/${sessionId}/dry-run`, {
         method: "POST",
         body: JSON.stringify({
           strategy: dryRunStrategy === "UNKNOWN" ? undefined : dryRunStrategy,
           stockImpactMode,
-          negativeStockPolicy
+          returnStockImpactMode,
+          stockJournalImpactMode,
+          negativeStockPolicy,
+          snapshotDate: snapshotDates.snapshotDate || undefined,
+          snapshotDateConfirmed: snapshotDates.snapshotDateConfirmed,
+          outstandingSnapshotDate: snapshotDates.outstandingSnapshotDate || undefined,
+          outstandingSnapshotDateConfirmed: snapshotDates.outstandingSnapshotDateConfirmed
         })
       });
     },
-    onSuccess: async () => {
-      setActiveTab("dry-run");
-      await refresh(sessionId);
+    onSuccess: async (saved) => {
+      const savedSessionId = saved.importSessionId ?? sessionId;
+      queryClient.setQueryData(["smart-import-dry-run", savedSessionId], saved);
+      if (savedSessionId === sessionId) {
+        setDateDraft(null);
+        setCommitConfirmation("");
+        setActiveTab("dry-run");
+      }
+      await refresh(savedSessionId);
     }
   });
 
   const commitFoundation = useMutation({
     mutationFn: () => {
       if (!sessionId || !dryRun.data?.id) throw new Error("Run a completed dry run before committing");
+      if (!datesMatchPreview) throw new Error("Run a new dry run with the confirmed snapshot dates before committing");
       return api<CommitResponse>(`/api/import-sessions/${sessionId}/commit`, {
         method: "POST",
         body: JSON.stringify({ dryRunId: dryRun.data.id, confirmation: commitConfirmation })
       });
     },
-    onSuccess: async () => {
+    onMutate: () => {
+      setPendingCommitSessionId(sessionId);
+      return { sessionId };
+    },
+    onSuccess: async (saved, _variables, context) => {
+      const savedSessionId = context.sessionId;
+      queryClient.setQueryData(["smart-import-commit", savedSessionId], saved);
       setActiveTab("commit");
       await Promise.all([
-        refresh(sessionId),
+        refresh(savedSessionId),
         queryClient.invalidateQueries({ queryKey: ["products"] }),
         queryClient.invalidateQueries({ queryKey: ["stock"] }),
         queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
         queryClient.invalidateQueries({ queryKey: ["sales"] }),
         queryClient.invalidateQueries({ queryKey: ["purchases"] })
       ]);
+    },
+    onSettled: async (_data, _error, _variables, context) => {
+      setPendingCommitSessionId(null);
+      // A disconnected POST does not cancel the server transaction. Check its durable status.
+      if (context) await queryClient.invalidateQueries({ queryKey: ["smart-import-commit", context.sessionId] });
     }
   });
+  const commitRunning = pendingCommitSessionId === sessionId || commitResult.data?.status === "COMMITTING";
 
   const details = current.data;
   const workspace = staging.data;
@@ -559,11 +686,14 @@ export default function SmartImportsPage() {
   const strategy = plan?.strategy ?? details?.recommendedStrategy ?? "UNKNOWN";
   const planSteps = plan?.details?.steps ?? [];
   const dryRunSummary = dryRun.data?.summary;
+  const effectiveStockImpactMode = dryRunSummary?.stockImpactMode ?? stockImpactMode;
   const safeDryRun = dryRun.data?.available && dryRun.data.status === "COMPLETED"
+    && datesValid && datesMatchPreview
     && Number(dryRunSummary?.blockingErrors ?? 0) === 0
     && Number(dryRunSummary?.reviewRequiredCount ?? 0) === 0
     && (!(workspace?.vouchers.some((voucher) => /SALE|PURCHASE/i.test(voucher.voucherType)))
-      || dryRunSummary?.stockImpactMode === "CREATE_INVOICES_ONLY");
+      || dryRunSummary?.stockImpactMode === "CREATE_INVOICES_ONLY"
+      || dryRunSummary?.stockImpactMode === "APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE");
   const reviewItems = workspace?.reviewItems ?? details?.issues ?? [];
   const openReviewCount = reviewItems.filter((item) => !item.resolved).length;
   const reviewGroups = useMemo(() => {
@@ -575,6 +705,7 @@ export default function SmartImportsPage() {
   useEffect(() => {
     setDryRunStrategy(strategy);
     setStockImpactMode(defaultStockImpactMode());
+    setStockJournalImpactMode("DEFER_STOCK_JOURNALS");
   }, [sessionId, strategy]);
 
   const acceptFiles = (incoming: FileList | File[]) => {
@@ -731,7 +862,11 @@ export default function SmartImportsPage() {
                     }
                   >
                     {details.files.length ? (
-                      <div className="overflow-x-auto">
+                      <div className="space-y-3">
+                        <div className="border-l-4 border-moss bg-moss/5 px-4 py-3 text-sm leading-6 text-ink/70">
+                          Combined Tally exports are split by each master entity and each voucher&apos;s actual VCHTYPE. Do not force a mixed file into Sales or Purchase.
+                        </div>
+                        <div className="overflow-x-auto">
                         <table className="w-full min-w-[1080px] text-left text-sm">
                           <thead className="border-b border-ink/10 text-xs uppercase text-ink/45">
                             <tr><th className="px-2 py-3">File</th><th className="px-2 py-3">Detected</th><th className="px-2 py-3">Selected type</th><th className="px-2 py-3">Confidence</th><th className="px-2 py-3">Company / dates</th><th className="px-2 py-3">Rows</th><th className="px-2 py-3">Reason</th><th className="w-12 px-2 py-3"><span className="sr-only">Actions</span></th></tr>
@@ -758,7 +893,12 @@ export default function SmartImportsPage() {
                                 <td className="px-2 py-3">{Math.round(Number(file.confidence || 0) * 100)}%</td>
                                 <td className="px-2 py-3 text-xs text-ink/65"><div>{file.companyName || "Not detected"}</div><div>{dateRange(file)}</div></td>
                                 <td className="px-2 py-3">{file.rowCount}</td>
-                                <td className="max-w-[270px] px-2 py-3 text-xs text-ink/65">{file.detectionReason || "Awaiting classification"}</td>
+                                <td className="max-w-[290px] px-2 py-3 text-xs text-ink/65">
+                                  <div>{file.detectionReason || "Awaiting classification"}</div>
+                                  {formatContentCounts(file.metadata?.contentCounts) ? (
+                                    <div className="mt-1 font-medium text-moss">Contents: {formatContentCounts(file.metadata.contentCounts)}</div>
+                                  ) : null}
+                                </td>
                                 <td className="px-2 py-3">
                                   <button className="focus-ring inline-flex h-9 w-9 items-center justify-center rounded text-coral hover:bg-coral/10" onClick={() => removeFile.mutate(file.id)} disabled={removeFile.isPending} aria-label={`Remove ${file.originalFileName}`} title="Remove file">
                                     <Trash2 size={16} />
@@ -768,6 +908,7 @@ export default function SmartImportsPage() {
                             ))}
                           </tbody>
                         </table>
+                        </div>
                       </div>
                     ) : <EmptyState label="No files uploaded to this session." />}
                   </Panel>
@@ -811,6 +952,36 @@ export default function SmartImportsPage() {
                     ) : <EmptyState label="No voucher rows staged." />}
                   </Panel>
 
+                  <Panel title="Stock Journal and Warehouse Transfer Preview">
+                    <p className="mb-4 text-sm leading-6 text-ink/65">
+                      Warehouse transfers create equal TRANSFER_OUT and TRANSFER_IN movements. They change
+                      warehouse distribution but never total company stock. Manufacturing and unbalanced
+                      stock journals remain deferred.
+                    </p>
+                    {workspace?.transferCandidates?.length ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full min-w-[1020px] text-left text-sm">
+                          <thead className="border-b border-ink/10 text-xs uppercase text-ink/45">
+                            <tr><th className="px-2 py-3">Voucher</th><th className="px-2 py-3">Classification</th><th className="px-2 py-3">Product</th><th className="px-2 py-3">Source</th><th className="px-2 py-3">Destination</th><th className="px-2 py-3 text-right">Quantity</th><th className="px-2 py-3">Resolution</th></tr>
+                          </thead>
+                          <tbody className="divide-y divide-ink/10">
+                            {workspace.transferCandidates.map((row) => (
+                              <tr key={row.id}>
+                                <td className="px-2 py-3"><div className="font-medium">{row.voucherNumber || "Unnumbered"}</div><div className="text-xs text-ink/50">{row.voucherDate || "-"}</div></td>
+                                <td className="px-2 py-3"><StatusPill value={row.classification} /></td>
+                                <td className="px-2 py-3">{row.productName || "Unresolved"} <span className="text-xs text-ink/50">{row.unitCode}</span></td>
+                                <td className="px-2 py-3">{row.sourceWarehouseName || "Unresolved"}</td>
+                                <td className="px-2 py-3">{row.destinationWarehouseName || "Unresolved"}</td>
+                                <td className="px-2 py-3 text-right">{number(row.normalizedQuantity)}</td>
+                                <td className="px-2 py-3"><StatusPill value={row.resolutionStatus} /></td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : <EmptyState label="No stock-journal transfer candidates staged." />}
+                  </Panel>
+
                   <Panel title="Debtor and Creditor Outstanding Preview">
                     {workspace?.parties.some((row) => row.sourceType === "DEBTOR_CREDITOR_ANALYSIS") ? (
                       <div className="overflow-x-auto">
@@ -818,7 +989,7 @@ export default function SmartImportsPage() {
                           <thead className="border-b border-ink/10 text-xs uppercase text-ink/45"><tr><th className="px-2 py-3">Party</th><th className="px-2 py-3">Type</th><th className="px-2 py-3">Snapshot date</th><th className="px-2 py-3 text-right">Outstanding</th><th className="px-2 py-3">Match</th></tr></thead>
                           <tbody className="divide-y divide-ink/10">
                             {workspace.parties.filter((row) => row.sourceType === "DEBTOR_CREDITOR_ANALYSIS").map((row) => (
-                              <tr key={row.id}><td className="px-2 py-3 font-medium">{row.name}</td><td className="px-2 py-3"><StatusPill value={row.partyType} /></td><td className="px-2 py-3">{row.snapshotDate || "Commit date"}</td><td className="px-2 py-3 text-right font-semibold">{money(row.outstandingAmount)}</td><td className="px-2 py-3"><StatusPill value={row.matchStatus} /></td></tr>
+                              <tr key={row.id}><td className="px-2 py-3 font-medium">{row.name}</td><td className="px-2 py-3"><StatusPill value={row.partyType} /></td><td className="px-2 py-3">{row.snapshotDate || "Date confirmation required"}</td><td className="px-2 py-3 text-right font-semibold">{money(row.outstandingAmount)}</td><td className="px-2 py-3"><StatusPill value={row.matchStatus} /></td></tr>
                             ))}
                           </tbody>
                         </table>
@@ -865,6 +1036,7 @@ export default function SmartImportsPage() {
 
               {activeTab === "review" ? (
                 <div className="space-y-4">
+                <a href="#cashbook-resolution" className="inline-flex items-center gap-2 text-sm font-semibold text-moss"><Link2 size={16} />Resolve cashbook entries and retail sales</a>
                 <Panel title="Review Queue" action={<ShieldAlert size={18} className="text-amber-600" />}>
                   {reviewGroups.size ? (
                     <div className="space-y-5">
@@ -882,7 +1054,14 @@ export default function SmartImportsPage() {
                                   </div>
                                   {item.resolved ? <StatusPill value="RESOLVED" /> : null}
                                 </div>
-                                {!item.resolved && item.availableChoices?.length ? (
+                                {!item.resolved && (item.code === "INVALID_RATE" || item.code === "ZERO_RATE_ITEM") ? (
+                                  <VoucherRateReviewForm sessionId={sessionId} item={item} onResolved={async (workspace) => {
+                                    await queryClient.cancelQueries({ queryKey: ["smart-import-staging", sessionId] });
+                                    queryClient.setQueryData(["smart-import-staging", sessionId], workspace as StagingWorkspace);
+                                    await refresh(sessionId);
+                                  }}
+                                    onRebuild={() => rebuild.mutateAsync()} rebuilding={rebuild.isPending} />
+                                ) : !item.resolved && item.availableChoices?.length ? (
                                   <div className="mt-3 flex flex-wrap gap-2">
                                     {item.availableChoices.map((choice) => (
                                       <SecondaryButton key={`${choice.action}:${choice.targetId || choice.selectedFileType || choice.label}`} className="min-h-9 h-auto py-2 text-left" onClick={() => resolveReview.mutate({ itemId: item.id, choice })} disabled={resolveReview.isPending}>
@@ -899,8 +1078,16 @@ export default function SmartImportsPage() {
                     </div>
                   ) : <EmptyState label="No review items. Exact matches were resolved automatically." />}
                 </Panel>
+                <section id="cashbook-resolution" className="scroll-mt-4">
                 <Panel title="Unmatched Cashbook Resolution" action={<Link2 size={18} className="text-moss" />}>
                   <CashbookReviewPanel sessionId={sessionId} />
+                </Panel>
+                </section>
+                <Panel title="Physical Return Review" action={<Boxes size={18} className="text-moss" />}>
+                  <ReturnReviewPanel sessionId={sessionId} />
+                </Panel>
+                <Panel title="Stock Journal and Transfer Review" action={<Boxes size={18} className="text-moss" />}>
+                  <TransferReviewPanel sessionId={sessionId} />
                 </Panel>
                 </div>
               ) : null}
@@ -924,7 +1111,7 @@ export default function SmartImportsPage() {
                 <div className="space-y-4">
                   <Panel title="Transaction-safe Dry Run" action={<FileSearch size={18} className="text-moss" />}>
                     <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
-                      <div className="grid gap-3 sm:grid-cols-3">
+                      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
                         <Field label="Import strategy">
                           <select className="focus-ring h-10 w-full rounded border border-ink/15 bg-white px-3 text-sm" value={dryRunStrategy} onChange={(event) => setDryRunStrategy(event.target.value as Strategy)}>
                             <option value="UNKNOWN">Choose strategy</option>
@@ -933,9 +1120,22 @@ export default function SmartImportsPage() {
                             <option value="HYBRID_RECONCILIATION">Hybrid reconciliation</option>
                           </select>
                         </Field>
-                        <Field label="Voucher stock impact">
-                          <select className="h-10 w-full rounded border border-ink/15 bg-ink/[0.03] px-3 text-sm text-ink/70" value={stockImpactMode} disabled>
+                        <Field label="Inventory effect">
+                          <select className="focus-ring h-10 w-full rounded border border-ink/15 bg-white px-3 text-sm" value={stockImpactMode} onChange={(event) => setStockImpactMode(event.target.value as StockImpactMode)}>
                             <option value="CREATE_INVOICES_ONLY">Invoice-only, no stock movement</option>
+                            <option value="APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE">Apply movements after closing-stock date</option>
+                          </select>
+                        </Field>
+                        <Field label="Return inventory effect">
+                          <select className="focus-ring h-10 w-full rounded border border-ink/15 bg-white px-3 text-sm" value={returnStockImpactMode} onChange={(event) => setReturnStockImpactMode(event.target.value as ReturnStockImpactMode)}>
+                            <option value="FINANCIAL_ONLY">Financial adjustments only</option>
+                            <option value="APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE">Apply confirmed physical returns after closing-stock date</option>
+                          </select>
+                        </Field>
+                        <Field label="Stock journal inventory effect">
+                          <select className="focus-ring h-10 w-full rounded border border-ink/15 bg-white px-3 text-sm" value={stockJournalImpactMode} onChange={(event) => setStockJournalImpactMode(event.target.value as StockJournalImpactMode)}>
+                            <option value="DEFER_STOCK_JOURNALS">Defer stock journals</option>
+                            <option value="APPLY_CONFIRMED_WAREHOUSE_TRANSFERS_AFTER_SNAPSHOT_DATE">Apply confirmed warehouse transfers after closing-stock date</option>
                           </select>
                         </Field>
                         <Field label="Negative stock policy">
@@ -946,13 +1146,18 @@ export default function SmartImportsPage() {
                           </select>
                         </Field>
                       </div>
-                      <PrimaryButton className="gap-2" onClick={() => runDryRun.mutate()} disabled={runDryRun.isPending || dryRunStrategy === "UNKNOWN" || !plan?.details?.stagingComplete}>
+                      <PrimaryButton className="gap-2" onClick={() => runDryRun.mutate()} disabled={runDryRun.isPending || !datesValid || staging.isLoading || dryRun.isLoading || dryRunStrategy === "UNKNOWN" || !plan?.details?.stagingComplete}>
                         <FileSearch size={16} /> {runDryRun.isPending ? "Running..." : "Run Dry Run"}
                       </PrimaryButton>
                     </div>
+                    <SmartImportSnapshotDates value={snapshotDates} stockMissing={stockDatesMissing} outstandingMissing={outstandingDatesMissing}
+                      disabled={runDryRun.isPending || dryRun.isLoading || staging.isLoading}
+                      onChange={(value) => { setDateDraft({ sessionId, value }); setCommitConfirmation(""); }} />
                     <div className="mt-4 border-l-2 border-moss/40 pl-3 text-sm leading-6 text-ink/65">
                       <p className="font-semibold text-ink">{strategyExplanation(dryRunStrategy)}</p>
                       <p>{stockImpactExplanation(dryRunStrategy, stockImpactMode)}</p>
+                      <p>{returnStockImpactExplanation(returnStockImpactMode)}</p>
+                      <p>{stockJournalImpactExplanation(stockJournalImpactMode)}</p>
                       <p className="mt-1 text-xs">Dry run replaces the previous simulation for this session. It never creates final products, parties, invoices, or stock movements.</p>
                     </div>
                   </Panel>
@@ -960,7 +1165,13 @@ export default function SmartImportsPage() {
                   {dryRun.data?.available ? (
                     <>
                       <Panel title="Final Impact Preview" action={<StatusPill value={dryRun.data.status} />}>
+                        <SavedSnapshotDates summary={dryRunSummary} changed={!datesMatchPreview} />
                         <MetricGrid entries={dryRunMetrics(dryRunSummary)} />
+                        {(Number(dryRunSummary?.cashbookRowsUnmatched ?? 0) + Number(dryRunSummary?.cashbookRowsReviewRequired ?? 0)) > 0 ? (
+                          <p className="mt-4 border-l-2 border-amber-400 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                            Unresolved cashbook entries will remain unposted. <button className="underline" onClick={() => setActiveTab("review")}>Review cashbook entries</button>
+                          </p>
+                        ) : null}
                       </Panel>
                       <Panel title="Dry-run Items">
                         <div className="mb-4 flex flex-wrap gap-3">
@@ -972,6 +1183,8 @@ export default function SmartImportsPage() {
                             <option value="WAREHOUSE">Warehouses</option>
                             <option value="STOCK_SNAPSHOT">Stock snapshots</option>
                             <option value="STOCK_MOVEMENT">Stock movements</option>
+                            <option value="STOCK_JOURNAL">Stock journals</option>
+                            <option value="WAREHOUSE_TRANSFER">Warehouse transfers</option>
                             <option value="SALES_INVOICE">Sales invoices</option>
                             <option value="PURCHASE_INVOICE">Purchase invoices</option>
                             <option value="CASHBOOK_ENTRY">Cashbook</option>
@@ -997,23 +1210,30 @@ export default function SmartImportsPage() {
 
               {activeTab === "commit" ? (
                 <div className="space-y-4">
-                  <Panel title="Financial and Payment Smart Import Commit" action={<ShieldCheck size={18} className="text-moss" />}>
+                  <Panel title="Reviewed Smart Import Commit" action={<ShieldCheck size={18} className="text-moss" />}>
+                    <SavedSnapshotDates summary={dryRunSummary} changed={!datesMatchPreview} />
                     <div className="mb-6 border-l-2 border-moss/50 bg-mint/30 px-4 py-3 text-sm leading-6 text-ink/70">
-                      <div className="font-semibold text-moss">Voucher posting mode: Invoice-only, no stock movement</div>
-                      <p>Since closing stock may already define the inventory baseline, sales and purchase invoices are imported without changing stock. This prevents historical vouchers from double-counting inventory.</p>
+                      <div className="font-semibold text-moss">{effectiveStockImpactMode === "APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE"
+                        ? "Inventory effect: Apply only after closing-stock date"
+                        : "Inventory effect: Invoice-only, no stock movement"}</div>
+                      <p>{commitStockImpactExplanation(effectiveStockImpactMode)}</p>
                     </div>
                     <div className="mb-6 border-l-2 border-amber-400 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
-                      <div className="font-semibold">Return stock impact deferred</div>
-                      <p>Credit and debit notes are posted as financial adjustments only. Return stock movements are not posted in this phase; stock remains controlled by the closing stock snapshot.</p>
+                      <div className="font-semibold">Return inventory effect: {readable(dryRunSummary?.returnStockImpactMode || returnStockImpactMode)}</div>
+                      <p>Credit and debit notes do not always represent physical goods movement. Stock changes are created only for confirmed inventory return lines dated after the applicable closing-stock snapshot.</p>
+                    </div>
+                    <div className="mb-6 border-l-2 border-moss/50 bg-mint/30 px-4 py-3 text-sm leading-6 text-ink/70">
+                      <div className="font-semibold text-moss">Stock journal effect: {readable(dryRunSummary?.stockJournalImpactMode || stockJournalImpactMode)}</div>
+                      <p>{stockJournalImpactExplanation((dryRunSummary?.stockJournalImpactMode || stockJournalImpactMode) as StockJournalImpactMode)}</p>
                     </div>
                     <div className="grid gap-6 lg:grid-cols-2">
                       <section className="border-l-2 border-moss/40 pl-4">
-                        <h2 className="text-sm font-semibold text-moss">Phase 4A through 4B-2B writes</h2>
-                        <p className="mt-2 text-sm leading-6 text-ink/65">Foundation data, snapshot adjustments, invoice-only sales/purchases, financial-only credit/debit notes, outstanding snapshots, and high-confidence customer or supplier payments.</p>
+                        <h2 className="text-sm font-semibold text-moss">Phase 4A through 4B-2E writes</h2>
+                        <p className="mt-2 text-sm leading-6 text-ink/65">Foundation data, snapshot adjustments, sales and purchase invoices, eligible post-snapshot stock movements, financial notes, confirmed physical returns, outstanding snapshots, matched payments, and confirmed balanced warehouse transfers.</p>
                       </section>
                       <section className="border-l-2 border-amber-400 pl-4">
                         <h2 className="text-sm font-semibold text-amber-800">Still deferred</h2>
-                        <p className="mt-2 text-sm leading-6 text-ink/65">Unmatched cashbook rows, stock-ageing insights, and every voucher or return stock movement remain staged.</p>
+                        <p className="mt-2 text-sm leading-6 text-ink/65">Ambiguous or damaged returns, manufacturing journals, unilateral stock adjustments, and stock-ageing reconciliation remain deferred.</p>
                       </section>
                     </div>
                     <div className="mt-6 border-y border-ink/10 py-5">
@@ -1026,14 +1246,14 @@ export default function SmartImportsPage() {
                           <Field label="Type COMMIT IMPORT PLAN">
                             <TextInput value={commitConfirmation} onChange={(event) => setCommitConfirmation(event.target.value)} autoComplete="off" />
                           </Field>
-                          <PrimaryButton className="gap-2" onClick={() => commitFoundation.mutate()} disabled={commitFoundation.isPending || commitConfirmation !== "COMMIT IMPORT PLAN" || commitResult.data?.status === "COMMITTED"}>
-                            <Boxes size={16} /> {commitFoundation.isPending ? "Committing safely..." : commitResult.data?.status === "COMMITTED" ? "Import committed" : "Commit Reviewed Import"}
+                          <PrimaryButton className="gap-2" onClick={() => commitFoundation.mutate()} disabled={commitRunning || commitFoundation.isPending || commitConfirmation !== "COMMIT IMPORT PLAN" || commitResult.data?.status === "COMMITTED"}>
+                            <Boxes size={16} /> {commitRunning ? "Committing safely..." : commitResult.data?.status === "COMMITTED" ? "Import committed" : "Commit Reviewed Import"}
                           </PrimaryButton>
                         </div>
                       ) : (
                         <div className="flex gap-3 text-sm text-coral">
                           <ShieldAlert className="mt-0.5 shrink-0" size={18} />
-                          <p>Commit is disabled. Run a completed dry run with zero blocking errors and zero unresolved review items.</p>
+                          <p>Commit is disabled. Confirm all required snapshot dates and run a new dry run with zero blocking errors and zero unresolved review items.</p>
                         </div>
                       )}
                     </div>
@@ -1041,11 +1261,18 @@ export default function SmartImportsPage() {
 
                   {commitResult.data?.available ? (
                     <Panel title="Commit Reconciliation" action={<StatusPill value={commitResult.data.status} />}>
-                      {commitResult.data.status === "FAILED" ? (
+                      {commitResult.data.status === "COMMITTING" ? (
+                        <div role="status" className="border-l-2 border-moss pl-4 text-sm leading-6 text-ink/70">
+                          <p className="font-semibold">Import transaction in progress</p>
+                          <p>Final totals will appear when the transaction completes. Do not submit another commit or stop the backend.</p>
+                          {commitResult.data.startedAt ? <p>Started: {new Date(commitResult.data.startedAt).toLocaleString()}</p> : null}
+                        </div>
+                      ) : commitResult.data.status === "FAILED" ? (
                         <div className="border-l-2 border-coral pl-4 text-sm leading-6 text-coral">
                           {String(commitResult.data.summary?.failureReason || "The commit failed safely. No partial business data was retained.")}
+                          {commitResult.data.summary?.transactionRolledBack ? <p>No business changes from this attempt were saved. Your staged files and review decisions are retained.</p> : null}
                         </div>
-                      ) : (
+                      ) : commitResult.data.status === "COMMITTED" ? (
                         <>
                           <MetricGrid entries={commitMetrics(commitResult.data.summary)} />
                           <p className="mt-5 border-t border-ink/10 pt-4 text-sm text-ink/60">
@@ -1064,7 +1291,7 @@ export default function SmartImportsPage() {
                             {String(commitResult.data.summary?.futurePhaseMessage || "Stock ageing and stock-affecting voucher posting remain deferred.")}
                           </p>
                         </>
-                      )}
+                      ) : null}
                     </Panel>
                   ) : null}
                 </div>
@@ -1133,6 +1360,9 @@ function stagingMetrics(summary?: StagingSummary): Array<[string, number]> {
     ["Debit notes staged", summary?.debitNotesStaged ?? 0], ["Ledger lines captured", summary?.ledgerAdjustmentLinesStaged ?? 0],
     ["Debtors staged", summary?.debtorRowsStaged ?? 0], ["Creditors staged", summary?.creditorRowsStaged ?? 0],
     ["Cashbook entries staged", summary?.cashbookEntriesStaged ?? 0],
+    ["Stock journals detected", summary?.stockJournalsDetected ?? 0],
+    ["Warehouse transfers detected", summary?.warehouseTransfersDetected ?? 0],
+    ["Transfer reviews required", summary?.warehouseTransfersReviewRequired ?? 0],
     ["Stock ageing rows staged", summary?.stockAgeingRowsStaged ?? 0]
   ];
 }
@@ -1154,8 +1384,26 @@ function dryRunMetrics(summary?: DryRunSummary): Array<[string, number]> {
     ["Products matched", Number(summary?.productsMatchedExisting ?? 0)],
     ["Invoices previewed", Number(summary?.purchaseInvoicesPreviewed ?? 0) + Number(summary?.salesInvoicesPreviewed ?? 0) + Number(summary?.creditNotesPreviewed ?? 0) + Number(summary?.debitNotesPreviewed ?? 0)],
     ["Snapshot adjustments", Number(summary?.snapshotAdjustmentsPreviewed ?? 0)],
-    ["Stock movements previewed", Number(summary?.stockMovementsPreviewed ?? 0)],
-    ["Stock movements skipped", Number(summary?.stockMovementsSkippedDueToInvoiceOnly ?? 0) + Number(summary?.stockMovementsSkippedBeforeSnapshotDate ?? 0)],
+    ["Sales movements planned", Number(summary?.salesStockMovementsPlanned ?? 0)],
+    ["Purchase movements planned", Number(summary?.purchaseStockMovementsPlanned ?? 0)],
+    ["Return-in planned", Number(summary?.returnInMovementsPlanned ?? 0)],
+    ["Return-out planned", Number(summary?.returnOutMovementsPlanned ?? 0)],
+    ["Ambiguous returns", Number(summary?.ambiguousReturnNotes ?? 0)],
+    ["Damaged returns deferred", Number(summary?.damagedOrNonSaleableReturnsDeferred ?? 0)],
+    ["Stock journals detected", Number(summary?.stockJournalsDetected ?? 0)],
+    ["Warehouse transfers detected", Number(summary?.warehouseTransfersDetected ?? 0)],
+    ["Transfers eligible", Number(summary?.warehouseTransfersEligible ?? 0)],
+    ["Transfers requiring review", Number(summary?.warehouseTransfersReviewRequired ?? 0)],
+    ["Transfer-out planned", Number(summary?.transferOutMovementsPlanned ?? 0)],
+    ["Transfer-in planned", Number(summary?.transferInMovementsPlanned ?? 0)],
+    ["Transfer net company effect", Number(summary?.netCompanyStockEffect ?? 0)],
+    ["Manufacturing journals deferred", Number(summary?.manufacturingJournalsDeferred ?? 0)],
+    ["Covered by snapshot", Number(summary?.voucherItemsCoveredBySnapshot ?? 0)],
+    ["Same-date items deferred", Number(summary?.sameDateVoucherItemsDeferred ?? 0)],
+    ["Missing snapshot", Number(summary?.voucherItemsWithoutSnapshot ?? 0)],
+    ["Warehouse blocked", Number(summary?.voucherItemsBlockedByWarehouse ?? 0)],
+    ["Negative stock blocked", Number(summary?.movementsBlockedByNegativeStock ?? 0)],
+    ["Movement policy skips", Number(summary?.movementsSkippedByPolicy ?? 0)],
     ["Outstanding snapshots", Number(summary?.outstandingSnapshotsPreviewed ?? 0)],
     ["Payments previewed", Number(summary?.customerPaymentsPreviewed ?? 0) + Number(summary?.supplierPaymentsPreviewed ?? 0)],
     ["Cashbook review", Number(summary?.cashbookRowsUnmatched ?? 0) + Number(summary?.cashbookRowsReviewRequired ?? 0)],
@@ -1187,6 +1435,8 @@ function commitMetrics(summary?: CommitSummary): Array<[string, number]> {
     ["Debit note items", Number(summary?.debitNoteItemsCreated ?? 0)],
     ["Financial ledger lines", Number(summary?.taxLinesCaptured ?? 0) + Number(summary?.discountLinesCaptured ?? 0) + Number(summary?.freightLinesCaptured ?? 0) + Number(summary?.roundOffLinesCaptured ?? 0) + Number(summary?.otherChargeLinesCaptured ?? 0)],
     ["Return movements created", Number(summary?.stockMovementsCreatedFromReturns ?? 0)],
+    ["Return-in movements", Number(summary?.returnInMovementsCreated ?? 0)],
+    ["Return-out movements", Number(summary?.returnOutMovementsCreated ?? 0)],
     ["Return movements deferred", Number(summary?.returnStockMovementsDeferred ?? 0)],
     ["Outstanding snapshots", Number(summary?.outstandingSnapshotsCreated ?? 0)],
     ["Customer payments", Number(summary?.customerPaymentsCreated ?? 0)],
@@ -1194,13 +1444,30 @@ function commitMetrics(summary?: CommitSummary): Array<[string, number]> {
     ["Payments linked to invoices", Number(summary?.paymentsLinkedToSalesInvoices ?? 0) + Number(summary?.paymentsLinkedToPurchaseInvoices ?? 0)],
     ["Cashbook unmatched", Number(summary?.cashbookRowsUnmatched ?? 0) + Number(summary?.cashbookRowsReviewRequired ?? 0)],
     ["Cashbook manually resolved", Number(summary?.cashbookRowsManuallyResolved ?? 0)],
+    ["Retail counter sale rows resolved", Number(summary?.retailCounterSaleRowsResolved ?? 0)],
     ["Cashbook ignored", Number(summary?.cashbookRowsIgnored ?? 0)],
     ["Manual payments", Number(summary?.manualCustomerPaymentsCreated ?? 0) + Number(summary?.manualSupplierPaymentsCreated ?? 0)],
     ["Manual invoice links", Number(summary?.manualPaymentsLinkedToSalesInvoices ?? 0) + Number(summary?.manualPaymentsLinkedToPurchaseInvoices ?? 0)],
     ["Duplicate payments skipped", Number(summary?.duplicatePaymentsSkipped ?? 0)],
     ["Duplicate vouchers skipped", Number(summary?.duplicateSalesVouchersSkipped ?? 0) + Number(summary?.duplicatePurchaseVouchersSkipped ?? 0)],
     ["Voucher stock movements", Number(summary?.voucherStockMovementsCreated ?? 0)],
-    ["Stock movements skipped", Number(summary?.stockMovementsSkippedDueToInvoiceOnly ?? 0)],
+    ["Sales stock movements", Number(summary?.salesStockMovementsCreated ?? 0)],
+    ["Purchase stock movements", Number(summary?.purchaseStockMovementsCreated ?? 0)],
+    ["Covered by snapshot", Number(summary?.voucherItemsCoveredBySnapshot ?? 0)],
+    ["Same-date items deferred", Number(summary?.sameDateVoucherItemsDeferred ?? 0)],
+    ["Missing snapshot", Number(summary?.voucherItemsWithoutSnapshot ?? 0)],
+    ["Duplicate movements skipped", Number(summary?.duplicateStockMovementsSkipped ?? 0)],
+    ["Negative movements skipped", Number(summary?.negativeStockMovementsSkipped ?? 0)],
+    ["Warehouse transfers committed", Number(summary?.warehouseTransfersCommitted ?? 0)],
+    ["Transfer pairs created", Number(summary?.transferPairsCreated ?? 0)],
+    ["Transfer-out movements", Number(summary?.transferOutMovementsCreated ?? 0)],
+    ["Transfer-in movements", Number(summary?.transferInMovementsCreated ?? 0)],
+    ["Transfer net company change", Number(summary?.netCompanyStockQuantityChange ?? 0)],
+    ["Transfers covered by snapshot", Number(summary?.warehouseTransfersCoveredBySnapshot ?? 0)],
+    ["Transfers without baseline", Number(summary?.warehouseTransfersWithoutBaseline ?? 0)],
+    ["Unresolved transfers", Number(summary?.unresolvedWarehouseTransfers ?? 0)],
+    ["Duplicate transfers skipped", Number(summary?.duplicateWarehouseTransfersSkipped ?? 0)],
+    ["Manufacturing journals deferred", Number(summary?.manufacturingJournalsDeferred ?? 0)],
     ["Records still deferred", Number(summary?.vouchersDeferredForFuturePhase ?? 0) + Number(summary?.futurePhaseCashbookRowsSkipped ?? 0) + Number(summary?.futurePhaseAgeingRowsSkipped ?? 0)]
   ];
 }
@@ -1216,6 +1483,9 @@ function voucherReadyMetrics(summary?: DryRunSummary): Array<[string, number]> {
     ["Cashbook rows ready", Number(summary?.cashbookRowsReady ?? 0)],
     ["Payments to create", Number(summary?.customerPaymentsPreviewed ?? 0) + Number(summary?.supplierPaymentsPreviewed ?? 0)],
     ["Review required entries", Number(summary?.cashbookRowsReviewRequired ?? 0) + Number(summary?.cashbookRowsUnmatched ?? 0)],
+    ["Warehouse transfers eligible", Number(summary?.warehouseTransfersEligible ?? 0)],
+    ["Transfer pairs planned", Math.min(Number(summary?.transferOutMovementsPlanned ?? 0), Number(summary?.transferInMovementsPlanned ?? 0))],
+    ["Transfer review required", Number(summary?.warehouseTransfersReviewRequired ?? 0)],
     ["Voucher items ready", Number(summary?.voucherItemsReady ?? 0)],
     ["Ledger lines captured", Number(summary?.taxLinesCaptured ?? 0) + Number(summary?.discountLinesCaptured ?? 0) + Number(summary?.freightLinesCaptured ?? 0) + Number(summary?.roundOffLinesCaptured ?? 0)],
     ["Vouchers blocked", Number(summary?.vouchersBlocked ?? 0)],
@@ -1229,16 +1499,36 @@ function defaultStockImpactMode(): StockImpactMode {
 
 function strategyExplanation(strategy: Strategy) {
   if (strategy === "SNAPSHOT_FIRST") return "Snapshot-first uses closing stock as the stock baseline.";
-  if (strategy === "TRANSACTION_HISTORY") return "Transaction history reconstructs stock from purchase, sale, and return vouchers.";
+  if (strategy === "TRANSACTION_HISTORY") return "Transaction history creates sales and purchase invoices; its inventory effect is controlled separately below.";
   if (strategy === "HYBRID_RECONCILIATION") return "Hybrid reconciliation combines transaction history with a dated closing-stock checkpoint.";
   return "Choose a strategy before running the simulation.";
 }
 
 function stockImpactExplanation(strategy: Strategy, mode: StockImpactMode) {
   if (mode === "CREATE_INVOICES_ONLY") return "Vouchers are previewed as invoices without ledger movements, preventing snapshot stock from being counted twice.";
-  if (mode === "APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE") return "Vouchers on or before the snapshot date are invoice-only; later vouchers preview stock movements.";
-  if (strategy === "SNAPSHOT_FIRST") return "All voucher movements are previewed. Review this carefully because historical movements may overlap the snapshot.";
-  return "Purchases, sales, and supported returns preview their corresponding stock-ledger movements.";
+  if (mode === "APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE") return "Closing stock is the inventory baseline. Vouchers on or before the applicable snapshot date are invoice-only; later sales and purchases preview stock movements.";
+  return strategy === "SNAPSHOT_FIRST" ? "Snapshot stock remains the inventory baseline." : "Choose an inventory effect.";
+}
+
+function returnStockImpactExplanation(mode: ReturnStockImpactMode) {
+  if (mode === "APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE") {
+    return "Confirmed physical customer returns create RETURN_IN and confirmed supplier returns create RETURN_OUT only when they are strictly after the applicable closing-stock snapshot.";
+  }
+  return "Credit and debit notes remain financial-only. No return stock movement will be created.";
+}
+
+function stockJournalImpactExplanation(mode: StockJournalImpactMode) {
+  if (mode === "APPLY_CONFIRMED_WAREHOUSE_TRANSFERS_AFTER_SNAPSHOT_DATE") {
+    return "Confirmed balanced transfers dated strictly after both warehouse-specific closing-stock baselines create one linked TRANSFER_OUT and TRANSFER_IN. Company-wide stock remains unchanged.";
+  }
+  return "Stock journals are staged for review but create no inventory movements. Manufacturing and unbalanced journals remain deferred.";
+}
+
+function commitStockImpactExplanation(mode: StockImpactMode) {
+  if (mode === "APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE") {
+    return "StockPilot uses the latest applicable closing-stock snapshot as the baseline. Sales and purchases strictly after that date change stock; same-date and earlier vouchers remain invoice-only.";
+  }
+  return "Sales and purchase invoices are imported without changing stock. Closing-stock snapshots remain the only inventory effect.";
 }
 
 function dryRunItemName(row: DryRunItem) {
@@ -1247,7 +1537,7 @@ function dryRunItemName(row: DryRunItem) {
 }
 
 function dryRunImpact(preview: Record<string, unknown>) {
-  const preferred = ["snapshotDate", "stockAtSnapshotDate", "importedSnapshotQuantity", "deltaAtSnapshotDate", "projectedCurrentStockAfterApplyingLaterTransactions", "quantity", "rateSource", "invoiceItemCount", "reason"];
+  const preferred = ["classification", "classificationConfidence", "decisionReasons", "resolutionStatus", "sourceWarehouseName", "destinationWarehouseName", "rawOutwardQuantity", "rawInwardQuantity", "normalizedQuantity", "sourceWarehouseStock", "projectedSourceStock", "destinationWarehouseStock", "projectedDestinationStock", "companyWideNetEffect", "sourceSnapshotDate", "destinationSnapshotDate", "effectiveEligibilityDate", "postingDecision", "returnClassification", "returnDirection", "disposition", "userResolutionStatus", "applicableSnapshotDate", "currentStock", "rawQuantity", "quantity", "signedQuantity", "projectedStock", "movementType", "stockMovementAction", "eligibilityReason", "snapshotDate", "stockAtSnapshotDate", "importedSnapshotQuantity", "deltaAtSnapshotDate", "projectedCurrentStockAfterApplyingLaterTransactions", "rateSource", "invoiceItemCount", "reason"];
   const details = preferred
     .filter((key) => preview[key] !== undefined && preview[key] !== "")
     .map((key) => `${readable(key)}: ${String(preview[key])}`);
@@ -1262,6 +1552,14 @@ function fileSize(bytes: number) {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   if (bytes >= 1024) return `${Math.ceil(bytes / 1024)} KB`;
   return `${bytes} bytes`;
+}
+
+function formatContentCounts(counts?: Record<string, number>) {
+  if (!counts) return "";
+  return Object.entries(counts)
+    .filter(([, count]) => Number(count) > 0)
+    .map(([label, count]) => `${readable(label)} ${Number(count).toLocaleString("en-IN")}`)
+    .join(" | ");
 }
 
 function dateRange(file: SessionFile) {

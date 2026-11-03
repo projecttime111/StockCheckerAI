@@ -37,12 +37,17 @@ public class JwtService {
     }
 
     public String issue(UUID userId, UUID tenantId, String email, DomainEnums.Role role) {
+        return issue(userId, tenantId, email, role, 0);
+    }
+
+    public String issue(UUID userId, UUID tenantId, String email, DomainEnums.Role role, long authVersion) {
         var now = Instant.now();
         return Jwts.builder()
             .subject(email)
             .claim("uid", userId.toString())
             .claim("tid", tenantId.toString())
             .claim("role", role.name())
+            .claim("av", authVersion)
             .issuedAt(Date.from(now))
             .expiration(Date.from(now.plusSeconds(accessTokenMinutes * 60)))
             .signWith(key)
@@ -50,10 +55,15 @@ public class JwtService {
     }
 
     public String issueAccountOnly(UUID userId, String email) {
+        return issueAccountOnly(userId, email, 0);
+    }
+
+    public String issueAccountOnly(UUID userId, String email, long authVersion) {
         var now = Instant.now();
         return Jwts.builder()
             .subject(email)
             .claim("uid", userId.toString())
+            .claim("av", authVersion)
             .issuedAt(Date.from(now))
             .expiration(Date.from(now.plusSeconds(accessTokenMinutes * 60)))
             .signWith(key)

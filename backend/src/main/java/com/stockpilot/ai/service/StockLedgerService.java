@@ -131,7 +131,7 @@ public class StockLedgerService {
         movement.unitId = unitId == null ? product.baseUnitId : unitId;
         movement.baseQuantity = signed;
         movement.rate = rate == null ? BigDecimal.ZERO : rate;
-        movement.totalValue = signed.abs().multiply(movement.rate);
+        movement.totalValue = quantity.abs().multiply(movement.rate);
         movement.referenceType = referenceType;
         movement.referenceId = referenceId;
         movement.movementDate = movementDate == null ? Instant.now() : movementDate;
@@ -185,7 +185,7 @@ public class StockLedgerService {
         movement.unitId = unitId == null ? product.baseUnitId : unitId;
         movement.baseQuantity = baseQuantity;
         movement.rate = rate == null ? BigDecimal.ZERO : rate;
-        movement.totalValue = baseQuantity.abs().multiply(movement.rate);
+        movement.totalValue = quantity.abs().multiply(movement.rate);
         movement.referenceType = "IMPORT_BATCH";
         movement.referenceId = importBatchId;
         movement.movementDate = movementDate == null ? Instant.now() : movementDate;
@@ -274,7 +274,12 @@ public class StockLedgerService {
             return quantity;
         }
         return conversions.findByTenantIdAndProductIdAndFromUnitIdAndToUnitId(tenantId, product.id, unitId, product.baseUnitId)
-            .map(conversion -> quantity.multiply(conversion.multiplier))
+            .map(conversion -> {
+                if (conversion.multiplier == null || conversion.multiplier.signum() <= 0) {
+                    throw ApiErrors.badRequest("Unit conversion must be positive for " + product.name);
+                }
+                return quantity.multiply(conversion.multiplier);
+            })
             .orElseThrow(() -> ApiErrors.badRequest("Unit conversion is not configured for " + product.name));
     }
 
@@ -303,10 +308,22 @@ public class StockLedgerService {
     }
 
     private BigDecimal latestCost(UUID tenantId, Product product) {
-        return movements.findFirstByTenantIdAndProductIdAndMovementTypeOrderByMovementDateDesc(tenantId, product.id, DomainEnums.MovementType.PURCHASE)
-            .map(movement -> movement.rate)
+        return latestCost(tenantId, product.id, product.defaultPurchasePrice);
+    }
+
+    public BigDecimal latestCost(UUID tenantId, UUID productId, BigDecimal fallback) {
+        return movements.findFirstByTenantIdAndProductIdAndMovementTypeOrderByMovementDateDesc(tenantId, productId, DomainEnums.MovementType.PURCHASE)
+            .filter(movement -> movement.baseQuantity != null && movement.baseQuantity.signum() != 0)
+            .filter(movement -> movement.quantity != null && movement.rate != null)
+            .map(movement -> movement.rate.multiply(movement.quantity.abs())
+                .divide(movement.baseQuantity.abs(), 6, java.math.RoundingMode.HALF_UP))
             .filter(rate -> rate != null && rate.compareTo(BigDecimal.ZERO) > 0)
-            .orElse(product.defaultPurchasePrice == null ? BigDecimal.ZERO : product.defaultPurchasePrice);
+            .orElse(fallback == null ? BigDecimal.ZERO : fallback);
+    }
+
+    BigDecimal toBaseRate(UUID tenantId, Product product, UUID unitId, BigDecimal sourceRate) {
+        return sourceRate.divide(toBaseQuantity(tenantId, product, unitId, BigDecimal.ONE),
+            6, java.math.RoundingMode.HALF_UP);
     }
 
     private StockPolicyResult enforceStockPolicy(UUID tenantId, UUID productId, UUID warehouseId, DomainEnums.MovementType type, BigDecimal signedQuantity) {

@@ -99,7 +99,7 @@ public class PurchaseService {
             items.save(item);
             subtotal = subtotal.add(lineSubtotal);
             tax = tax.add(lineTax);
-            product.defaultPurchasePrice = line.rate();
+            product.defaultPurchasePrice = stockLedger.toBaseRate(tenantId, product, item.unitId, line.rate());
             products.save(product);
             stockLedger.createMovement(tenantId, product.id, request.warehouseId(), DomainEnums.MovementType.PURCHASE, line.quantity(), item.unitId, line.rate(), "PURCHASE_INVOICE", invoice.id, request.invoiceDate().atStartOfDay().toInstant(ZoneOffset.UTC), "Purchase " + request.invoiceNumber());
         }

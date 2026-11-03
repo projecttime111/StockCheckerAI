@@ -29,7 +29,7 @@ public class AiAssistantService {
     private final Repositories.CustomerRepository customers;
     private final Repositories.SupplierRepository suppliers;
     private final Repositories.SalesInvoiceRepository invoices;
-    private final Repositories.CustomerPaymentRepository payments;
+    private final OutstandingService outstanding;
     private final ProductCategorizationService categorization;
     private final ProfitInsightService profitInsights;
     private final ReorderEngineService reorderEngine;
@@ -45,7 +45,7 @@ public class AiAssistantService {
         Repositories.CustomerRepository customers,
         Repositories.SupplierRepository suppliers,
         Repositories.SalesInvoiceRepository invoices,
-        Repositories.CustomerPaymentRepository payments,
+        OutstandingService outstanding,
         ProductCategorizationService categorization,
         ProfitInsightService profitInsights,
         ReorderEngineService reorderEngine,
@@ -60,7 +60,7 @@ public class AiAssistantService {
         this.customers = customers;
         this.suppliers = suppliers;
         this.invoices = invoices;
-        this.payments = payments;
+        this.outstanding = outstanding;
         this.categorization = categorization;
         this.profitInsights = profitInsights;
         this.reorderEngine = reorderEngine;
@@ -252,14 +252,9 @@ public class AiAssistantService {
 
     private String outstanding(Map<String, Object> evidence) {
         var tenantId = TenantContext.tenantId();
-        var rows = customers.findByTenantIdOrderByNameAsc(tenantId).stream().map(customer -> {
-            var invoiced = invoices.findByTenantId(tenantId).stream()
-                .filter(invoice -> customer.id.equals(invoice.customerId))
-                .map(invoice -> invoice.totalAmount)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-            var paid = payments.totalPaymentsForCustomer(tenantId, customer.id);
-            return Map.entry(customer.name, customer.openingBalance.add(invoiced).subtract(paid == null ? BigDecimal.ZERO : paid));
-        }).sorted(Map.Entry.<String, BigDecimal>comparingByValue(Comparator.reverseOrder())).toList();
+        var rows = customers.findByTenantIdOrderByNameAsc(tenantId).stream()
+            .map(customer -> Map.entry(customer.name, outstanding.customerOutstanding(tenantId, customer.id)))
+            .sorted(Map.Entry.<String, BigDecimal>comparingByValue(Comparator.reverseOrder())).toList();
         evidence.put("customerOutstanding", rows);
         if (rows.isEmpty()) {
             return "Customer data is missing, so I cannot calculate outstanding balances yet.";

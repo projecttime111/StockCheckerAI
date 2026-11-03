@@ -43,7 +43,7 @@ public class SmartImportCanonicalParserService {
                 return cashbookRows(input);
             }
             if (isXml(file) && type == DomainEnums.DetectedFileType.DEBTOR_CREDITOR_ANALYSIS) {
-                return debtorCreditorRows(input);
+                return debtorCreditorRows(input, file);
             }
             if (isXml(file) && type == DomainEnums.DetectedFileType.STOCK_AGEING) {
                 return stockAgeingRows(input);
@@ -77,8 +77,9 @@ public class SmartImportCanonicalParserService {
             return true;
         }
         return switch (type) {
-            case INVENTORY_MASTER, ACCOUNTING_MASTER, STOCK_SNAPSHOT, SALES_VOUCHERS, PURCHASE_VOUCHERS,
-                CREDIT_NOTES, DEBIT_NOTES, STOCK_JOURNAL -> file.detectedFileType == type && file.confidence != null
+            case INVENTORY_MASTER, ACCOUNTING_MASTER, MIXED_TALLY_MASTERS, STOCK_SNAPSHOT,
+                SALES_VOUCHERS, PURCHASE_VOUCHERS, CREDIT_NOTES, DEBIT_NOTES, STOCK_JOURNAL,
+                MIXED_TALLY_VOUCHERS -> file.detectedFileType == type && file.confidence != null
                     && file.confidence.compareTo(new java.math.BigDecimal("0.90")) >= 0;
             default -> false;
         };
@@ -96,6 +97,7 @@ public class SmartImportCanonicalParserService {
             row.put("Party Name", first(voucher, "PARTYLEDGERNAME", "LEDGERNAME"));
             row.put("Amount", first(voucher, "AMOUNT", "TOTALAMOUNT"));
             row.put("Voucher Number", first(voucher, "VOUCHERNUMBER", "REFERENCENUMBER"));
+            row.put("Invoice Reference", first(voucher, "REFERENCENUMBER", "BILLREF", "BILLNAME"));
             row.put("Reference Number", first(voucher, "REFERENCENUMBER", "BILLREF", "BILLNAME", "VOUCHERNUMBER"));
             row.put("GSTIN", first(voucher, "PARTYGSTIN", "GSTIN"));
             row.put("Payment Mode", first(voucher, "PAYMENTMODE", "INSTRUMENTTYPE", "TRANSACTIONTYPE"));
@@ -105,9 +107,10 @@ public class SmartImportCanonicalParserService {
         return rows.isEmpty() ? genericRows(document) : rows;
     }
 
-    private List<Map<String, String>> debtorCreditorRows(InputStream input) throws Exception {
+    private List<Map<String, String>> debtorCreditorRows(InputStream input, ImportSessionFile file) throws Exception {
         var document = genericXml.parseDocument(input);
         var rows = new ArrayList<Map<String, String>>();
+        addTallyOutstandingRows(document, rows, outstandingPartyType(file));
         addPartyNodes(document, rows, "DEBTOR", "CUSTOMER");
         addPartyNodes(document, rows, "CREDITOR", "SUPPLIER");
         if (rows.isEmpty()) {
@@ -118,6 +121,80 @@ public class SmartImportCanonicalParserService {
             }
         }
         return rows.isEmpty() ? genericRows(document) : rows;
+    }
+
+    private void addTallyOutstandingRows(Document document, List<Map<String, String>> rows, String partyType) {
+        var names = document.getElementsByTagName("DSPACCNAME");
+        for (int index = 0; index < names.getLength(); index++) {
+            var name = (Element) names.item(index);
+            var info = nextElementSibling(name, "DSPACCINFO");
+            if (info == null) continue;
+
+            var partyName = first(name, "DSPDISPNAME", "NAME");
+            if (partyName.isBlank()) continue;
+            var debit = first(info, "DSPCLDRAMTA", "DSPCLDRAMT");
+            var credit = first(info, "DSPCLCRAMTA", "DSPCLCRAMT");
+            var balance = firstNonZeroAmount(debit, credit);
+
+            var row = new LinkedHashMap<String, String>();
+            row.put("Party Name", partyName);
+            row.put("Opening Balance", absoluteAmount(balance));
+            row.put("Snapshot Date", fileDate(document));
+            row.put("Party Type", partyType);
+            row.put("Debit Balance", debit);
+            row.put("Credit Balance", credit);
+            row.put("Source Entity", "DEBTOR_CREDITOR");
+            rows.add(row);
+        }
+    }
+
+    private String outstandingPartyType(ImportSessionFile file) {
+        var metadataType = file.metadataJson == null ? null : file.metadataJson.get("outstandingPartyType");
+        if (metadataType != null && !metadataType.toString().isBlank()) {
+            return metadataType.toString().toUpperCase(Locale.ROOT);
+        }
+        var name = file.originalFileName == null ? "" : file.originalFileName.toLowerCase(Locale.ROOT);
+        if (name.contains("creditor") || name.contains("payable")) return "SUPPLIER";
+        if (name.contains("debtor") || name.contains("receivable")) return "CUSTOMER";
+        return "UNKNOWN";
+    }
+
+    private String fileDate(Document document) {
+        var root = document.getDocumentElement();
+        return root == null ? "" : first(root, "SVTODATE", "TODATE", "ASSONDATE", "REPORTDATE");
+    }
+
+    private Element nextElementSibling(Element element, String tagName) {
+        var current = element.getNextSibling();
+        while (current != null) {
+            if (current instanceof Element sibling) {
+                return tagName.equalsIgnoreCase(sibling.getTagName()) ? sibling : null;
+            }
+            current = current.getNextSibling();
+        }
+        return null;
+    }
+
+    private String firstNonZeroAmount(String... values) {
+        for (var value : values) {
+            if (value == null || value.isBlank()) continue;
+            try {
+                var parsed = new java.math.BigDecimal(value.replace(",", "").replaceAll("[^0-9.\\-]", ""));
+                if (parsed.signum() != 0) return value;
+            } catch (NumberFormatException ignored) {
+                // Keep looking for a usable balance field.
+            }
+        }
+        return "0";
+    }
+
+    private String absoluteAmount(String value) {
+        try {
+            var cleaned = value == null ? "" : value.replace(",", "").replaceAll("[^0-9.\\-]", "");
+            return cleaned.isBlank() ? "0" : new java.math.BigDecimal(cleaned).abs().stripTrailingZeros().toPlainString();
+        } catch (NumberFormatException ignored) {
+            return value == null ? "0" : value;
+        }
     }
 
     private List<Map<String, String>> stockAgeingRows(InputStream input) throws Exception {

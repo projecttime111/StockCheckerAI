@@ -107,8 +107,8 @@ public class AccountLifecycleService {
             .findFirst();
         var onboardingRequired = nextMembership.isEmpty();
         var token = nextMembership
-            .map(activeMembership -> jwtService.issue(account.id, activeMembership.tenantId, account.email, activeMembership.role))
-            .orElseGet(() -> jwtService.issueAccountOnly(account.id, account.email));
+            .map(activeMembership -> jwtService.issue(account.id, activeMembership.tenantId, account.email, activeMembership.role, account.authVersion))
+            .orElseGet(() -> jwtService.issueAccountOnly(account.id, account.email, account.authVersion));
         scheduleFileCleanup(tenantId, actorUserId, outcome.storageKeys);
         return new ApiDtos.WorkspaceDeletionResponse(
             "DELETED",
@@ -143,7 +143,7 @@ public class AccountLifecycleService {
         membership.role = DomainEnums.Role.OWNER;
         memberships.save(membership);
         audit.log(tenant.id, userId, "WORKSPACE_CREATED", "Tenant", tenant.id, Map.of("onboarding", true));
-        var token = jwtService.issue(userId, tenant.id, account.email, membership.role);
+        var token = jwtService.issue(userId, tenant.id, account.email, membership.role, account.authVersion);
         return new ApiDtos.AuthResponse(token, tenant.id, userId, membership.role, account.email, account.fullName);
     }
 
@@ -205,8 +205,11 @@ public class AccountLifecycleService {
             "sales_invoice_items",
             "purchase_invoice_items",
             "customer_payments",
+            "retail_counter_sales",
             "supplier_payments",
+            "smart_staged_transfer_candidates",
             "stock_movements",
+            "stock_snapshot_baselines",
             "forecast_results",
             "reorder_suggestions",
             "dead_stock_insights",

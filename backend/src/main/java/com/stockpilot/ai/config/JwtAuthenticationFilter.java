@@ -56,6 +56,10 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         var claims = jwtService.parse(token);
         var userId = jwtService.userId(claims);
         var account = users.findById(userId).filter(user -> user.active).orElseThrow();
+        var tokenVersion = claims.get("av", Number.class);
+        if ((tokenVersion == null ? 0 : tokenVersion.longValue()) != account.authVersion) {
+            throw new IllegalStateException("Token has been revoked");
+        }
         if (!account.email.equalsIgnoreCase(claims.getSubject())) {
             throw new IllegalStateException("Token subject does not match user");
         }

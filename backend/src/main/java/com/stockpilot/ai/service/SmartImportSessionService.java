@@ -55,7 +55,7 @@ public class SmartImportSessionService {
         ImportFileClassifierService classifier,
         ImportPlanBuilderService planBuilder,
         AuditService auditService,
-        @Value("${app.import.max-upload-size:150MB}") DataSize maxUploadSize
+        @Value("${app.import.max-upload-size:500MB}") DataSize maxUploadSize
     ) {
         this.sessions = sessions;
         this.files = files;

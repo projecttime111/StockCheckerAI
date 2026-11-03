@@ -10,11 +10,10 @@ import java.util.Map;
 @Service
 public class GoogleTokenInfoIdentityService implements GoogleIdentityService {
     private final String clientId;
-    private final RestClient client;
+    private volatile RestClient client;
 
     public GoogleTokenInfoIdentityService(@Value("${app.auth.google-client-id:}") String clientId) {
         this.clientId = clientId;
-        this.client = RestClient.builder().baseUrl("https://oauth2.googleapis.com").build();
     }
 
     @Override
@@ -25,7 +24,7 @@ public class GoogleTokenInfoIdentityService implements GoogleIdentityService {
         }
         Map<String, Object> tokenInfo;
         try {
-            tokenInfo = client.get()
+            tokenInfo = client().get()
                 .uri(uriBuilder -> uriBuilder.path("/tokeninfo").queryParam("id_token", idToken).build())
                 .retrieve()
                 .body(Map.class);
@@ -44,5 +43,19 @@ public class GoogleTokenInfoIdentityService implements GoogleIdentityService {
             throw ApiErrors.badRequest("Google sign-in token is invalid.");
         }
         return new GoogleUserInfo(subject, email.trim().toLowerCase(), name);
+    }
+
+    private RestClient client() {
+        var current = client;
+        if (current == null) {
+            synchronized (this) {
+                current = client;
+                if (current == null) {
+                    current = RestClient.builder().baseUrl("https://oauth2.googleapis.com").build();
+                    client = current;
+                }
+            }
+        }
+        return current;
     }
 }

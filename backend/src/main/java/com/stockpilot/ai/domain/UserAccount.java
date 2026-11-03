@@ -23,4 +23,5 @@ public class UserAccount extends BaseAudit {
     public Instant passwordResetTokenExpiresAt;
     public Instant passwordResetRequestedAt;
     public Instant passwordResetUsedAt;
+    public long authVersion = 0;
 }

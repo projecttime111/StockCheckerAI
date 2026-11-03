@@ -201,9 +201,9 @@ Click **Classify, stage, and match**. Review the workspace tabs:
 - **Review Queue:** possible duplicates, ambiguous identities, unknown warehouses, duplicate vouchers, and source-data warnings. Simple choices can be resolved and persisted across rebuilds.
 - **Plan:** recommended snapshot-first, transaction-history, or hybrid strategy and the proposed internal processing order.
 - **Dry Run:** choose the strategy, voucher stock-impact mode, and negative-stock policy; run a non-posting final-impact simulation and inspect filtered reconciliation items.
-- **Final Commit:** after a clean invoice-only dry run, type `COMMIT IMPORT PLAN` and use **Commit Reviewed Import**.
+- **Final Commit:** after a clean reviewed dry run, type `COMMIT IMPORT PLAN` and use **Commit Reviewed Import**.
 
-Smart Import Phase 4B-2B commits the Phase 4A foundation, reviewed Sales and Purchase invoice headers/items, credit/debit notes as financial adjustments, debtor/creditor outstanding snapshots, and high-confidence cashbook payments. Select `CREATE_INVOICES_ONLY`: no voucher, cashbook, outstanding, or return stock movement is written, so a previously imported closing-stock snapshot remains the inventory source of truth. Stock-ageing actions, unmatched cashbook entries, and stock-affecting Smart Import voucher posting remain deferred.
+Smart Import Phase 4B-2D commits the Phase 4A foundation, reviewed Sales and Purchase invoice headers/items, eligible post-snapshot inventory movements, credit/debit notes as financial adjustments, confirmed physical return movements, debtor/creditor outstanding snapshots, and high-confidence cashbook payments. `CREATE_INVOICES_ONLY` keeps every sales/purchase item stock-neutral. `APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE` creates stock movements only for genuine inventory items strictly after their applicable closing-stock snapshot. Return inventory effect is selected separately.
 
 In the staging preview, verify that debtor rows are customers, creditor rows are suppliers, snapshot dates and balances match the report, and cashbook entries show their match status and evidence. `MATCHED_SALES_INVOICE` and `MATCHED_PURCHASE_INVOICE` create linked payments. Exact party-only matches create unlinked customer or supplier payments. `LOW_CONFIDENCE_REVIEW` and `UNMATCHED_REVIEW` stay staged and are counted after commit; do not force a match merely to clear the review list.
 
@@ -211,9 +211,15 @@ To resolve a deferred cashbook row, open **Review Queue**, then use **Unmatched 
 
 The safe commit is transactional and repeat-safe. If a write fails, no partial business records remain. Reusing the same committed session returns the existing result. Re-importing an identical closing-stock snapshot in a new session calculates a zero delta and creates no movement. If files, review decisions, staged rows, or stock-at-snapshot-date changed after dry run, run the dry run again before committing.
 
-For closing-stock exports, verify these dry-run fields: snapshot date, stock at snapshot date, imported quantity, delta at snapshot date, and projected current stock. Re-running the same already-reflected snapshot should show `NO_CHANGE`. Every Sales/Purchase voucher shows invoice creation with skipped stock impact, every credit/debit note shows financial-adjustment creation with deferred return stock impact, and every cashbook row shows matched, unmatched, review-required, or duplicate status.
+For closing-stock exports, verify these dry-run fields: snapshot date, stock at snapshot date, imported quantity, delta at snapshot date, and projected current stock. Re-running the same already-reflected snapshot should show `NO_CHANGE`. For post-snapshot mode, inspect each voucher item's applicable snapshot date, movement action, current/projected stock, warehouse, eligibility reason, and negative-stock result. Same-date and earlier items must show no movement. Credit/debit notes remain stock-neutral in `FINANCIAL_ONLY`; confirmed physical lines may create movements only in `APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE`.
 
-After commit, verify invoice and note counts plus `outstandingSnapshotsCreated`, `customerPaymentsCreated`, `supplierPaymentsCreated`, `cashbookRowsMatched`, `cashbookRowsUnmatched`, `cashbookRowsReviewRequired`, and `duplicatePaymentsSkipped`. `voucherStockMovementsCreated` and `stockMovementsCreatedFromReturns` must both be `0`; `returnStockMovementsDeferred` reports note item rows not posted to inventory. Re-importing the same cashbook in a new session should increment `duplicatePaymentsSkipped` and create no additional payments.
+After commit, verify invoice/note counts plus `salesStockMovementsCreated`, `purchaseStockMovementsCreated`, `returnInMovementsCreated`, `returnOutMovementsCreated`, covered/same-date counters, duplicate stock effects, and negative-stock counters. In financial-only mode, `stockMovementsCreatedFromReturns` remains `0`; in physical mode it must equal only newly created return movements. `returnStockMovementsDeferred` reports note rows not posted to inventory. Re-importing the same source must not create duplicate payments or stock effects.
+
+To resolve an ambiguous return, open **Review Queue** and use **Physical Return Review**. Confirm the product, receiving/leaving warehouse, normalized quantity, and `RESTOCK_TO_AVAILABLE`; type `POST RETURN STOCK` exactly. Choose **Financial-only** for tax/rate/discount claims with no physical goods movement, or **Keep unresolved** when evidence is insufficient. Damaged, expired, rejected, scrap, and non-saleable returns should remain deferred from available stock.
+
+Return worked check: closing stock `2026-03-31` Product A `100`; customer return `5` on `2026-03-30` and supplier return `4` on `2026-03-31` create no movement; confirmed customer return `10` on `2026-04-01` creates `RETURN_IN`; confirmed supplier return `6` on `2026-04-02` creates `RETURN_OUT`; expected stock is `104`.
+
+If post-snapshot mode reports `NO_APPLICABLE_STOCK_SNAPSHOT`, upload or resolve the correct dated closing-stock report and rerun staging/dry run. If it reports an unresolved godown, map or approve that exact tenant warehouse; do not select an arbitrary default. Product-level snapshot fallback is allowed with a warning when the export lacks warehouse-level quantities. For negative projected sales, choose `BLOCK`, `SKIP_STOCK_MOVEMENT`, or `IMPORT_AS_IS` only after reviewing the business policy; import-as-is also requires the tenant negative-stock setting.
 
 Files may be uploaded in any order. Smart Import classifies and stages them first, then applies its internal dependency-aware plan. This removes manual upload sequencing without weakening tenant, duplicate, or review controls.
 
@@ -279,8 +285,7 @@ Voucher stock-impact workflow after closing stock:
 
 1. If Closing Stock was imported first, upload historical Purchase/Sales XML using `CREATE_INVOICES_ONLY`. StockPilot creates invoices and line items for revenue, cost, supplier, and customer analysis while current stock remains equal to the snapshot.
 2. Use `APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE` when the file contains transactions around the cutoff. Rows on or before the latest snapshot date become invoice-only; later rows create movements.
-3. Use `CREATE_INVOICES_AND_STOCK_MOVEMENTS` only when intentionally rebuilding stock from transaction history. Historical overlap with a snapshot requires an explicit checkbox confirmation and is audit logged.
-4. To build a pure movement ledger, start with Opening Stock, then import purchases, sales, and returns in date order. Do not import final Closing Stock first in that workflow.
+3. Smart Import does not expose unrestricted historical stock posting in Phase 4B-2C. To build a pure movement ledger, use a separately reviewed opening-balance and transaction-history workflow; do not mix it with a final closing-stock snapshot.
 
 Expected reconciliation for invoice-only historical purchases:
 
@@ -381,6 +386,27 @@ If PostgreSQL contains old test data and you want a completely clean database:
 - easiest safe path: use Import Undo for one bad batch, or use Settings > Danger Zone > Reset workspace data for a full current-tenant cleanup.
 - local/dev only: set `APP_DEV_TOOLS_ENABLED=true`, restart backend in `dev` profile, open Settings, type `RESET WORKSPACE`, and reset current tenant business data.
 
+## Test A Tally Stock Journal Transfer
+
+1. Import closing-stock snapshots that identify both the source and destination godowns.
+2. Upload the Tally Stock Journal in Smart Import and stage it.
+3. Open Review Queue and verify the classification is `WAREHOUSE_TRANSFER`.
+4. Exact balanced matches can be `AUTO_CONFIRMED`. Ambiguous entries require tenant product,
+   source warehouse, destination warehouse, quantity, and exact `POST STOCK TRANSFER` confirmation.
+5. In Dry Run, choose **Apply confirmed warehouse transfers after closing-stock date**.
+6. Confirm the transfer is strictly after both warehouse baseline dates.
+7. Confirm one transfer-out and one transfer-in are planned and net company stock effect is zero.
+8. Commit and check reconciliation plus the warehouse stock ledger.
+
+Example: East `100`, West `40`, transfer `20` produces East `80`, West `60`, total `140`.
+Re-uploading the same voucher must not create another pair. Transfers dated on or before either
+baseline remain covered by the snapshot. A company/product-level snapshot without godown
+allocation blocks automatic posting.
+
+Manufacturing consumption/production, BOM conversion, unbalanced journals, unilateral stock
+adjustments, damaged/quarantine stock, and stock-ageing reconciliation are intentionally not
+posted by Phase 4B-2E.
+
 ## What Not To Do
 
 - Do not commit real Tally exports.
@@ -388,3 +414,15 @@ If PostgreSQL contains old test data and you want a completely clean database:
 - Do not use frontend demo mode for real import validation.
 - Do not enable demo seed when testing a clean tenant.
 - Do not manually delete XML rows or database rows to make an import pass. Use validation, undo, reconciliation, and replacement.
+
+## Test Combined Tally Exports
+
+1. Upload `All Masters` and `All Vouchers` without manually choosing Sales or Purchase.
+2. Click **Classify, stage, and match**.
+3. Confirm the detected types are **Mixed Tally Masters** and **Mixed Tally Vouchers**.
+4. Review the per-file content counts for products, ledgers, total vouchers, and each voucher type.
+5. Confirm Sales, Purchase, Credit Note, Debit Note, Receipt, and Payment records appear in their correct staging sections.
+6. Confirm Contra and Journal counts are visible but are not posted as inventory invoices.
+7. For Sundry Debtors/Creditors report XML, confirm party names and closing debit/credit balances appear in outstanding staging.
+
+Combined exports are routed row by row from `STOCKITEM`, `LEDGER`, and each voucher's actual `VCHTYPE`. Do not override a combined voucher file to Sales or Purchase; that would discard its mixed-file meaning.

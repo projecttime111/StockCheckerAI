@@ -9,6 +9,10 @@ import org.xml.sax.InputSource;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.PushbackInputStream;
+import java.io.PushbackReader;
+import java.io.Reader;
 import java.io.StringReader;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
@@ -50,8 +54,18 @@ public class GenericXmlImportAdapter implements ErpImportAdapter {
         factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
         factory.setXIncludeAware(false);
         factory.setExpandEntityReferences(false);
-        var xml = sanitizeInvalidXmlCharacters(inputStream.readAllBytes());
-        return factory.newDocumentBuilder().parse(new InputSource(new StringReader(xml)));
+        try (var reader = sanitizingReader(inputStream)) {
+            return factory.newDocumentBuilder().parse(new InputSource(reader));
+        }
+    }
+
+    static Reader sanitizingReader(InputStream inputStream) throws java.io.IOException {
+        var input = new PushbackInputStream(inputStream, 4);
+        var prefix = input.readNBytes(4);
+        if (prefix.length > 0) {
+            input.unread(prefix);
+        }
+        return new SanitizingXmlReader(new InputStreamReader(input, detectXmlCharset(prefix)));
     }
 
     static String sanitizeInvalidXmlCharacters(byte[] bytes) {
@@ -84,7 +98,7 @@ public class GenericXmlImportAdapter implements ErpImportAdapter {
         return new String(bytes, charset);
     }
 
-    private static Charset detectXmlCharset(byte[] bytes) {
+    static Charset detectXmlCharset(byte[] bytes) {
         if (bytes.length >= 2) {
             var first = bytes[0] & 0xFF;
             var second = bytes[1] & 0xFF;
@@ -146,6 +160,116 @@ public class GenericXmlImportAdapter implements ErpImportAdapter {
             || (codePoint >= 0x20 && codePoint <= 0xD7FF)
             || (codePoint >= 0xE000 && codePoint <= 0xFFFD)
             || (codePoint >= 0x10000 && codePoint <= 0x10FFFF);
+    }
+
+    private static final class SanitizingXmlReader extends Reader {
+        private static final int PUSHBACK_SIZE = 32;
+        private final PushbackReader input;
+        private boolean firstCharacter = true;
+        private int pendingCharacter = -1;
+
+        private SanitizingXmlReader(Reader input) {
+            this.input = new PushbackReader(input, PUSHBACK_SIZE);
+        }
+
+        @Override
+        public int read(char[] buffer, int offset, int length) throws java.io.IOException {
+            if (length == 0) {
+                return 0;
+            }
+            var count = 0;
+            while (count < length) {
+                var value = nextSanitizedCharacter();
+                if (value < 0) {
+                    return count == 0 ? -1 : count;
+                }
+                buffer[offset + count++] = (char) value;
+            }
+            return count;
+        }
+
+        private int nextSanitizedCharacter() throws java.io.IOException {
+            var value = pendingCharacter >= 0 ? takePendingCharacter() : input.read();
+            if (value < 0) {
+                return -1;
+            }
+            if (firstCharacter) {
+                firstCharacter = false;
+                if (value == '\uFEFF') {
+                    return nextSanitizedCharacter();
+                }
+            }
+            if (value == '&') {
+                return sanitizedCharacterReference();
+            }
+            if (Character.isHighSurrogate((char) value)) {
+                var low = input.read();
+                if (low >= 0 && Character.isLowSurrogate((char) low)) {
+                    var codePoint = Character.toCodePoint((char) value, (char) low);
+                    if (isValidXml10CodePoint(codePoint)) {
+                        pendingCharacter = low;
+                        return value;
+                    }
+                } else if (low >= 0) {
+                    input.unread(low);
+                }
+                return ' ';
+            }
+            return isValidXml10CodePoint(value) ? value : ' ';
+        }
+
+        private int sanitizedCharacterReference() throws java.io.IOException {
+            var consumed = new StringBuilder();
+            var next = input.read();
+            if (next != '#') {
+                if (next >= 0) input.unread(next);
+                return '&';
+            }
+            consumed.append((char) next);
+            next = input.read();
+            var hex = next == 'x' || next == 'X';
+            if (hex) {
+                consumed.append((char) next);
+                next = input.read();
+            }
+            var digits = new StringBuilder();
+            while (next >= 0 && isReferenceDigit((char) next, hex) && digits.length() < 10) {
+                consumed.append((char) next);
+                digits.append((char) next);
+                next = input.read();
+            }
+            if (next == ';') {
+                consumed.append(';');
+            } else if (next >= 0) {
+                input.unread(next);
+            }
+            if (!digits.isEmpty()) {
+                try {
+                    var codePoint = Integer.parseInt(digits.toString(), hex ? 16 : 10);
+                    if (!isValidXml10CodePoint(codePoint)) {
+                        return ' ';
+                    }
+                } catch (NumberFormatException ignored) {
+                    // Preserve malformed references so the XML parser reports them normally.
+                }
+            }
+            var suffix = consumed.toString().toCharArray();
+            for (var index = suffix.length - 1; index >= 0; index--) {
+                input.unread(suffix[index]);
+            }
+            return '&';
+        }
+
+        private int takePendingCharacter() {
+            var value = pendingCharacter;
+            pendingCharacter = -1;
+            return value;
+        }
+
+        @Override
+        public void close() throws java.io.IOException {
+            input.close();
+        }
     }
 
     @Override

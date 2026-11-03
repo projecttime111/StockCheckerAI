@@ -5,8 +5,14 @@ import org.springframework.stereotype.Component;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
+import javax.xml.XMLConstants;
+import javax.xml.stream.XMLInputFactory;
+import javax.xml.stream.XMLOutputFactory;
+import java.io.ByteArrayInputStream;
+import java.io.StringWriter;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
@@ -14,9 +20,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 @Component
 public class TallyXmlImportAdapter extends GenericXmlImportAdapter {
+    private static final Set<String> STREAMED_ENTITIES = Set.of(
+        "STOCKITEM", "LEDGER", "VOUCHER", "DSPACCNAME", "DSPSTKINFO");
+
     @Override
     public DomainEnums.SourceType sourceType() {
         return DomainEnums.SourceType.TALLY_XML;
@@ -25,93 +35,50 @@ public class TallyXmlImportAdapter extends GenericXmlImportAdapter {
     @Override
     public ImportPreview parse(ImportRequest request) {
         try {
-            var document = parseDocument(request.inputStream());
             var rows = new ArrayList<Map<String, String>>();
-            var stockItems = document.getElementsByTagName("STOCKITEM");
-            for (int i = 0; i < stockItems.getLength(); i++) {
-                var item = (Element) stockItems.item(i);
-                var row = new LinkedHashMap<String, String>();
-                row.put("Item Name", item.getAttribute("NAME"));
-                row.put("Unit", text(item, "BASEUNITS"));
-                row.put("Category", text(item, "PARENT"));
-                row.put("Opening Stock", numberPrefix(text(item, "OPENINGBALANCE")));
-                row.put("Purchase Price", numberPrefix(text(item, "OPENINGRATE")));
-                row.put("Sales Price", numberPrefix(text(item, "RATEOFVAT")));
-                row.put("HSN", text(item, "HSNCODE"));
-                row.put("HSN Code", text(item, "HSNCODE"));
-                row.put("GST %", text(item, "RATEDETAILS.LIST"));
-                row.put("Source Entity", "STOCKITEM");
-                rows.add(row);
-            }
-            var ledgers = document.getElementsByTagName("LEDGER");
-            for (int i = 0; i < ledgers.getLength(); i++) {
-                var ledger = (Element) ledgers.item(i);
-                var row = new LinkedHashMap<String, String>();
-                row.put("Party Name", ledger.getAttribute("NAME"));
-                row.put("GSTIN", text(ledger, "PARTYGSTIN"));
-                row.put("GST No", text(ledger, "PARTYGSTIN"));
-                row.put("Ledger Group", text(ledger, "PARENT"));
-                row.put("Source Entity", "LEDGER");
-                rows.add(row);
-            }
-            addDisplayStockRows(document, rows);
-            var entries = document.getElementsByTagName("ALLINVENTORYENTRIES.LIST");
-            var financialsEmitted = Collections.newSetFromMap(new IdentityHashMap<Element, Boolean>());
-            for (int i = 0; i < entries.getLength(); i++) {
-                var entry = (Element) entries.item(i);
-                var voucher = parentElement(entry, "VOUCHER");
-                var voucherType = voucher == null ? "" : firstNonBlank(voucher.getAttribute("VCHTYPE"), textIgnoreCase(voucher, "VOUCHERTYPENAME"));
-                var rawBilledQuantity = textIgnoreCase(entry, "BILLEDQTY");
-                var rawActualQuantity = textIgnoreCase(entry, "ACTUALQTY");
-                var rawQuantity = firstNonBlank(rawBilledQuantity, rawActualQuantity);
-                var rawRate = textIgnoreCase(entry, "RATE");
-                var rawAmount = textIgnoreCase(entry, "AMOUNT");
-                var purchaseLike = isPurchaseVoucher(voucherType) || isPurchaseReturnVoucher(voucherType);
-                var purchaseReturn = isPurchaseReturnVoucher(voucherType);
-                var quantity = numberPrefix(rawQuantity);
-                if (purchaseReturn) {
-                    quantity = absoluteNumber(quantity);
+            var inputFactory = XMLInputFactory.newFactory();
+            setXmlProperty(inputFactory, XMLInputFactory.SUPPORT_DTD, false);
+            setXmlProperty(inputFactory, "javax.xml.stream.isSupportingExternalEntities", false);
+            setXmlProperty(inputFactory, XMLInputFactory.IS_REPLACING_ENTITY_REFERENCES, false);
+            setXmlProperty(inputFactory, XMLConstants.ACCESS_EXTERNAL_DTD, "");
+            setXmlProperty(inputFactory, XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
+            var outputFactory = XMLOutputFactory.newFactory();
+
+            try (var sanitized = sanitizingReader(request.inputStream())) {
+                var reader = inputFactory.createXMLEventReader(sanitized);
+                String pendingDisplayName = null;
+                while (reader.hasNext()) {
+                    var event = reader.nextEvent();
+                    if (!event.isStartElement()) continue;
+                    var entityName = event.asStartElement().getName().getLocalPart().toUpperCase(Locale.ROOT);
+                    if (!STREAMED_ENTITIES.contains(entityName)) continue;
+
+                    var fragment = new StringWriter();
+                    var writer = outputFactory.createXMLEventWriter(fragment);
+                    writer.add(event);
+                    var depth = 1;
+                    while (reader.hasNext() && depth > 0) {
+                        var nested = reader.nextEvent();
+                        writer.add(nested);
+                        if (nested.isStartElement()) depth++;
+                        if (nested.isEndElement()) depth--;
+                    }
+                    writer.close();
+
+                    var element = parseFragment(fragment.toString());
+                    switch (entityName) {
+                        case "STOCKITEM" -> addStockItemRow(element, rows);
+                        case "LEDGER" -> addLedgerRow(element, rows);
+                        case "VOUCHER" -> addVoucherRows(element, rows);
+                        case "DSPACCNAME" -> pendingDisplayName = text(element, "DSPDISPNAME");
+                        case "DSPSTKINFO" -> {
+                            addDisplayStockRow(pendingDisplayName, element, rows);
+                            pendingDisplayName = null;
+                        }
+                        default -> { }
+                    }
                 }
-                var rateResolution = purchaseLike
-                    ? resolvePurchaseRate(rawRate, rawAmount, rawQuantity)
-                    : new PurchaseRateResolution(numberPrefix(rawRate), "RATE_FIELD");
-                var row = new LinkedHashMap<String, String>();
-                row.put("Voucher Type", voucherType);
-                row.put("Voucher Date", voucher == null ? "" : text(voucher, "DATE"));
-                row.put("Voucher Number", voucher == null ? "" : text(voucher, "VOUCHERNUMBER"));
-                row.put("Invoice Number", voucher == null ? "" : text(voucher, "VOUCHERNUMBER"));
-                row.put("Party Name", voucher == null ? "" : text(voucher, "PARTYLEDGERNAME"));
-                row.put("Tally GUID", voucher == null ? "" : firstNonBlank(
-                    voucher.getAttribute("GUID"), textIgnoreCase(voucher, "GUID"), textIgnoreCase(voucher, "MASTERID")));
-                row.put("Item Name", text(entry, "STOCKITEMNAME"));
-                row.put("Unit", unitFromQuantity(rawBilledQuantity, rawActualQuantity));
-                row.put("Qty", quantity);
-                row.put("Billed Quantity", purchaseReturn ? absoluteNumber(numberPrefix(rawBilledQuantity)) : numberPrefix(rawBilledQuantity));
-                row.put("Actual Quantity", purchaseReturn ? absoluteNumber(numberPrefix(rawActualQuantity)) : numberPrefix(rawActualQuantity));
-                row.put("Rate", rateResolution.rate());
-                row.put("Amount", numberPrefix(rawAmount));
-                row.put("Raw Rate", rawRate);
-                row.put("Raw Amount", rawAmount);
-                row.put("Raw Quantity", rawQuantity);
-                row.put("Parsed Rate", rateResolution.rate());
-                row.put("Rate Source", rateResolution.source());
-                row.put("Ledger Lines Skipped", voucher == null ? "0" : String.valueOf(voucher.getElementsByTagName("ALLLEDGERENTRIES.LIST").getLength()));
-                row.put("Godown", text(entry, "GODOWNNAME"));
-                row.put("Batch", text(entry, "BATCHNAME"));
-                row.put("Cancelled", voucher == null ? "" : cancelled(voucher));
-                row.put("Source Entity", "VOUCHER");
-                if (voucher != null && financialsEmitted.add(voucher)) {
-                    applyVoucherFinancials(row, voucher);
-                }
-                rows.add(row);
-            }
-            var vouchers = document.getElementsByTagName("VOUCHER");
-            for (int i = 0; i < vouchers.getLength(); i++) {
-                var voucher = (Element) vouchers.item(i);
-                if (voucher.getElementsByTagName("ALLINVENTORYENTRIES.LIST").getLength() > 0) continue;
-                var row = voucherHeaderRow(voucher);
-                applyVoucherFinancials(row, voucher);
-                rows.add(row);
+                reader.close();
             }
             return new ImportPreview(rows);
         } catch (Exception ex) {
@@ -160,15 +127,69 @@ public class TallyXmlImportAdapter extends GenericXmlImportAdapter {
 
     private Map<String, String> voucherHeaderRow(Element voucher) {
         var row = new LinkedHashMap<String, String>();
-        row.put("Voucher Type", firstNonBlank(voucher.getAttribute("VCHTYPE"), textIgnoreCase(voucher, "VOUCHERTYPENAME")));
+        var voucherType = firstNonBlank(voucher.getAttribute("VCHTYPE"), textIgnoreCase(voucher, "VOUCHERTYPENAME"));
+        var partyName = firstNonBlank(textIgnoreCase(voucher, "PARTYLEDGERNAME"), cashbookPartyName(voucher));
+        row.put("Voucher Type", voucherType);
         row.put("Voucher Date", textIgnoreCase(voucher, "DATE"));
+        row.put("Date", textIgnoreCase(voucher, "DATE"));
         row.put("Voucher Number", textIgnoreCase(voucher, "VOUCHERNUMBER"));
         row.put("Invoice Number", textIgnoreCase(voucher, "VOUCHERNUMBER"));
-        row.put("Party Name", textIgnoreCase(voucher, "PARTYLEDGERNAME"));
+        row.put("Party Name", partyName);
+        row.put("Amount", cashbookAmount(voucher, partyName));
+        row.put("Invoice Reference", firstNonBlank(textIgnoreCase(voucher, "REFERENCENUMBER"),
+            textIgnoreCase(voucher, "BILLREF"), textIgnoreCase(voucher, "BILLNAME")));
+        row.put("Reference Number", firstNonBlank(
+            textIgnoreCase(voucher, "REFERENCENUMBER"),
+            textIgnoreCase(voucher, "BILLREF"),
+            textIgnoreCase(voucher, "BILLNAME"),
+            textIgnoreCase(voucher, "VOUCHERNUMBER")));
+        row.put("Payment Mode", cashbookPaymentMode(voucher));
         row.put("Tally GUID", firstNonBlank(voucher.getAttribute("GUID"), textIgnoreCase(voucher, "GUID"), textIgnoreCase(voucher, "MASTERID")));
         row.put("Cancelled", cancelled(voucher));
         row.put("Source Entity", "VOUCHER_HEADER");
         return row;
+    }
+
+    private String cashbookPartyName(Element voucher) {
+        var ledgers = voucher.getElementsByTagName("ALLLEDGERENTRIES.LIST");
+        for (int index = 0; index < ledgers.getLength(); index++) {
+            var ledger = (Element) ledgers.item(index);
+            var ledgerName = firstNonBlank(textIgnoreCase(ledger, "LEDGERNAME"), textIgnoreCase(ledger, "NAME"));
+            if (!ledgerName.isBlank() && !isCashOrBankLedger(ledgerName)) return ledgerName;
+        }
+        return "";
+    }
+
+    private String cashbookAmount(Element voucher, String partyName) {
+        String firstNonZero = "";
+        var ledgers = voucher.getElementsByTagName("ALLLEDGERENTRIES.LIST");
+        for (int index = 0; index < ledgers.getLength(); index++) {
+            var ledger = (Element) ledgers.item(index);
+            var ledgerName = firstNonBlank(textIgnoreCase(ledger, "LEDGERNAME"), textIgnoreCase(ledger, "NAME"));
+            var amount = decimal(textIgnoreCase(ledger, "AMOUNT"));
+            if (amount == null || amount.signum() == 0) continue;
+            if (firstNonZero.isBlank()) firstNonZero = format(amount.abs());
+            if (!partyName.isBlank() && normalizeLedger(ledgerName).equals(normalizeLedger(partyName))) {
+                return format(amount.abs());
+            }
+        }
+        return firstNonBlank(firstNonZero, numberPrefix(textIgnoreCase(voucher, "AMOUNT")));
+    }
+
+    private String cashbookPaymentMode(Element voucher) {
+        var ledgers = voucher.getElementsByTagName("ALLLEDGERENTRIES.LIST");
+        for (int index = 0; index < ledgers.getLength(); index++) {
+            var ledger = (Element) ledgers.item(index);
+            var ledgerName = firstNonBlank(textIgnoreCase(ledger, "LEDGERNAME"), textIgnoreCase(ledger, "NAME"));
+            if (isCashOrBankLedger(ledgerName)) return ledgerName;
+        }
+        return firstNonBlank(textIgnoreCase(voucher, "PAYMENTMODE"), textIgnoreCase(voucher, "TRANSACTIONTYPE"));
+    }
+
+    private boolean isCashOrBankLedger(String ledgerName) {
+        var normalized = normalizeLedger(ledgerName);
+        return normalized.contains("CASH") || normalized.contains("BANK") || normalized.contains("UPI")
+            || normalized.contains("NEFT") || normalized.contains("RTGS") || normalized.contains("IMPS");
     }
 
     private void applyVoucherFinancials(Map<String, String> row, Element voucher) {
@@ -273,6 +294,114 @@ public class TallyXmlImportAdapter extends GenericXmlImportAdapter {
                 case "ROUND_OFF" -> { roundOffAmount = roundOffAmount.add(amount); roundOffLines++; }
                 default -> { otherChargesAmount = otherChargesAmount.add(amount.abs()); otherChargeLines++; }
             }
+        }
+    }
+
+    private Element parseFragment(String xml) throws Exception {
+        try (var input = new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8))) {
+            return parseDocument(input).getDocumentElement();
+        }
+    }
+
+    private void addStockItemRow(Element item, List<Map<String, String>> rows) {
+        var row = new LinkedHashMap<String, String>();
+        row.put("Item Name", item.getAttribute("NAME"));
+        row.put("Unit", text(item, "BASEUNITS"));
+        row.put("Category", text(item, "PARENT"));
+        row.put("Opening Stock", numberPrefix(text(item, "OPENINGBALANCE")));
+        row.put("Purchase Price", numberPrefix(text(item, "OPENINGRATE")));
+        row.put("Sales Price", numberPrefix(text(item, "RATEOFVAT")));
+        row.put("HSN", text(item, "HSNCODE"));
+        row.put("HSN Code", text(item, "HSNCODE"));
+        row.put("GST %", text(item, "RATEDETAILS.LIST"));
+        row.put("Tally GUID", firstNonBlank(item.getAttribute("GUID"), textIgnoreCase(item, "GUID"), textIgnoreCase(item, "MASTERID")));
+        row.put("Source Entity", "STOCKITEM");
+        rows.add(row);
+    }
+
+    private void addLedgerRow(Element ledger, List<Map<String, String>> rows) {
+        var row = new LinkedHashMap<String, String>();
+        row.put("Party Name", ledger.getAttribute("NAME"));
+        row.put("GSTIN", text(ledger, "PARTYGSTIN"));
+        row.put("GST No", text(ledger, "PARTYGSTIN"));
+        row.put("Ledger Group", text(ledger, "PARENT"));
+        row.put("Tally GUID", firstNonBlank(ledger.getAttribute("GUID"), textIgnoreCase(ledger, "GUID"), textIgnoreCase(ledger, "MASTERID")));
+        row.put("Source Entity", "LEDGER");
+        rows.add(row);
+    }
+
+    private void addVoucherRows(Element voucher, List<Map<String, String>> rows) {
+        var entries = voucher.getElementsByTagName("ALLINVENTORYENTRIES.LIST");
+        for (int index = 0; index < entries.getLength(); index++) {
+            var entry = (Element) entries.item(index);
+            var row = voucherItemRow(voucher, entry);
+            if (index == 0) applyVoucherFinancials(row, voucher);
+            rows.add(row);
+        }
+        if (entries.getLength() == 0) {
+            var row = voucherHeaderRow(voucher);
+            applyVoucherFinancials(row, voucher);
+            rows.add(row);
+        }
+    }
+
+    private Map<String, String> voucherItemRow(Element voucher, Element entry) {
+        var voucherType = firstNonBlank(voucher.getAttribute("VCHTYPE"), textIgnoreCase(voucher, "VOUCHERTYPENAME"));
+        var rawBilledQuantity = textIgnoreCase(entry, "BILLEDQTY");
+        var rawActualQuantity = textIgnoreCase(entry, "ACTUALQTY");
+        var rawQuantity = firstNonBlank(rawBilledQuantity, rawActualQuantity);
+        var rawRate = textIgnoreCase(entry, "RATE");
+        var rawAmount = textIgnoreCase(entry, "AMOUNT");
+        var purchaseLike = isPurchaseVoucher(voucherType) || isPurchaseReturnVoucher(voucherType);
+        var quantity = numberPrefix(rawQuantity);
+        if (isPurchaseReturnVoucher(voucherType)) quantity = absoluteNumber(quantity);
+        var rateResolution = purchaseLike
+            ? resolvePurchaseRate(rawRate, rawAmount, rawQuantity)
+            : new PurchaseRateResolution(numberPrefix(rawRate), "RATE_FIELD");
+        var row = voucherHeaderRow(voucher);
+        row.put("Item Name", text(entry, "STOCKITEMNAME"));
+        row.put("Unit", unitFromQuantity(rawBilledQuantity, rawActualQuantity));
+        row.put("Qty", quantity);
+        row.put("Billed Quantity", numberPrefix(rawBilledQuantity));
+        row.put("Actual Quantity", numberPrefix(rawActualQuantity));
+        row.put("Rate", rateResolution.rate());
+        row.put("Amount", numberPrefix(rawAmount));
+        row.put("Raw Rate", rawRate);
+        row.put("Raw Amount", rawAmount);
+        row.put("Raw Quantity", rawQuantity);
+        row.put("Parsed Rate", rateResolution.rate());
+        row.put("Rate Source", rateResolution.source());
+        row.put("Ledger Lines Skipped", String.valueOf(voucher.getElementsByTagName("ALLLEDGERENTRIES.LIST").getLength()));
+        row.put("Godown", text(entry, "GODOWNNAME"));
+        row.put("Source Godown", firstNonBlank(textIgnoreCase(entry, "SOURCEGODOWN"), textIgnoreCase(voucher, "SOURCEGODOWN")));
+        row.put("Destination Godown", firstNonBlank(textIgnoreCase(entry, "DESTINATIONGODOWN"), textIgnoreCase(voucher, "DESTINATIONGODOWN")));
+        row.put("Is Deemed Positive", textIgnoreCase(entry, "ISDEEMEDPOSITIVE"));
+        row.put("Batch", textIgnoreCase(entry, "BATCHNAME"));
+        row.put("Tracking Number", firstNonBlank(textIgnoreCase(entry, "TRACKINGNUMBER"), textIgnoreCase(voucher, "TRACKINGNUMBER")));
+        row.put("Narration", textIgnoreCase(voucher, "NARRATION"));
+        row.put("Source Entity", "VOUCHER");
+        return row;
+    }
+
+    private void addDisplayStockRow(String itemName, Element stockInfo, List<Map<String, String>> rows) {
+        var stockClose = firstElement(stockInfo, "DSPSTKCL");
+        if (itemName == null || itemName.isBlank() || stockClose == null) return;
+        var closingQty = text(stockClose, "DSPCLQTY");
+        var row = new LinkedHashMap<String, String>();
+        row.put("Item Name", itemName);
+        row.put("Unit", unitFromQuantity(closingQty, ""));
+        row.put("Opening Stock", numberPrefix(closingQty));
+        row.put("Purchase Price", numberPrefix(text(stockClose, "DSPCLRATE")));
+        row.put("Stock Value", numberPrefix(text(stockClose, "DSPCLAMTA")));
+        row.put("Source Entity", "DSPSTKCL");
+        rows.add(row);
+    }
+
+    private void setXmlProperty(XMLInputFactory factory, String property, Object value) {
+        try {
+            factory.setProperty(property, value);
+        } catch (IllegalArgumentException ignored) {
+            // StAX providers differ; unsupported hardening properties are ignored individually.
         }
     }
 

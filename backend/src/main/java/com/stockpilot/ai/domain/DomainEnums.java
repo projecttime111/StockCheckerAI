@@ -66,12 +66,14 @@ public final class DomainEnums {
     public enum DetectedFileType {
         INVENTORY_MASTER,
         ACCOUNTING_MASTER,
+        MIXED_TALLY_MASTERS,
         STOCK_SNAPSHOT,
         STOCK_AGEING,
         SALES_VOUCHERS,
         PURCHASE_VOUCHERS,
         CREDIT_NOTES,
         DEBIT_NOTES,
+        MIXED_TALLY_VOUCHERS,
         CASH_BOOK,
         DEBTOR_CREDITOR_ANALYSIS,
         STOCK_JOURNAL,
@@ -105,6 +107,8 @@ public final class DomainEnums {
         DEBIT_NOTE,
         CASHBOOK_ENTRY,
         OUTSTANDING_SNAPSHOT,
+        STOCK_JOURNAL,
+        WAREHOUSE_TRANSFER,
         STOCK_AGEING
     }
 
@@ -120,11 +124,86 @@ public final class DomainEnums {
         PRODUCT, CUSTOMER, SUPPLIER, WAREHOUSE, UNIT, CATEGORY, STOCK_MOVEMENT,
         SALES_INVOICE, SALES_INVOICE_ITEM, PURCHASE_INVOICE, PURCHASE_INVOICE_ITEM,
         CREDIT_NOTE, CREDIT_NOTE_ITEM, DEBIT_NOTE, DEBIT_NOTE_ITEM,
-        CUSTOMER_PAYMENT, SUPPLIER_PAYMENT, OUTSTANDING_SNAPSHOT, IMPORT_MAPPING
+        CUSTOMER_PAYMENT, SUPPLIER_PAYMENT, OUTSTANDING_SNAPSHOT, WAREHOUSE_TRANSFER, IMPORT_MAPPING
     }
 
     public enum FinancialAdjustmentType {
         CREDIT_NOTE, DEBIT_NOTE
+    }
+
+    public enum ReturnClassification {
+        FINANCIAL_ONLY,
+        PHYSICAL_SALES_RETURN,
+        PHYSICAL_PURCHASE_RETURN,
+        MIXED_SALES_RETURN,
+        MIXED_PURCHASE_RETURN,
+        AMBIGUOUS_RETURN,
+        NOT_A_RETURN
+    }
+
+    public enum ReturnResolutionStatus {
+        AUTO_CONFIRMED_PHYSICAL,
+        USER_CONFIRMED_PHYSICAL,
+        USER_CONFIRMED_FINANCIAL_ONLY,
+        REVIEW_REQUIRED,
+        STOCK_EFFECT_DEFERRED,
+        STOCK_EFFECT_COMMITTED
+    }
+
+    public enum ReturnDirection {
+        SALES_RETURN_IN, PURCHASE_RETURN_OUT, NONE
+    }
+
+    public enum ReturnDisposition {
+        RESTOCK_TO_AVAILABLE, FINANCIAL_ONLY, REVIEW_REQUIRED
+    }
+
+    public enum ReturnResolutionAction {
+        CONFIRM_PHYSICAL_SALES_RETURN,
+        CONFIRM_PHYSICAL_PURCHASE_RETURN,
+        CONFIRM_FINANCIAL_ONLY,
+        KEEP_UNRESOLVED
+    }
+
+    public enum ReturnStockImpactMode {
+        FINANCIAL_ONLY,
+        APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE
+    }
+
+    public enum StockJournalClassification {
+        WAREHOUSE_TRANSFER,
+        STOCK_ADJUSTMENT_IN,
+        STOCK_ADJUSTMENT_OUT,
+        MANUFACTURING_CONSUMPTION,
+        MANUFACTURING_PRODUCTION,
+        MIXED_MANUFACTURING_JOURNAL,
+        UNBALANCED_STOCK_JOURNAL,
+        AMBIGUOUS_STOCK_JOURNAL,
+        ZERO_EFFECT_STOCK_JOURNAL,
+        UNSUPPORTED_STOCK_JOURNAL
+    }
+
+    public enum TransferResolutionStatus {
+        AUTO_CONFIRMED,
+        USER_CONFIRMED,
+        REVIEW_REQUIRED,
+        DEFERRED_MANUFACTURING,
+        DEFERRED_ADJUSTMENT,
+        IGNORED,
+        STOCK_EFFECT_COMMITTED
+    }
+
+    public enum TransferResolutionAction {
+        CONFIRM_WAREHOUSE_TRANSFER,
+        MARK_MANUFACTURING_DEFERRED,
+        MARK_UNSUPPORTED_ADJUSTMENT,
+        IGNORE,
+        KEEP_UNRESOLVED
+    }
+
+    public enum StockJournalImpactMode {
+        DEFER_STOCK_JOURNALS,
+        APPLY_CONFIRMED_WAREHOUSE_TRANSFERS_AFTER_SNAPSHOT_DATE
     }
 
     public enum SmartImportEffectAction {
@@ -161,7 +240,7 @@ public final class DomainEnums {
     }
 
     public enum CashbookResolutionStatus {
-        UNRESOLVED, PAYMENT_POSTED, IGNORED
+        UNRESOLVED, PAYMENT_POSTED, IGNORED, RETAIL_SALE_RECORDED
     }
 
     public enum CashbookResolutionAction {
@@ -169,12 +248,26 @@ public final class DomainEnums {
         MAP_SUPPLIER,
         MAP_SALES_INVOICE,
         MAP_PURCHASE_INVOICE,
+        RECORD_RETAIL_SALE,
         IGNORE,
+        KEEP_UNRESOLVED
+    }
+
+    public enum VoucherRateResolutionAction {
+        CONFIRM_ZERO_VALUE,
+        DERIVE_RATE,
+        TREAT_AS_FINANCIAL_ADJUSTMENT,
+        ENTER_VERIFIED_RATE,
+        EXCLUDE_VOUCHER,
         KEEP_UNRESOLVED
     }
 
     public enum PaymentMode {
         CASH, BANK, UPI, CHEQUE, OTHER
+    }
+
+    public enum RetailCollectionMethod {
+        CASH, UPI, CASH_AND_UPI
     }
 
     public enum OutstandingPartyType {

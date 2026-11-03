@@ -17,7 +17,6 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.StringReader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
@@ -25,6 +24,8 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -53,7 +54,7 @@ public class ImportFileClassifierService {
     public DetectionResult classify(String fileName, InputStream input) throws IOException {
         var extension = extension(fileName);
         return switch (extension) {
-            case "xml" -> classifyXml(input);
+            case "xml" -> classifyXml(fileName, input);
             case "csv" -> classifyDelimited(input, "CSV");
             case "xlsx", "xls" -> classifyWorkbook(input);
             case "json" -> classifyJson(input);
@@ -61,8 +62,8 @@ public class ImportFileClassifierService {
         };
     }
 
-    private DetectionResult classifyXml(InputStream input) throws IOException {
-        var evidence = new Evidence("XML");
+    private DetectionResult classifyXml(String fileName, InputStream input) throws IOException {
+        var evidence = new Evidence("XML", fileName);
         var factory = XMLInputFactory.newFactory();
         setXmlProperty(factory, XMLInputFactory.SUPPORT_DTD, false);
         setXmlProperty(factory, "javax.xml.stream.isSupportingExternalEntities", false);
@@ -70,26 +71,43 @@ public class ImportFileClassifierService {
         setXmlProperty(factory, XMLConstants.ACCESS_EXTERNAL_DTD, "");
         setXmlProperty(factory, XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
 
-        try {
-            var xml = GenericXmlImportAdapter.sanitizeInvalidXmlCharacters(input.readAllBytes());
-            var reader = factory.createXMLStreamReader(new StringReader(xml));
-            String currentTag = null;
-            StringBuilder text = null;
+        try (var sanitized = GenericXmlImportAdapter.sanitizingReader(input)) {
+            var reader = factory.createXMLStreamReader(sanitized);
+            Deque<String> elementStack = new ArrayDeque<>();
+            Deque<StringBuilder> textStack = new ArrayDeque<>();
+            var currentVoucherHasTypeAttribute = false;
             while (reader.hasNext()) {
                 var event = reader.next();
                 if (event == XMLStreamConstants.START_ELEMENT) {
-                    currentTag = normalize(reader.getLocalName());
-                    evidence.tags.add(currentTag);
-                    evidence.countElement(currentTag);
-                    text = new StringBuilder();
-                } else if ((event == XMLStreamConstants.CHARACTERS || event == XMLStreamConstants.CDATA) && text != null) {
-                    if (text.length() < 1_000) {
-                        text.append(reader.getText());
+                    var tag = normalize(reader.getLocalName());
+                    elementStack.push(tag);
+                    textStack.push(new StringBuilder());
+                    evidence.tags.add(tag);
+                    evidence.countElement(tag);
+                    if ("VOUCHER".equals(tag)) {
+                        currentVoucherHasTypeAttribute = false;
+                        for (var index = 0; index < reader.getAttributeCount(); index++) {
+                            if ("VCHTYPE".equals(normalize(reader.getAttributeLocalName(index)))) {
+                                evidence.acceptVoucherType(reader.getAttributeValue(index));
+                                currentVoucherHasTypeAttribute = true;
+                            }
+                        }
                     }
-                } else if (event == XMLStreamConstants.END_ELEMENT && currentTag != null && text != null) {
-                    evidence.acceptValue(currentTag, text.toString());
-                    currentTag = null;
-                    text = null;
+                } else if ((event == XMLStreamConstants.CHARACTERS || event == XMLStreamConstants.CDATA) && !textStack.isEmpty()) {
+                    var text = textStack.peek();
+                    if (text.length() < 1_000) text.append(reader.getText());
+                } else if (event == XMLStreamConstants.END_ELEMENT && !elementStack.isEmpty()) {
+                    var tag = elementStack.pop();
+                    var text = textStack.pop().toString();
+                    var insideVoucher = elementStack.contains("VOUCHER");
+                    if (insideVoucher && "VOUCHERTYPENAME".equals(tag) && !currentVoucherHasTypeAttribute) {
+                        evidence.acceptVoucherType(text);
+                        currentVoucherHasTypeAttribute = true;
+                    }
+                    evidence.acceptValue(tag, text, insideVoucher);
+                    if ("VOUCHER".equals(tag)) {
+                        currentVoucherHasTypeAttribute = false;
+                    }
                 }
             }
             reader.close();
@@ -178,7 +196,7 @@ public class ImportFileClassifierService {
                 } else if (parser.currentToken() == JsonToken.START_OBJECT) {
                     evidence.rowCount++;
                 } else if (parser.currentToken().isScalarValue() && field != null) {
-                    evidence.acceptValue(field, parser.getValueAsString(""));
+                    evidence.acceptValue(field, parser.getValueAsString(""), false);
                 }
             }
             if (rootObject) {
@@ -198,10 +216,49 @@ public class ImportFileClassifierService {
         BigDecimal confidence;
         String reason;
 
+        var voucherCount = evidence.elementCounts.getOrDefault("VOUCHER", 0);
+        var stockItemCount = evidence.elementCounts.getOrDefault("STOCKITEM", 0);
+        var ledgerCount = evidence.elementCounts.getOrDefault("LEDGER", 0);
+        var voucherKinds = evidence.voucherTypeCounts.keySet();
+
         if (has(tags, "DSPACCNAME") && (has(tags, "DSPSTKINFO") || has(tags, "DSPCLQTY"))) {
             type = DomainEnums.DetectedFileType.STOCK_SNAPSHOT;
             confidence = confidence("0.99");
             reason = "Tally closing-stock tags DSPACCNAME and DSPSTKINFO/DSPCLQTY were found.";
+        } else if (voucherCount > 0 && !voucherKinds.isEmpty() && voucherKinds.stream().allMatch(this::isCashbookVoucherType)) {
+            type = DomainEnums.DetectedFileType.CASH_BOOK;
+            confidence = confidence("0.98");
+            reason = "Tally receipt/payment vouchers were found.";
+        } else if (voucherCount > 0 && voucherKinds.size() > 1) {
+            type = DomainEnums.DetectedFileType.MIXED_TALLY_VOUCHERS;
+            confidence = confidence("0.99");
+            reason = "Mixed Tally voucher export detected with " + voucherCount + " vouchers across "
+                + voucherKinds.size() + " voucher types.";
+        } else if (voucherCount > 0 && voucherKinds.size() == 1) {
+            var voucherType = voucherKinds.iterator().next();
+            type = detectedVoucherType(voucherType);
+            confidence = type == DomainEnums.DetectedFileType.UNKNOWN ? confidence("0.60") : confidence("0.98");
+            reason = type == DomainEnums.DetectedFileType.UNKNOWN
+                ? "Tally vouchers were found, but the voucher type is not yet supported for posting."
+                : "Tally voucher type " + voucherType + " was found.";
+        } else if (stockItemCount > 0 && ledgerCount > 0) {
+            type = DomainEnums.DetectedFileType.MIXED_TALLY_MASTERS;
+            confidence = confidence("0.99");
+            reason = "Mixed Tally master export detected with " + stockItemCount + " stock items and "
+                + ledgerCount + " ledgers.";
+        } else if (stockItemCount > 0) {
+            type = DomainEnums.DetectedFileType.INVENTORY_MASTER;
+            confidence = confidence("0.98");
+            reason = "Tally STOCKITEM master fields were found.";
+        } else if (ledgerCount > 0) {
+            type = DomainEnums.DetectedFileType.ACCOUNTING_MASTER;
+            confidence = confidence("0.97");
+            reason = "Tally LEDGER master fields were found.";
+        } else if (has(tags, "DSPACCNAME") && has(tags, "DSPACCINFO")
+            && (has(tags, "DSPCLDRAMT") || has(tags, "DSPCLCRAMT"))) {
+            type = DomainEnums.DetectedFileType.DEBTOR_CREDITOR_ANALYSIS;
+            confidence = confidence("0.97");
+            reason = "Tally Sundry Debtor/Creditor closing-balance rows were found.";
         } else if (containsAny(all, "STOCK AGEING", "STOCKAGING", "AGEING BUCKET", "AGE BUCKET") || (containsAny(all, "AGEING", "BUCKET") && containsAny(all, "DAYS", "DAY"))) {
             type = DomainEnums.DetectedFileType.STOCK_AGEING;
             confidence = confidence("0.88");
@@ -269,6 +326,10 @@ public class ImportFileClassifierService {
         return buildResult(type, confidence, reason, evidence);
     }
 
+    private boolean isCashbookVoucherType(String voucherType) {
+        return voucherType.contains("RECEIPT") || voucherType.contains("PAYMENT");
+    }
+
     private DetectionResult unknown(String reason, String format) {
         return buildResult(DomainEnums.DetectedFileType.UNKNOWN, confidence("0.10"), reason, new Evidence(format));
     }
@@ -283,9 +344,14 @@ public class ImportFileClassifierService {
         metadata.put("tally", evidence.tally);
         metadata.put("matchedTags", evidence.tags.stream().limit(60).toList());
         metadata.put("matchedHeaders", evidence.headers.stream().limit(60).toList());
+        metadata.put("contentCounts", evidence.contentCounts());
+        if (evidence.outstandingPartyType != null) {
+            metadata.put("outstandingPartyType", evidence.outstandingPartyType);
+        }
 
-        var start = evidence.dates.stream().min(LocalDate::compareTo).orElse(null);
-        var end = evidence.dates.stream().max(LocalDate::compareTo).orElse(null);
+        var relevantDates = evidence.voucherDates.isEmpty() ? evidence.dates : evidence.voucherDates;
+        var start = relevantDates.stream().min(LocalDate::compareTo).orElse(null);
+        var end = relevantDates.stream().max(LocalDate::compareTo).orElse(null);
         var rowCount = evidence.inferredRowCount(type);
         return new DetectionResult(type, confidence, reason, rowCount, start, end, evidence.companyName, metadata);
     }
@@ -339,6 +405,17 @@ public class ImportFileClassifierService {
 
     private static BigDecimal confidence(String value) {
         return new BigDecimal(value);
+    }
+
+    private static DomainEnums.DetectedFileType detectedVoucherType(String voucherType) {
+        var normalized = normalizeHeader(voucherType);
+        if (normalized.contains("CREDIT NOTE")) return DomainEnums.DetectedFileType.CREDIT_NOTES;
+        if (normalized.contains("DEBIT NOTE")) return DomainEnums.DetectedFileType.DEBIT_NOTES;
+        if (normalized.contains("STOCK JOURNAL")) return DomainEnums.DetectedFileType.STOCK_JOURNAL;
+        if (normalized.contains("PURCHASE")) return DomainEnums.DetectedFileType.PURCHASE_VOUCHERS;
+        if (normalized.contains("SALE")) return DomainEnums.DetectedFileType.SALES_VOUCHERS;
+        if (normalized.contains("RECEIPT") || normalized.contains("PAYMENT")) return DomainEnums.DetectedFileType.CASH_BOOK;
+        return DomainEnums.DetectedFileType.UNKNOWN;
     }
 
     private static String extension(String fileName) {
@@ -421,19 +498,32 @@ public class ImportFileClassifierService {
         private final Set<String> values = new LinkedHashSet<>();
         private final Map<String, Integer> elementCounts = new LinkedHashMap<>();
         private final List<LocalDate> dates = new ArrayList<>();
+        private final List<LocalDate> voucherDates = new ArrayList<>();
+        private final Map<String, Integer> voucherTypeCounts = new LinkedHashMap<>();
         private int rowCount;
         private String companyName;
         private boolean tally;
+        private String outstandingPartyType;
 
         private Evidence(String format) {
+            this(format, null);
+        }
+
+        private Evidence(String format, String fileName) {
             this.format = format;
+            var normalizedFileName = normalizeHeader(fileName);
+            if (normalizedFileName.contains("DEBTOR") || normalizedFileName.contains("RECEIVABLE")) {
+                outstandingPartyType = "CUSTOMER";
+            } else if (normalizedFileName.contains("CREDITOR") || normalizedFileName.contains("PAYABLE")) {
+                outstandingPartyType = "SUPPLIER";
+            }
         }
 
         private void countElement(String tag) {
             elementCounts.merge(tag, 1, Integer::sum);
         }
 
-        private void acceptValue(String tag, String rawValue) {
+        private void acceptValue(String tag, String rawValue, boolean insideVoucher) {
             if (rawValue == null) {
                 return;
             }
@@ -445,11 +535,38 @@ public class ImportFileClassifierService {
                 values.add(value.toUpperCase(Locale.ROOT));
             }
             if (Set.of("DATE", "VOUCHERDATE", "SVFROMDATE", "SVTODATE", "FROMDATE", "TODATE").contains(tag)) {
-                parseDate(value).ifPresent(dates::add);
+                parseDate(value).ifPresent(parsed -> {
+                    dates.add(parsed);
+                    if (insideVoucher && Set.of("DATE", "VOUCHERDATE").contains(tag)) voucherDates.add(parsed);
+                });
             }
             if (companyName == null && Set.of("SVCURRENTCOMPANY", "COMPANYNAME", "CMPNAME").contains(tag)) {
                 companyName = value;
             }
+        }
+
+        private void acceptVoucherType(String rawValue) {
+            var normalized = normalizeHeader(rawValue);
+            if (!normalized.isBlank()) voucherTypeCounts.merge(normalized, 1, Integer::sum);
+        }
+
+        private Map<String, Integer> contentCounts() {
+            var counts = new LinkedHashMap<String, Integer>();
+            counts.put("products", elementCounts.getOrDefault("STOCKITEM", 0));
+            counts.put("ledgers", elementCounts.getOrDefault("LEDGER", 0));
+            counts.put("vouchers", elementCounts.getOrDefault("VOUCHER", 0));
+            counts.put("stockSnapshotRows", elementCounts.getOrDefault("DSPACCNAME", 0));
+            voucherTypeCounts.forEach((type, count) -> counts.put(voucherCountKey(type), count));
+            return counts;
+        }
+
+        private String voucherCountKey(String type) {
+            var words = type.toLowerCase(Locale.ROOT).split("[^a-z0-9]+");
+            var key = new StringBuilder("voucher");
+            for (var word : words) {
+                if (!word.isBlank()) key.append(Character.toUpperCase(word.charAt(0))).append(word.substring(1));
+            }
+            return key.toString();
         }
 
         private void scanDelimitedDates(String line) {
@@ -466,7 +583,10 @@ public class ImportFileClassifierService {
                 case STOCK_SNAPSHOT -> elementCounts.getOrDefault("DSPACCNAME", 0);
                 case INVENTORY_MASTER -> elementCounts.getOrDefault("STOCKITEM", 0);
                 case ACCOUNTING_MASTER -> elementCounts.getOrDefault("LEDGER", 0);
-                case SALES_VOUCHERS, PURCHASE_VOUCHERS, CREDIT_NOTES, DEBIT_NOTES, CASH_BOOK, STOCK_JOURNAL -> elementCounts.getOrDefault("VOUCHER", 0);
+                case MIXED_TALLY_MASTERS -> elementCounts.getOrDefault("STOCKITEM", 0) + elementCounts.getOrDefault("LEDGER", 0);
+                case SALES_VOUCHERS, PURCHASE_VOUCHERS, CREDIT_NOTES, DEBIT_NOTES, MIXED_TALLY_VOUCHERS,
+                    CASH_BOOK, STOCK_JOURNAL -> elementCounts.getOrDefault("VOUCHER", 0);
+                case DEBTOR_CREDITOR_ANALYSIS -> elementCounts.getOrDefault("DSPACCNAME", 0);
                 default -> 0;
             };
         }

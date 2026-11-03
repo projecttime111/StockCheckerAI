@@ -1,5 +1,6 @@
 package com.stockpilot.ai.domain;
 
+import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
@@ -25,6 +26,7 @@ public class ImportDryRun extends TenantOwnedEntity {
 
     public Instant startedAt;
     public Instant finishedAt;
+    @Column(length = 64)
     public String inputFingerprint;
 
     @JdbcTypeCode(SqlTypes.JSON)

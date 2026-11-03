@@ -4,6 +4,9 @@ import com.stockpilot.ai.config.TenantContext;
 import com.stockpilot.ai.domain.*;
 import com.stockpilot.ai.exception.ApiErrors;
 import com.stockpilot.ai.repo.Repositories;
+import jakarta.persistence.EntityManager;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -19,12 +22,15 @@ import java.util.stream.Collectors;
 
 @Service
 public class SmartImportCommitExecutor {
+    private static final Logger log = LoggerFactory.getLogger(SmartImportCommitExecutor.class);
+    private static final int WRITE_BATCH_SIZE = 25;
     private static final BigDecimal ZERO = BigDecimal.ZERO;
     private static final String SOURCE_SYSTEM = "SMART_IMPORT";
 
     private final Repositories.ImportSessionRepository sessions;
     private final Repositories.ImportSessionFileRepository files;
     private final Repositories.ImportDryRunRepository dryRuns;
+    private final Repositories.ImportDryRunItemRepository dryRunItems;
     private final Repositories.SmartImportCommitRepository commits;
     private final Repositories.SmartImportEffectRepository effects;
     private final Repositories.ExternalRecordMappingRepository mappings;
@@ -35,6 +41,7 @@ public class SmartImportCommitExecutor {
     private final Repositories.SmartStagedStockSnapshotRepository stagedSnapshots;
     private final Repositories.SmartStagedVoucherRepository stagedVouchers;
     private final Repositories.SmartStagedVoucherItemRepository stagedVoucherItems;
+    private final Repositories.SmartStagedTransferCandidateRepository stagedTransfers;
     private final Repositories.SmartStagedCashbookEntryRepository stagedCashbook;
     private final Repositories.SmartStagedStockAgeingRepository stagedAgeing;
     private final Repositories.UnitRepository units;
@@ -53,13 +60,21 @@ public class SmartImportCommitExecutor {
     private final Repositories.CustomerPaymentRepository customerPayments;
     private final Repositories.SupplierPaymentRepository supplierPayments;
     private final Repositories.OutstandingSnapshotRepository outstandingSnapshots;
+    private final Repositories.StockMovementRepository stockMovements;
+    private final Repositories.StockSnapshotBaselineRepository snapshotBaselines;
     private final StockLedgerService stockLedger;
     private final AuditService audit;
+    private final SmartImportSnapshotEligibilityService snapshotEligibility;
+    private final SmartImportTransferService transferService;
+    private final RetailCounterSaleService retailSales;
+    private final SmartImportSnapshotDateService snapshotDates;
+    private final EntityManager entityManager;
 
     public SmartImportCommitExecutor(
         Repositories.ImportSessionRepository sessions,
         Repositories.ImportSessionFileRepository files,
         Repositories.ImportDryRunRepository dryRuns,
+        Repositories.ImportDryRunItemRepository dryRunItems,
         Repositories.SmartImportCommitRepository commits,
         Repositories.SmartImportEffectRepository effects,
         Repositories.ExternalRecordMappingRepository mappings,
@@ -70,6 +85,7 @@ public class SmartImportCommitExecutor {
         Repositories.SmartStagedStockSnapshotRepository stagedSnapshots,
         Repositories.SmartStagedVoucherRepository stagedVouchers,
         Repositories.SmartStagedVoucherItemRepository stagedVoucherItems,
+        Repositories.SmartStagedTransferCandidateRepository stagedTransfers,
         Repositories.SmartStagedCashbookEntryRepository stagedCashbook,
         Repositories.SmartStagedStockAgeingRepository stagedAgeing,
         Repositories.UnitRepository units,
@@ -88,12 +104,20 @@ public class SmartImportCommitExecutor {
         Repositories.CustomerPaymentRepository customerPayments,
         Repositories.SupplierPaymentRepository supplierPayments,
         Repositories.OutstandingSnapshotRepository outstandingSnapshots,
+        Repositories.StockMovementRepository stockMovements,
+        Repositories.StockSnapshotBaselineRepository snapshotBaselines,
         StockLedgerService stockLedger,
-        AuditService audit
+        AuditService audit,
+        SmartImportSnapshotEligibilityService snapshotEligibility,
+        SmartImportTransferService transferService,
+        RetailCounterSaleService retailSales,
+        SmartImportSnapshotDateService snapshotDates,
+        EntityManager entityManager
     ) {
         this.sessions = sessions;
         this.files = files;
         this.dryRuns = dryRuns;
+        this.dryRunItems = dryRunItems;
         this.commits = commits;
         this.effects = effects;
         this.mappings = mappings;
@@ -104,6 +128,7 @@ public class SmartImportCommitExecutor {
         this.stagedSnapshots = stagedSnapshots;
         this.stagedVouchers = stagedVouchers;
         this.stagedVoucherItems = stagedVoucherItems;
+        this.stagedTransfers = stagedTransfers;
         this.stagedCashbook = stagedCashbook;
         this.stagedAgeing = stagedAgeing;
         this.units = units;
@@ -122,12 +147,20 @@ public class SmartImportCommitExecutor {
         this.customerPayments = customerPayments;
         this.supplierPayments = supplierPayments;
         this.outstandingSnapshots = outstandingSnapshots;
+        this.stockMovements = stockMovements;
+        this.snapshotBaselines = snapshotBaselines;
         this.stockLedger = stockLedger;
         this.audit = audit;
+        this.snapshotEligibility = snapshotEligibility;
+        this.transferService = transferService;
+        this.retailSales = retailSales;
+        this.snapshotDates = snapshotDates;
+        this.entityManager = entityManager;
     }
 
     @Transactional
     public Map<String, Object> execute(UUID tenantId, UUID sessionId, UUID commitId) {
+        retailSales.lockCashbook(tenantId);
         var commit = commits.findByTenantIdAndImportSessionIdAndId(tenantId, sessionId, commitId)
             .orElseThrow(() -> ApiErrors.notFound("Smart Import commit not found"));
         var session = sessions.findByTenantIdAndId(tenantId, sessionId)
@@ -137,23 +170,50 @@ public class SmartImportCommitExecutor {
         if (commit.status == DomainEnums.SmartImportCommitStatus.COMMITTED) {
             return response(commit, true);
         }
+        var dates = snapshotDates.fromSummary(dryRun.summaryJson);
+        snapshotDates.validateSession(tenantId, sessionId, dates);
 
         effects.deleteByTenantIdAndCommitId(tenantId, commit.id);
         session.status = DomainEnums.ImportSessionStatus.COMMITTING;
         session.updatedBy = TenantContext.userId();
         sessions.save(session);
+        flushAndClear();
 
         var counts = new CommitCounts();
+        var stockImpactMode = stockImpactMode(dryRun);
+        var returnStockImpactMode = returnStockImpactMode(dryRun);
+        var stockJournalImpactMode = stockJournalImpactMode(dryRun);
+        var stockDryRunItems = dryRunItems.findByTenantIdAndDryRunIdAndItemTypeOrderByCreatedAtAsc(
+                tenantId, dryRun.id, DomainEnums.ImportDryRunItemType.STOCK_MOVEMENT).stream()
+            .collect(Collectors.toMap(
+                this::stockDryRunKey,
+                Function.identity(),
+                (left, right) -> left,
+                LinkedHashMap::new));
+        var transferDryRunItems = dryRunItems.findByTenantIdAndDryRunIdAndItemTypeOrderByCreatedAtAsc(
+                tenantId, dryRun.id, DomainEnums.ImportDryRunItemType.WAREHOUSE_TRANSFER).stream()
+            .collect(Collectors.toMap(
+                item -> item.targetEntityId == null
+                    ? item.sourceFileId + ":" + item.sourceRowNumber : item.targetEntityId.toString(),
+                Function.identity(), (left, right) -> left, LinkedHashMap::new));
         var fileHashes = files.findByTenantIdAndImportSessionIdOrderByCreatedAtAsc(tenantId, sessionId).stream()
             .collect(Collectors.toMap(file -> file.id, file -> nullSafe(file.fileHash), (left, right) -> left));
         var unitIndex = commitUnits(tenantId, sessionId, commit, counts, fileHashes);
         var warehouseIndex = commitWarehouses(tenantId, sessionId, commit, counts, fileHashes);
         var productIndex = commitProducts(tenantId, sessionId, commit, counts, fileHashes, unitIndex);
         commitParties(tenantId, sessionId, commit, counts, fileHashes);
-        commitOutstandingSnapshots(tenantId, sessionId, commit, counts, fileHashes);
+        log.info("Smart import commit {}: foundation resolved", commit.id);
+        commitOutstandingSnapshots(tenantId, sessionId, commit, counts, fileHashes, dates);
         commitSnapshots(tenantId, sessionId, commit, dryRun, counts, fileHashes, unitIndex, warehouseIndex, productIndex);
-        commitInvoiceOnlyVouchers(tenantId, sessionId, commit, counts, fileHashes, unitIndex, warehouseIndex, productIndex);
+        log.info("Smart import commit {}: snapshots processed", commit.id);
+        commitVouchers(tenantId, sessionId, commit, dryRun, stockImpactMode, returnStockImpactMode, stockDryRunItems,
+            counts, fileHashes, unitIndex, warehouseIndex, productIndex);
+        log.info("Smart import commit {}: vouchers processed", commit.id);
+        commitTransfers(tenantId, sessionId, commit, dryRun, stockJournalImpactMode,
+            transferDryRunItems, counts);
         commitCashbook(tenantId, sessionId, commit, counts);
+        verifyCashbookReconciliation(dryRun, counts);
+        log.info("Smart import commit {}: transfers and cashbook processed", commit.id);
 
         counts.set("futurePhaseVoucherRowsSkipped", counts.get("vouchersDeferredForFuturePhase"));
         counts.set("futurePhaseCashbookRowsSkipped",
@@ -163,15 +223,27 @@ public class SmartImportCommitExecutor {
 
         var finishedAt = Instant.now();
         var summary = counts.response();
-        summary.put("warnings", 0);
+        summary.putAll(dates.summary());
+        summary.put("warnings", counts.get("futurePhaseCashbookRowsSkipped"));
         summary.put("blockingErrors", 0);
-        summary.put("phase", "4B-2B");
-        summary.put("voucherStockImpactMode", DomainEnums.VoucherStockImpactMode.CREATE_INVOICES_ONLY.name());
-        summary.put("invoiceOnlyMessage", "Sales/Purchase vouchers were imported as invoice-only. Stock was not changed because this phase uses invoice-only posting.");
-        summary.put("financialAdjustmentMessage", "Credit/debit notes were imported as financial adjustments. Stock impact for returns is deferred to a later phase.");
-        summary.put("cashbookMessage", "High-confidence cashbook rows were posted as customer or supplier payments. Low-confidence and unmatched rows remain available for review.");
+        summary.put("phase", "4B-2E");
+        summary.put("voucherStockImpactMode", stockImpactMode.name());
+        summary.put("returnStockImpactMode", returnStockImpactMode.name());
+        summary.put("stockJournalImpactMode", stockJournalImpactMode.name());
+        summary.put("netCompanyStockQuantityChange", BigDecimal.ZERO);
+        summary.put("invoiceOnlyMessage", stockImpactMode == DomainEnums.VoucherStockImpactMode.CREATE_INVOICES_ONLY
+            ? "Sales/Purchase vouchers were imported as invoice-only and did not change stock."
+            : "Only eligible sales and purchase items strictly after their applicable closing-stock snapshot changed stock.");
+        summary.put("financialAdjustmentMessage",
+            returnStockImpactMode == DomainEnums.ReturnStockImpactMode.FINANCIAL_ONLY
+                ? "Credit/debit notes were imported as financial adjustments without return stock movements."
+                : "Only confirmed physical return lines strictly after their applicable closing-stock snapshot changed stock.");
+        summary.put("cashbookMessage", counts.get("futurePhaseCashbookRowsSkipped") > 0
+            ? counts.get("futurePhaseCashbookRowsSkipped") + " cashbook rows were not posted as payments because their party, amount, or matching evidence needs review. Other resolved rows were posted."
+            : "Resolved cashbook rows were posted as customer or supplier payments.");
         summary.put("outstandingMessage", "Debtor and creditor rows were stored as dated outstanding snapshots; no fake invoices were created.");
-        summary.put("futurePhaseMessage", "Stock ageing and all stock-affecting voucher and return posting remain deferred.");
+        summary.put("futurePhaseMessage",
+            "Manufacturing journals, unilateral stock adjustments, damaged/quarantine stock, and stock-ageing reconciliation remain deferred.");
         summary.put("committedAt", finishedAt);
         summary.put("committedBy", commit.committedBy);
         commit.summaryJson = summary;
@@ -196,7 +268,11 @@ public class SmartImportCommitExecutor {
             "customerPaymentsCreated", counts.get("customerPaymentsCreated"),
             "supplierPaymentsCreated", counts.get("supplierPaymentsCreated"),
             "outstandingSnapshotsCreated", counts.get("outstandingSnapshotsCreated"),
-            "voucherStockMovementsCreated", 0
+            "voucherStockMovementsCreated", counts.get("voucherStockMovementsCreated"),
+            "warehouseTransfersCommitted", counts.get("warehouseTransfersCommitted"),
+            "transferOutMovementsCreated", counts.get("transferOutMovementsCreated"),
+            "transferInMovementsCreated", counts.get("transferInMovementsCreated"),
+            "netCompanyStockEffect", BigDecimal.ZERO
         ));
         return response(commit, false);
     }
@@ -206,7 +282,9 @@ public class SmartImportCommitExecutor {
     ) {
         var index = units.findByTenantIdOrderByCodeAsc(tenantId).stream()
             .collect(Collectors.toMap(unit -> normalizeUnit(unit.code), Function.identity(), (left, right) -> left, LinkedHashMap::new));
+        int processed = 0;
         for (var row : stagedUnits.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId, sessionId)) {
+            flushBatch(processed++);
             var code = normalizeUnit(firstNonBlank(row.normalizedCode, row.sourceUnitCode, "PCS"));
             var existing = row.matchedUnitId == null ? index.get(code)
                 : units.findByTenantIdAndId(tenantId, row.matchedUnitId).orElse(null);
@@ -237,7 +315,9 @@ public class SmartImportCommitExecutor {
     ) {
         var index = warehouses.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId).stream()
             .collect(Collectors.toMap(warehouse -> normalizeName(warehouse.name), Function.identity(), (left, right) -> left, LinkedHashMap::new));
+        int processed = 0;
         for (var row : stagedWarehouses.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId, sessionId)) {
+            flushBatch(processed++);
             requireResolved(row.matchStatus, row.reviewStatus, "warehouse", row.sourceRowNumber);
             var key = normalizeName(firstNonBlank(row.normalizedName, row.sourceWarehouseName));
             if (key.isBlank()) continue;
@@ -273,7 +353,9 @@ public class SmartImportCommitExecutor {
         for (var product : products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)) {
             index.put(productKey(product.normalizedName, unitCode(tenantId, product)), product);
         }
+        int processed = 0;
         for (var row : stagedProducts.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId, sessionId)) {
+            flushBatch(processed++);
             requireResolved(row.matchStatus, row.reviewStatus, "product", row.sourceRowNumber);
             var unit = ensureUnit(tenantId, commit, row.sessionFileId, row.sourceRowNumber, row.unitCode, counts, unitIndex);
             var key = productKey(firstNonBlank(row.normalizedName, normalizeName(row.rawName)), unit.code);
@@ -313,7 +395,9 @@ public class SmartImportCommitExecutor {
                 createBarcodeIfPresent(tenantId, product.id, row.barcode);
                 index.put(productKey(product.normalizedName, unitCode(tenantId, product)), product);
             }
-            upsertMapping(commit, row.sessionFileId, "PRODUCT", row.externalId, key, "PRODUCT", product.id,
+            // Keep the source name/unit alias even when an existing master identity resolved it.
+            index.put(key, product);
+            upsertMapping(commit, row.sessionFileId, "PRODUCT", SmartImportProductIdentity.externalId(row), key, "PRODUCT", product.id,
                 fileHashes.get(row.sessionFileId));
         }
         return index;
@@ -322,7 +406,9 @@ public class SmartImportCommitExecutor {
     private void commitParties(
         UUID tenantId, UUID sessionId, SmartImportCommit commit, CommitCounts counts, Map<UUID, String> fileHashes
     ) {
+        int processed = 0;
         for (var row : stagedParties.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId, sessionId)) {
+            flushBatch(processed++);
             requireResolved(row.matchStatus, row.reviewStatus, "party", row.sourceRowNumber);
             if (row.partyType == DomainEnums.SmartPartyType.UNKNOWN) {
                 throw ApiErrors.badRequest("Party type is unresolved at row " + row.sourceRowNumber);
@@ -377,12 +463,15 @@ public class SmartImportCommitExecutor {
     }
 
     private void commitOutstandingSnapshots(
-        UUID tenantId, UUID sessionId, SmartImportCommit commit, CommitCounts counts, Map<UUID, String> fileHashes
+        UUID tenantId, UUID sessionId, SmartImportCommit commit, CommitCounts counts, Map<UUID, String> fileHashes,
+        SmartImportSnapshotDateService.Selection dates
     ) {
+        int processed = 0;
         for (var row : stagedParties.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId, sessionId)) {
+            flushBatch(processed++);
             if (row.sourceType != DomainEnums.DetectedFileType.DEBTOR_CREDITOR_ANALYSIS) continue;
             requireResolved(row.matchStatus, row.reviewStatus, "outstanding party", row.sourceRowNumber);
-            var snapshotDate = row.snapshotDate == null ? LocalDate.now(ZoneOffset.UTC) : row.snapshotDate;
+            var snapshotDate = dates.outstandingDate(row.snapshotDate);
             var amount = nvl(row.openingBalance);
             if (row.partyType == DomainEnums.SmartPartyType.CUSTOMER) {
                 counts.inc("debtorRowsProcessed");
@@ -448,7 +537,14 @@ public class SmartImportCommitExecutor {
     }
 
     private void commitCashbook(UUID tenantId, UUID sessionId, SmartImportCommit commit, CommitCounts counts) {
+        int processed = 0;
         for (var row : stagedCashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(tenantId, sessionId)) {
+            flushBatch(processed++);
+            if (retailSales.restoreResolution(row)) {
+                stagedCashbook.save(row);
+                counts.inc("retailCounterSaleRowsResolved");
+                continue;
+            }
             if (row.resolutionStatus == DomainEnums.CashbookResolutionStatus.IGNORED) {
                 counts.inc("cashbookRowsIgnored");
                 continue;
@@ -474,9 +570,9 @@ public class SmartImportCommitExecutor {
                 counts.inc("cashbookRowsReviewRequired");
                 continue;
             }
-            if (row.entryDate == null || row.amount == null || row.amount.signum() <= 0) {
-                counts.inc("cashbookRowsReviewRequired");
-                continue;
+            if (!SmartImportCashbookMatchingService.ready(row)) {
+                throw ApiErrors.conflict("Cashbook row " + row.sourceRowNumber
+                    + " is no longer ready. Run a new dry run and review its matching evidence.");
             }
             if (row.matchedPartyType == DomainEnums.SmartPartyType.CUSTOMER) {
                 commitCustomerPayment(tenantId, row, commit, counts);
@@ -510,12 +606,12 @@ public class SmartImportCommitExecutor {
         UUID tenantId, SmartStagedCashbookEntry row, SmartImportCommit commit, CommitCounts counts
     ) {
         var customer = row.matchedPartyId == null ? null : customers.findByTenantIdAndId(tenantId, row.matchedPartyId).orElse(null);
-        if (customer == null && row.partyName != null) {
-            customer = customers.findByTenantIdAndNameIgnoreCase(tenantId, normalizeName(row.partyName)).orElse(null);
+        if (customer == null && row.matchedPartyName != null) {
+            customer = customerBySourceName(tenantId, row.matchedPartyName);
         }
         if (customer == null) {
-            counts.inc("cashbookRowsReviewRequired");
-            return;
+            throw ApiErrors.conflict("Verified customer is unresolved for cashbook row " + row.sourceRowNumber
+                + ". Run a new dry run; no payment was silently skipped.");
         }
         var fingerprint = firstNonBlank(row.fingerprint, sha256(tenantId + "|CASHBOOK|" + row.id));
         var duplicate = customerPayments.findByTenantIdAndSourceFingerprint(tenantId, fingerprint).orElse(null);
@@ -555,12 +651,12 @@ public class SmartImportCommitExecutor {
         UUID tenantId, SmartStagedCashbookEntry row, SmartImportCommit commit, CommitCounts counts
     ) {
         var supplier = row.matchedPartyId == null ? null : suppliers.findByTenantIdAndId(tenantId, row.matchedPartyId).orElse(null);
-        if (supplier == null && row.partyName != null) {
-            supplier = suppliers.findByTenantIdAndNameIgnoreCase(tenantId, normalizeName(row.partyName)).orElse(null);
+        if (supplier == null && row.matchedPartyName != null) {
+            supplier = supplierBySourceName(tenantId, row.matchedPartyName);
         }
         if (supplier == null) {
-            counts.inc("cashbookRowsReviewRequired");
-            return;
+            throw ApiErrors.conflict("Verified supplier is unresolved for cashbook row " + row.sourceRowNumber
+                + ". Run a new dry run; no payment was silently skipped.");
         }
         var fingerprint = firstNonBlank(row.fingerprint, sha256(tenantId + "|CASHBOOK|" + row.id));
         var duplicate = supplierPayments.findByTenantIdAndSourceFingerprint(tenantId, fingerprint).orElse(null);
@@ -597,19 +693,47 @@ public class SmartImportCommitExecutor {
     }
 
     private SalesInvoice resolveSalesInvoice(UUID tenantId, SmartStagedCashbookEntry row, UUID customerId) {
-        var invoice = row.matchedInvoiceId == null ? null : salesInvoices.findByTenantIdAndId(tenantId, row.matchedInvoiceId).orElse(null);
-        if (invoice == null && row.referenceNumber != null) {
-            invoice = salesInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, row.referenceNumber).orElse(null);
+        if (row.cashbookMatchStatus != DomainEnums.CashbookMatchStatus.MATCHED_SALES_INVOICE) return null;
+        var id = cashbookInvoiceId(tenantId, row, "SALES_VOUCHER");
+        var invoice = id == null ? null : salesInvoices.findByTenantIdAndId(tenantId, id).orElse(null);
+        if (invoice == null || !customerId.equals(invoice.customerId)) {
+            throw ApiErrors.conflict("Sales invoice identity changed for cashbook row " + row.sourceRowNumber + ". Run a new dry run.");
         }
-        return invoice != null && customerId.equals(invoice.customerId) ? invoice : null;
+        return invoice;
     }
 
     private PurchaseInvoice resolvePurchaseInvoice(UUID tenantId, SmartStagedCashbookEntry row, UUID supplierId) {
-        var invoice = row.matchedInvoiceId == null ? null : purchaseInvoices.findByTenantIdAndId(tenantId, row.matchedInvoiceId).orElse(null);
-        if (invoice == null && row.referenceNumber != null) {
-            invoice = purchaseInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, row.referenceNumber).orElse(null);
+        if (row.cashbookMatchStatus != DomainEnums.CashbookMatchStatus.MATCHED_PURCHASE_INVOICE) return null;
+        var id = cashbookInvoiceId(tenantId, row, "PURCHASE_VOUCHER");
+        var invoice = id == null ? null : purchaseInvoices.findByTenantIdAndId(tenantId, id).orElse(null);
+        if (invoice == null || !supplierId.equals(invoice.supplierId)) {
+            throw ApiErrors.conflict("Purchase invoice identity changed for cashbook row " + row.sourceRowNumber + ". Run a new dry run.");
         }
-        return invoice != null && supplierId.equals(invoice.supplierId) ? invoice : null;
+        return invoice;
+    }
+
+    private UUID cashbookInvoiceId(UUID tenantId, SmartStagedCashbookEntry row, String type) {
+        if (row.matchedInvoiceId != null) return row.matchedInvoiceId;
+        if (row.matchedStagedVoucherId == null) return null;
+        var voucher = stagedVouchers.findByTenantIdAndImportSessionIdAndId(
+            tenantId, row.importSessionId, row.matchedStagedVoucherId).orElse(null);
+        if (voucher == null || excludedVoucher(voucher)) return null;
+        return mappedInvoiceId(tenantId, type, voucher);
+    }
+
+    private void verifyCashbookReconciliation(ImportDryRun dryRun, CommitCounts counts) {
+        var checks = Map.of("customerPaymentsPreviewed", "customerPaymentsCreated",
+            "supplierPaymentsPreviewed", "supplierPaymentsCreated",
+            "paymentsLinkedToSalesInvoices", "paymentsLinkedToSalesInvoices",
+            "paymentsLinkedToPurchaseInvoices", "paymentsLinkedToPurchaseInvoices",
+            "duplicatePaymentsSkipped", "duplicatePaymentsSkipped");
+        for (var check : checks.entrySet()) {
+            var expected = Long.parseLong(Objects.toString(dryRun.summaryJson.get(check.getKey()), "0"));
+            if (expected != counts.get(check.getValue())) {
+                throw ApiErrors.conflict("Cashbook reconciliation differs from the dry run (" + check.getKey()
+                    + "). Nothing was partially committed. Run a new dry run.");
+            }
+        }
     }
 
     private void commitSnapshots(
@@ -618,7 +742,9 @@ public class SmartImportCommitExecutor {
         Map<String, Warehouse> warehouseIndex, Map<String, Product> productIndex
     ) {
         var policy = negativePolicy(dryRun);
+        int processed = 0;
         for (var row : stagedSnapshots.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId, sessionId)) {
+            flushBatch(processed++);
             counts.inc("snapshotRowsProcessed");
             var imported = nvl(row.importedStock);
             if (imported.signum() < 0 && (row.matchStatus == DomainEnums.SmartMatchStatus.MATCH_EXISTING
@@ -648,7 +774,7 @@ public class SmartImportCommitExecutor {
                     product.id, DomainEnums.SmartImportEffectAction.CREATED, Map.of(), productValue(product), true);
             }
             var warehouse = resolveSnapshotWarehouse(tenantId, commit, row, counts, warehouseIndex);
-            var snapshotDate = row.snapshotDate == null ? LocalDate.now() : row.snapshotDate;
+            var snapshotDate = snapshotDates.fromSummary(dryRun.summaryJson).stockDate(row.snapshotDate);
             if (imported.signum() < 0) {
                 counts.inc("negativeStockRowsFound");
                 if (policy == DomainEnums.NegativeStockImportPolicy.SKIP_STOCK_MOVEMENT) {
@@ -663,6 +789,7 @@ public class SmartImportCommitExecutor {
             }
             var stockAtDate = stockLedger.stockAt(tenantId, product.id, warehouse.id, snapshotDate);
             var delta = imported.subtract(stockAtDate);
+            UUID adjustmentMovementId = null;
             if (delta.signum() == 0) {
                 counts.inc("snapshotRowsNoChange");
                 effect(commit, row.sessionFileId, row.sourceRowNumber, DomainEnums.SmartImportEffectEntityType.STOCK_MOVEMENT,
@@ -675,6 +802,7 @@ public class SmartImportCommitExecutor {
                     DomainEnums.MovementType.ADJUSTMENT, delta, product.baseUnitId, nvl(row.rate),
                     "SMART_IMPORT_COMMIT", commit.id, movementDate,
                     "Smart Import stock snapshot adjustment for " + snapshotDate);
+                adjustmentMovementId = movement.id;
                 counts.inc("snapshotMovementsCreated");
                 counts.inc(delta.signum() > 0 ? "snapshotPositiveAdjustments" : "snapshotNegativeAdjustments");
                 effect(commit, row.sessionFileId, row.sourceRowNumber, DomainEnums.SmartImportEffectEntityType.STOCK_MOVEMENT,
@@ -682,20 +810,56 @@ public class SmartImportCommitExecutor {
                     linked("importedStock", imported, "delta", delta, "warehouseId", warehouse.id,
                         "snapshotDate", snapshotDate), true);
             }
+            var baseline = new StockSnapshotBaseline();
+            own(baseline, tenantId);
+            baseline.productId = product.id;
+            baseline.warehouseId = row.matchedWarehouseId != null
+                || row.warehouseName != null && !row.warehouseName.isBlank() ? warehouse.id : null;
+            baseline.adjustmentWarehouseId = warehouse.id;
+            baseline.snapshotDate = snapshotDate;
+            baseline.importedQuantity = imported;
+            baseline.adjustmentMovementId = adjustmentMovementId;
+            baseline.sourceImportSessionId = sessionId;
+            baseline.sourceFileId = row.sessionFileId;
+            baseline.sourceRowNumber = row.sourceRowNumber;
+            snapshotBaselines.save(baseline);
             var mappingKey = product.id + "|" + warehouse.id + "|" + snapshotDate;
             upsertMapping(commit, row.sessionFileId, "STOCK_SNAPSHOT", null, mappingKey,
                 "PRODUCT", product.id, fileHashes.get(row.sessionFileId));
         }
     }
 
-    private void commitInvoiceOnlyVouchers(
-        UUID tenantId, UUID sessionId, SmartImportCommit commit, CommitCounts counts, Map<UUID, String> fileHashes,
+    private void commitVouchers(
+        UUID tenantId, UUID sessionId, SmartImportCommit commit, ImportDryRun dryRun,
+        DomainEnums.VoucherStockImpactMode stockImpactMode,
+        DomainEnums.ReturnStockImpactMode returnStockImpactMode,
+        Map<String, ImportDryRunItem> stockDryRunItems,
+        CommitCounts counts, Map<UUID, String> fileHashes,
         Map<String, UnitOfMeasure> unitIndex, Map<String, Warehouse> warehouseIndex, Map<String, Product> productIndex
     ) {
+        if (stockImpactMode == DomainEnums.VoucherStockImpactMode.APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE) {
+            audit.logCurrent("SMART_IMPORT_POST_SNAPSHOT_STOCK_MODE_SELECTED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "mode", stockImpactMode));
+        }
+        if (returnStockImpactMode == DomainEnums.ReturnStockImpactMode.APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE) {
+            audit.logCurrent("SMART_IMPORT_RETURN_MODE_SELECTED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "mode", returnStockImpactMode));
+        }
         var itemsByVoucher = stagedVoucherItems
             .findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId, sessionId).stream()
             .collect(Collectors.groupingBy(item -> item.stagedVoucherId, LinkedHashMap::new, Collectors.toList()));
+        var stockJournalVoucherIds = stagedTransfers
+            .findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(tenantId, sessionId).stream()
+            .map(candidate -> candidate.stagedVoucherId).collect(Collectors.toSet());
+        int processed = 0;
         for (var voucher : stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(tenantId, sessionId)) {
+            flushBatch(processed++);
+            if (processed % 250 == 0) log.info("Smart import commit {}: processing voucher {}", commit.id, processed);
+            if (stockJournalVoucherIds.contains(voucher.id)) continue;
+            if (excludedVoucher(voucher)) {
+                counts.inc("vouchersExcludedByUser");
+                continue;
+            }
             var kind = voucherKind(voucher.voucherType);
             if (kind == VoucherKind.DEFERRED) {
                 counts.inc("vouchersDeferredForFuturePhase");
@@ -714,12 +878,16 @@ public class SmartImportCommitExecutor {
                 .max().orElse(0));
             captureFinancialCounts(counts, voucher);
             switch (kind) {
-                case SALES -> commitSalesVoucher(tenantId, voucher, sourceItems, commit, counts, fileHashes, unitIndex, warehouseIndex, productIndex);
-                case PURCHASE -> commitPurchaseVoucher(tenantId, voucher, sourceItems, commit, counts, fileHashes, unitIndex, warehouseIndex, productIndex);
+                case SALES -> commitSalesVoucher(tenantId, voucher, sourceItems, commit, dryRun, stockImpactMode,
+                    stockDryRunItems, counts, fileHashes, unitIndex, warehouseIndex, productIndex);
+                case PURCHASE -> commitPurchaseVoucher(tenantId, voucher, sourceItems, commit, dryRun, stockImpactMode,
+                    stockDryRunItems, counts, fileHashes, unitIndex, warehouseIndex, productIndex);
                 case CREDIT_NOTE -> commitFinancialNote(tenantId, voucher, sourceItems, DomainEnums.FinancialAdjustmentType.CREDIT_NOTE,
-                    commit, counts, fileHashes, unitIndex, warehouseIndex, productIndex);
+                    commit, dryRun, returnStockImpactMode, stockDryRunItems, counts, fileHashes,
+                    unitIndex, warehouseIndex, productIndex);
                 case DEBIT_NOTE -> commitFinancialNote(tenantId, voucher, sourceItems, DomainEnums.FinancialAdjustmentType.DEBIT_NOTE,
-                    commit, counts, fileHashes, unitIndex, warehouseIndex, productIndex);
+                    commit, dryRun, returnStockImpactMode, stockDryRunItems, counts, fileHashes,
+                    unitIndex, warehouseIndex, productIndex);
                 case DEFERRED -> { }
             }
         }
@@ -755,11 +923,311 @@ public class SmartImportCommitExecutor {
             audit.logCurrent("SMART_IMPORT_DUPLICATE_NOTES_SKIPPED", "SmartImportCommit", commit.id,
                 Map.of("count", duplicateNotes));
         }
+        if (counts.get("vouchersExcludedByUser") > 0) {
+            audit.logCurrent("SMART_IMPORT_VOUCHERS_EXCLUDED", "SmartImportCommit", commit.id,
+                Map.of("count", counts.get("vouchersExcludedByUser")));
+        }
+        if (counts.get("salesStockMovementsCreated") > 0) {
+            audit.logCurrent("SMART_IMPORT_SALES_STOCK_MOVEMENTS_COMMITTED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("salesStockMovementsCreated")));
+        }
+        if (counts.get("purchaseStockMovementsCreated") > 0) {
+            audit.logCurrent("SMART_IMPORT_PURCHASE_STOCK_MOVEMENTS_COMMITTED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("purchaseStockMovementsCreated")));
+        }
+        if (counts.get("voucherItemsCoveredBySnapshot") > 0) {
+            audit.logCurrent("SMART_IMPORT_VOUCHER_STOCK_EFFECT_COVERED_BY_SNAPSHOT", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("voucherItemsCoveredBySnapshot"),
+                    "sameDate", counts.get("sameDateVoucherItemsDeferred")));
+        }
+        if (counts.get("duplicateStockMovementsSkipped") > 0) {
+            audit.logCurrent("SMART_IMPORT_DUPLICATE_STOCK_MOVEMENT_SKIPPED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("duplicateStockMovementsSkipped")));
+        }
+        if (counts.get("returnInMovementsCreated") > 0) {
+            audit.logCurrent("SMART_IMPORT_RETURN_IN_MOVEMENTS_COMMITTED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("returnInMovementsCreated")));
+        }
+        if (counts.get("returnOutMovementsCreated") > 0) {
+            audit.logCurrent("SMART_IMPORT_RETURN_OUT_MOVEMENTS_COMMITTED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("returnOutMovementsCreated")));
+        }
+        if (counts.get("physicalSalesReturnsCommitted") > 0) {
+            audit.logCurrent("SMART_IMPORT_PHYSICAL_SALES_RETURNS_COMMITTED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("physicalSalesReturnsCommitted")));
+        }
+        if (counts.get("physicalPurchaseReturnsCommitted") > 0) {
+            audit.logCurrent("SMART_IMPORT_PHYSICAL_PURCHASE_RETURNS_COMMITTED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("physicalPurchaseReturnsCommitted")));
+        }
+        if (counts.get("financialOnlyNotesCommitted") > 0) {
+            audit.logCurrent("SMART_IMPORT_FINANCIAL_ONLY_RETURN_CONFIRMED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("financialOnlyNotesCommitted")));
+        }
+        if (counts.get("returnsCoveredBySnapshot") > 0) {
+            audit.logCurrent("SMART_IMPORT_RETURN_COVERED_BY_SNAPSHOT", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("returnsCoveredBySnapshot"),
+                    "sameDate", counts.get("sameDateReturnsDeferred")));
+        }
+        if (counts.get("duplicateReturnMovementsSkipped") > 0) {
+            audit.logCurrent("SMART_IMPORT_DUPLICATE_RETURN_MOVEMENT_SKIPPED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("duplicateReturnMovementsSkipped")));
+        }
+    }
+
+    private void commitTransfers(
+        UUID tenantId,
+        UUID sessionId,
+        SmartImportCommit commit,
+        ImportDryRun dryRun,
+        DomainEnums.StockJournalImpactMode mode,
+        Map<String, ImportDryRunItem> transferDryRunItems,
+        CommitCounts counts
+    ) {
+        audit.logCurrent("SMART_IMPORT_STOCK_JOURNAL_MODE_SELECTED", "SmartImportCommit", commit.id,
+            linked("sessionId", sessionId, "mode", mode));
+        var processedVouchers = new HashSet<UUID>();
+        int processed = 0;
+        for (var candidate : stagedTransfers
+            .findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(tenantId, sessionId)) {
+            flushBatch(processed++);
+            if (processedVouchers.add(candidate.stagedVoucherId)) counts.inc("stockJournalsProcessed");
+            if (candidate.resolutionStatus == DomainEnums.TransferResolutionStatus.IGNORED) {
+                counts.inc("ignoredStockJournals");
+                continue;
+            }
+            if (transferService.manufacturing(candidate)) {
+                counts.inc("manufacturingJournalsDeferred");
+                continue;
+            }
+            if (candidate.classification != DomainEnums.StockJournalClassification.WAREHOUSE_TRANSFER) {
+                if (candidate.classification == DomainEnums.StockJournalClassification.UNBALANCED_STOCK_JOURNAL
+                    || candidate.resolutionStatus == DomainEnums.TransferResolutionStatus.DEFERRED_ADJUSTMENT) {
+                    counts.inc("adjustmentJournalsDeferred");
+                } else {
+                    counts.inc("ambiguousStockJournalsDeferred");
+                }
+                continue;
+            }
+            if (mode == DomainEnums.StockJournalImpactMode.DEFER_STOCK_JOURNALS) {
+                counts.inc("unresolvedWarehouseTransfers");
+                continue;
+            }
+            if (!transferService.isConfirmed(candidate)) {
+                counts.inc("unresolvedWarehouseTransfers");
+                throw ApiErrors.badRequest("Warehouse transfer row " + candidate.sourceRowNumber + " requires review");
+            }
+            var dryRunItem = transferDryRunItems.get(candidate.id.toString());
+            if (dryRunItem == null) {
+                throw ApiErrors.conflict("The selected dry run does not contain warehouse transfer row "
+                    + candidate.sourceRowNumber);
+            }
+            if (dryRunItem.action == DomainEnums.ImportDryRunAction.SKIP) {
+                switch (nullSafe(dryRunItem.warningCode)) {
+                    case "DUPLICATE_WAREHOUSE_TRANSFER" -> counts.inc("duplicateWarehouseTransfersSkipped");
+                    case "TRANSFER_ALREADY_COVERED_BY_SNAPSHOT" -> {
+                        counts.inc("warehouseTransfersCoveredBySnapshot");
+                        var sourceDate = date(dryRunItem.previewJson.get("sourceSnapshotDate"));
+                        var destinationDate = date(dryRunItem.previewJson.get("destinationSnapshotDate"));
+                        if (Objects.equals(sourceDate, candidate.voucherDate)
+                            || Objects.equals(destinationDate, candidate.voucherDate)) {
+                            counts.inc("sameDateWarehouseTransfersDeferred");
+                        }
+                    }
+                    case "TRANSFER_NEGATIVE_STOCK_SKIPPED" -> {
+                        counts.inc("warehouseTransfersSkippedByPolicy");
+                        counts.inc("warehouseTransfersBlockedByNegativeStock");
+                    }
+                    default -> counts.inc("unresolvedWarehouseTransfers");
+                }
+                continue;
+            }
+            if (dryRunItem.action != DomainEnums.ImportDryRunAction.CREATE) {
+                throw ApiErrors.conflict("The selected dry run does not authorize warehouse transfer row "
+                    + candidate.sourceRowNumber);
+            }
+
+            var product = products.findByTenantIdAndId(tenantId, candidate.matchedProductId)
+                .orElseThrow(() -> ApiErrors.badRequest("Transfer product is not available in this workspace"));
+            var source = warehouses.findByTenantIdAndId(tenantId, candidate.sourceWarehouseId)
+                .orElseThrow(() -> ApiErrors.badRequest("Transfer source warehouse is not available in this workspace"));
+            var destination = warehouses.findByTenantIdAndId(tenantId, candidate.destinationWarehouseId)
+                .orElseThrow(() -> ApiErrors.badRequest("Transfer destination warehouse is not available in this workspace"));
+            if (source.id.equals(destination.id)) {
+                throw ApiErrors.badRequest("Source and destination warehouses must be different");
+            }
+            var quantity = nvl(candidate.normalizedQuantity).abs();
+            if (quantity.signum() <= 0) throw ApiErrors.badRequest("Transfer quantity must be positive");
+            var unit = candidate.unitCode == null ? null
+                : units.findByTenantIdAndCodeIgnoreCase(tenantId, candidate.unitCode).orElse(null);
+            var unitId = unit == null ? product.baseUnitId : unit.id;
+            var baseQuantity = stockLedger.toBaseQuantity(tenantId, product, unitId, quantity).abs();
+
+            var sourceEligibility = snapshotEligibility.decideWarehouseSpecific(
+                tenantId, sessionId, candidate.voucherDate, product.id,
+                candidate.normalizedProductName, candidate.unitCode, source.id, source.name,
+                snapshotDates.fromSummary(dryRun.summaryJson).stockDate());
+            var destinationEligibility = snapshotEligibility.decideWarehouseSpecific(
+                tenantId, sessionId, candidate.voucherDate, product.id,
+                candidate.normalizedProductName, candidate.unitCode, destination.id, destination.name,
+                snapshotDates.fromSummary(dryRun.summaryJson).stockDate());
+            if (sourceEligibility.blocking() || destinationEligibility.blocking()) {
+                counts.inc("warehouseTransfersWithoutBaseline");
+                throw ApiErrors.badRequest("Both warehouses require a reliable closing-stock baseline before transfer posting");
+            }
+            if (!sourceEligibility.eligible() || !destinationEligibility.eligible()) {
+                counts.inc("warehouseTransfersCoveredBySnapshot");
+                if (sourceEligibility.reasonCode() == SmartImportSnapshotEligibilityService.ReasonCode.ON_SNAPSHOT_DATE
+                    || destinationEligibility.reasonCode() == SmartImportSnapshotEligibilityService.ReasonCode.ON_SNAPSHOT_DATE) {
+                    counts.inc("sameDateWarehouseTransfersDeferred");
+                }
+                continue;
+            }
+            if (!Objects.equals(sourceEligibility.snapshotDate(), date(dryRunItem.previewJson.get("sourceSnapshotDate")))
+                || !Objects.equals(destinationEligibility.snapshotDate(), date(dryRunItem.previewJson.get("destinationSnapshotDate")))) {
+                throw ApiErrors.conflict("Warehouse snapshot baselines changed after the dry run. Run the dry run again.");
+            }
+
+            candidate.transferFingerprint = transferService.transferFingerprint(
+                tenantId, candidate, product.id, source.id, destination.id, quantity);
+            candidate.transferLineFingerprint = transferService.transferLineFingerprint(tenantId, candidate, product.id);
+            stockLedger.lockStockKeys(List.of(
+                stockLedger.stockKey(tenantId, product.id, source.id),
+                stockLedger.stockKey(tenantId, product.id, destination.id)));
+
+            var pairEffects = stockMovements.findByTenantIdAndTransferPairFingerprint(
+                tenantId, candidate.transferFingerprint);
+            if (completeTransferPair(pairEffects)) {
+                counts.inc("duplicateWarehouseTransfersSkipped");
+                audit.logCurrent("SMART_IMPORT_DUPLICATE_TRANSFER_SKIPPED", "SmartStagedTransferCandidate",
+                    candidate.id, linked("sessionId", sessionId, "fingerprint", candidate.transferFingerprint));
+                continue;
+            }
+            var lineEffects = stockMovements.findByTenantIdAndTransferLineFingerprint(
+                tenantId, candidate.transferLineFingerprint);
+            if (!pairEffects.isEmpty() || !lineEffects.isEmpty()) {
+                throw ApiErrors.conflict("A conflicting or one-sided historical warehouse transfer requires review");
+            }
+
+            var sourceCurrent = stockLedger.currentStock(tenantId, product.id, source.id);
+            var destinationCurrent = stockLedger.currentStock(tenantId, product.id, destination.id);
+            var expectedSource = decimal(dryRunItem.previewJson.get("sourceCurrentStock"));
+            var expectedDestination = decimal(dryRunItem.previewJson.get("destinationCurrentStock"));
+            if (expectedSource == null || expectedDestination == null
+                || expectedSource.compareTo(sourceCurrent) != 0
+                || expectedDestination.compareTo(destinationCurrent) != 0) {
+                throw ApiErrors.conflict("Warehouse stock changed after the dry run. Run the dry run again.");
+            }
+            var projectedSource = sourceCurrent.subtract(baseQuantity);
+            if (projectedSource.signum() < 0) {
+                var policy = negativePolicy(dryRun);
+                if (policy == DomainEnums.NegativeStockImportPolicy.SKIP_STOCK_MOVEMENT) {
+                    counts.inc("warehouseTransfersSkippedByPolicy");
+                    counts.inc("warehouseTransfersBlockedByNegativeStock");
+                    continue;
+                }
+                if (policy == DomainEnums.NegativeStockImportPolicy.BLOCK
+                    || !stockLedger.negativeStockAllowed(tenantId)) {
+                    counts.inc("warehouseTransfersBlockedByNegativeStock");
+                    audit.logCurrent("SMART_IMPORT_TRANSFER_NEGATIVE_STOCK_BLOCKED",
+                        "SmartStagedTransferCandidate", candidate.id, linked(
+                            "sessionId", sessionId, "productId", product.id,
+                            "sourceWarehouseId", source.id, "projectedSourceStock", projectedSource));
+                    throw ApiErrors.badRequest("Warehouse transfer would make source stock negative");
+                }
+            }
+
+            var groupId = UUID.randomUUID();
+            var movementDate = requireTransferDate(candidate).atTime(12, 0).toInstant(ZoneOffset.UTC);
+            var out = stockLedger.createMovement(
+                tenantId, product.id, source.id, DomainEnums.MovementType.TRANSFER_OUT,
+                quantity, unitId, ZERO, "SMART_IMPORT_WAREHOUSE_TRANSFER", groupId, movementDate,
+                "Smart Import warehouse transfer " + nullSafe(candidate.voucherNumber));
+            out.sourceImportSessionId = sessionId;
+            out.sourceFileId = candidate.sessionFileId;
+            out.sourceRowNumber = candidate.sourceRowNumber;
+            out.sourceFingerprint = sha256(candidate.transferFingerprint + "|TRANSFER_OUT");
+            out.snapshotBaselineId = sourceEligibility.snapshotId();
+            out.decisionReason = "AFTER_BOTH_WAREHOUSE_SNAPSHOTS";
+            out.transferGroupId = groupId;
+            out.transferPairFingerprint = candidate.transferFingerprint;
+            out.transferLineFingerprint = candidate.transferLineFingerprint;
+            stockMovements.save(out);
+
+            var in = stockLedger.createMovement(
+                tenantId, product.id, destination.id, DomainEnums.MovementType.TRANSFER_IN,
+                quantity, unitId, ZERO, "SMART_IMPORT_WAREHOUSE_TRANSFER", groupId, movementDate,
+                "Smart Import warehouse transfer " + nullSafe(candidate.voucherNumber));
+            in.sourceImportSessionId = sessionId;
+            in.sourceFileId = candidate.sessionFileId;
+            in.sourceRowNumber = candidate.sourceRowNumber;
+            in.sourceFingerprint = sha256(candidate.transferFingerprint + "|TRANSFER_IN");
+            in.snapshotBaselineId = destinationEligibility.snapshotId();
+            in.decisionReason = "AFTER_BOTH_WAREHOUSE_SNAPSHOTS";
+            in.transferGroupId = groupId;
+            in.transferPairFingerprint = candidate.transferFingerprint;
+            in.transferLineFingerprint = candidate.transferLineFingerprint;
+            out.linkedMovementId = in.id;
+            in.linkedMovementId = out.id;
+            stockMovements.saveAll(List.of(out, in));
+
+            candidate.sourceSnapshotId = sourceEligibility.snapshotId();
+            candidate.destinationSnapshotId = destinationEligibility.snapshotId();
+            candidate.sourceSnapshotDate = sourceEligibility.snapshotDate();
+            candidate.destinationSnapshotDate = destinationEligibility.snapshotDate();
+            candidate.resolutionStatus = DomainEnums.TransferResolutionStatus.STOCK_EFFECT_COMMITTED;
+            candidate.updatedBy = TenantContext.userId();
+            stagedTransfers.save(candidate);
+
+            counts.inc("warehouseTransfersCommitted");
+            counts.inc("transferPairsCreated");
+            counts.inc("transferOutMovementsCreated");
+            counts.inc("transferInMovementsCreated");
+            if (candidate.resolvedBy != null) counts.inc("manuallyResolvedWarehouseTransfers");
+            effect(commit, candidate.sessionFileId, candidate.sourceRowNumber,
+                DomainEnums.SmartImportEffectEntityType.WAREHOUSE_TRANSFER, groupId,
+                DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
+                    "productId", product.id, "sourceWarehouseId", source.id,
+                    "destinationWarehouseId", destination.id, "quantity", quantity,
+                    "transferOutMovementId", out.id, "transferInMovementId", in.id,
+                    "transferGroupId", groupId, "transferFingerprint", candidate.transferFingerprint,
+                    "netCompanyStockEffect", ZERO), true);
+            if (projectedSource.signum() < 0) {
+                audit.logCurrent("SMART_IMPORT_TRANSFER_NEGATIVE_STOCK_ALLOWED",
+                    "SmartStagedTransferCandidate", candidate.id, linked(
+                        "sessionId", sessionId, "projectedSourceStock", projectedSource));
+            }
+        }
+        if (counts.get("warehouseTransfersCommitted") > 0) {
+            audit.logCurrent("SMART_IMPORT_WAREHOUSE_TRANSFERS_COMMITTED", "SmartImportCommit", commit.id,
+                linked("sessionId", sessionId, "count", counts.get("warehouseTransfersCommitted"),
+                    "netCompanyStockEffect", ZERO));
+            audit.logCurrent("SMART_IMPORT_TRANSFER_OUT_MOVEMENTS_COMMITTED", "SmartImportCommit", commit.id,
+                Map.of("sessionId", sessionId, "count", counts.get("transferOutMovementsCreated")));
+            audit.logCurrent("SMART_IMPORT_TRANSFER_IN_MOVEMENTS_COMMITTED", "SmartImportCommit", commit.id,
+                Map.of("sessionId", sessionId, "count", counts.get("transferInMovementsCreated")));
+        }
+    }
+
+    private boolean completeTransferPair(List<StockMovement> movements) {
+        return movements.size() == 2
+            && movements.stream().anyMatch(row -> row.movementType == DomainEnums.MovementType.TRANSFER_OUT)
+            && movements.stream().anyMatch(row -> row.movementType == DomainEnums.MovementType.TRANSFER_IN)
+            && movements.stream().map(row -> row.transferGroupId).filter(Objects::nonNull).distinct().count() == 1;
+    }
+
+    private LocalDate requireTransferDate(SmartStagedTransferCandidate candidate) {
+        if (candidate.voucherDate == null) {
+            throw ApiErrors.badRequest("Stock-journal voucher date is required at source row "
+                + candidate.sourceRowNumber);
+        }
+        return candidate.voucherDate;
     }
 
     private void commitSalesVoucher(
         UUID tenantId, SmartStagedVoucher voucher, List<SmartStagedVoucherItem> sourceItems,
-        SmartImportCommit commit, CommitCounts counts, Map<UUID, String> fileHashes,
+        SmartImportCommit commit, ImportDryRun dryRun, DomainEnums.VoucherStockImpactMode stockImpactMode,
+        Map<String, ImportDryRunItem> stockDryRunItems, CommitCounts counts, Map<UUID, String> fileHashes,
         Map<String, UnitOfMeasure> unitIndex, Map<String, Warehouse> warehouseIndex, Map<String, Product> productIndex
     ) {
         var customer = resolveVoucherCustomer(tenantId, voucher);
@@ -810,6 +1278,9 @@ public class SmartImportCommitExecutor {
                 DomainEnums.SmartImportEffectEntityType.SALES_INVOICE_ITEM, item.id,
                 DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
                     "invoiceId", invoice.id, "productId", product.id, "quantity", quantity, "rate", rate), true);
+            commitVoucherStockMovement(tenantId, voucher, sourceItem, item.id, product, unit,
+                DomainEnums.MovementType.SALE, "SALES_INVOICE_ITEM", commit, dryRun, stockImpactMode,
+                stockDryRunItems, counts, warehouseIndex);
         }
         invoice.subtotal = subtotal;
         invoice.taxAmount = nvl(voucher.taxAmount);
@@ -821,19 +1292,19 @@ public class SmartImportCommitExecutor {
         invoice.financialMetadata = financialMetadata(voucher);
         salesInvoices.save(invoice);
         counts.inc("salesInvoicesCreated");
-        counts.set("stockMovementsSkippedDueToInvoiceOnly",
-            counts.get("stockMovementsSkippedDueToInvoiceOnly") + sourceItems.size());
         effect(commit, voucher.sessionFileId, voucher.sourceRowNumber, DomainEnums.SmartImportEffectEntityType.SALES_INVOICE,
             invoice.id, DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
                 "invoiceNumber", invoice.invoiceNumber, "invoiceDate", invoice.invoiceDate,
-                "customerId", customer.id, "totalAmount", invoice.totalAmount, "stockImpact", "INVOICE_ONLY"), true);
+                "customerId", customer.id, "totalAmount", invoice.totalAmount,
+                "stockImpact", stockImpactMode.name()), true);
         upsertMapping(commit, voucher.sessionFileId, "SALES_VOUCHER", voucher.externalId, voucher.fingerprint,
             "SALES_INVOICE", invoice.id, fileHashes.get(voucher.sessionFileId));
     }
 
     private void commitPurchaseVoucher(
         UUID tenantId, SmartStagedVoucher voucher, List<SmartStagedVoucherItem> sourceItems,
-        SmartImportCommit commit, CommitCounts counts, Map<UUID, String> fileHashes,
+        SmartImportCommit commit, ImportDryRun dryRun, DomainEnums.VoucherStockImpactMode stockImpactMode,
+        Map<String, ImportDryRunItem> stockDryRunItems, CommitCounts counts, Map<UUID, String> fileHashes,
         Map<String, UnitOfMeasure> unitIndex, Map<String, Warehouse> warehouseIndex, Map<String, Product> productIndex
     ) {
         var supplier = resolveVoucherSupplier(tenantId, voucher);
@@ -882,6 +1353,9 @@ public class SmartImportCommitExecutor {
                 DomainEnums.SmartImportEffectEntityType.PURCHASE_INVOICE_ITEM, item.id,
                 DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
                     "invoiceId", invoice.id, "productId", product.id, "quantity", quantity, "rate", rate), true);
+            commitVoucherStockMovement(tenantId, voucher, sourceItem, item.id, product, unit,
+                DomainEnums.MovementType.PURCHASE, "PURCHASE_INVOICE_ITEM", commit, dryRun, stockImpactMode,
+                stockDryRunItems, counts, warehouseIndex);
         }
         invoice.subtotal = subtotal;
         invoice.taxAmount = nvl(voucher.taxAmount);
@@ -893,19 +1367,229 @@ public class SmartImportCommitExecutor {
         invoice.financialMetadata = financialMetadata(voucher);
         purchaseInvoices.save(invoice);
         counts.inc("purchaseInvoicesCreated");
-        counts.set("stockMovementsSkippedDueToInvoiceOnly",
-            counts.get("stockMovementsSkippedDueToInvoiceOnly") + sourceItems.size());
         effect(commit, voucher.sessionFileId, voucher.sourceRowNumber, DomainEnums.SmartImportEffectEntityType.PURCHASE_INVOICE,
             invoice.id, DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
                 "invoiceNumber", invoice.invoiceNumber, "invoiceDate", invoice.invoiceDate,
-                "supplierId", supplier.id, "totalAmount", invoice.totalAmount, "stockImpact", "INVOICE_ONLY"), true);
+                "supplierId", supplier.id, "totalAmount", invoice.totalAmount,
+                "stockImpact", stockImpactMode.name()), true);
         upsertMapping(commit, voucher.sessionFileId, "PURCHASE_VOUCHER", voucher.externalId, voucher.fingerprint,
             "PURCHASE_INVOICE", invoice.id, fileHashes.get(voucher.sessionFileId));
     }
 
+    private void commitVoucherStockMovement(
+        UUID tenantId,
+        SmartStagedVoucher voucher,
+        SmartStagedVoucherItem sourceItem,
+        UUID invoiceItemId,
+        Product product,
+        UnitOfMeasure unit,
+        DomainEnums.MovementType movementType,
+        String referenceType,
+        SmartImportCommit commit,
+        ImportDryRun dryRun,
+        DomainEnums.VoucherStockImpactMode stockImpactMode,
+        Map<String, ImportDryRunItem> stockDryRunItems,
+        CommitCounts counts,
+        Map<String, Warehouse> warehouseIndex
+    ) {
+        if (stockImpactMode == DomainEnums.VoucherStockImpactMode.CREATE_INVOICES_ONLY) {
+            counts.inc("stockMovementsSkippedDueToInvoiceOnly");
+            counts.inc("invoicesOnlyCommitted");
+            skippedMovementEffect(commit, sourceItem, invoiceItemId, "INVOICE_ONLY", null);
+            return;
+        }
+
+        var warehouse = resolveStockMovementWarehouse(tenantId, sourceItem, warehouseIndex);
+        var returnMovement = movementType == DomainEnums.MovementType.RETURN_IN
+            || movementType == DomainEnums.MovementType.RETURN_OUT;
+        if (warehouse == null) {
+            counts.inc("warehouseUnresolved");
+            counts.inc("voucherItemsDeferred");
+            if (returnMovement) counts.inc("warehouseBlockedReturns");
+            throw ApiErrors.badRequest("Warehouse is unresolved for stock-affecting voucher item at source row "
+                + sourceItem.sourceRowNumber);
+        }
+        if (sourceItem.matchedWarehouseId == null) {
+            counts.inc("warehouseAutoCreatedOrMapped");
+        } else {
+            counts.inc("warehouseMatchedForStock");
+        }
+
+        var decision = snapshotEligibility.decide(
+            tenantId, commit.importSessionId, voucher.voucherDate, product.id,
+            firstNonBlank(sourceItem.normalizedProductName, sourceItem.productName), sourceItem.unitCode,
+            warehouse.id, warehouse.name, snapshotDates.fromSummary(dryRun.summaryJson).stockDate());
+        if (decision.blocking()) {
+            counts.inc("voucherItemsWithoutSnapshot");
+            if (returnMovement) counts.inc("returnsWithoutSnapshot");
+            throw ApiErrors.badRequest(decision.explanation() + " Source row " + sourceItem.sourceRowNumber);
+        }
+        if (!decision.eligible()) {
+            counts.inc("voucherItemsCoveredBySnapshot");
+            counts.inc("voucherItemsDeferred");
+            if (returnMovement) counts.inc("returnsCoveredBySnapshot");
+            if (decision.reasonCode() == SmartImportSnapshotEligibilityService.ReasonCode.ON_SNAPSHOT_DATE) {
+                counts.inc("sameDateVoucherItemsDeferred");
+                if (returnMovement) counts.inc("sameDateReturnsDeferred");
+            }
+            skippedMovementEffect(commit, sourceItem, invoiceItemId, decision.reasonCode().name(), decision.snapshotId());
+            return;
+        }
+        if (decision.productLevelFallback()) {
+            counts.inc("productLevelSnapshotFallbacks");
+        }
+
+        var quantity = nvl(sourceItem.quantity).abs();
+        if (quantity.signum() == 0) {
+            counts.inc("movementsSkippedByPolicy");
+            skippedMovementEffect(commit, sourceItem, invoiceItemId, "ZERO_QUANTITY", decision.snapshotId());
+            return;
+        }
+        var fingerprint = stockEffectFingerprint(
+            tenantId, voucher, sourceItem, product.id, warehouse.id, movementType, quantity);
+        stockLedger.lockStockKey(tenantId, product.id, warehouse.id);
+        var duplicate = stockMovements.findByTenantIdAndSourceFingerprint(tenantId, fingerprint).orElse(null);
+        if (duplicate != null) {
+            counts.inc("duplicateStockMovementsSkipped");
+            if (returnMovement) counts.inc("duplicateReturnMovementsSkipped");
+            effect(commit, sourceItem.sessionFileId, sourceItem.sourceRowNumber,
+                DomainEnums.SmartImportEffectEntityType.STOCK_MOVEMENT, duplicate.id,
+                DomainEnums.SmartImportEffectAction.SKIPPED, Map.of(), linked(
+                    "reason", "DUPLICATE_STOCK_EFFECT", "sourceFingerprint", fingerprint), false);
+            return;
+        }
+
+        var current = stockLedger.currentStock(tenantId, product.id, warehouse.id);
+        var dryRunItem = stockDryRunItems.get(sourceItem.id.toString());
+        if (dryRunItem != null
+            && dryRunItem.action == DomainEnums.ImportDryRunAction.SKIP
+            && "NEGATIVE_STOCK_SKIPPED".equals(dryRunItem.warningCode)) {
+            counts.inc("negativeStockRowsFound");
+            counts.inc("negativeStockMovementsSkipped");
+            if (returnMovement) counts.inc("negativeStockReturnMovementsSkipped");
+            counts.inc("movementsSkippedByPolicy");
+            skippedMovementEffect(commit, sourceItem, invoiceItemId, "NEGATIVE_STOCK_SKIPPED", decision.snapshotId());
+            audit.logCurrent("SMART_IMPORT_STOCK_MOVEMENT_SKIPPED", "SmartImportCommit", commit.id, linked(
+                "sessionId", commit.importSessionId, "sourceRow", sourceItem.sourceRowNumber,
+                "reason", "NEGATIVE_STOCK_SKIPPED"));
+            return;
+        }
+        if (dryRunItem == null || dryRunItem.action != DomainEnums.ImportDryRunAction.CREATE) {
+            throw ApiErrors.conflict("The selected dry run does not authorize stock movement for source row "
+                + sourceItem.sourceRowNumber);
+        }
+        var expectedCurrent = decimal(dryRunItem.previewJson.get("currentStock"));
+        if (expectedCurrent == null || expectedCurrent.compareTo(current) != 0) {
+            throw ApiErrors.conflict("Stock changed after the dry run for " + product.name
+                + " in " + warehouse.name + ". Run the dry run again.");
+        }
+
+        var baseQuantity = stockLedger.toBaseQuantity(tenantId, product, unit.id, quantity);
+        var signedQuantity = StockLedgerService.signedQuantity(movementType, baseQuantity);
+        var projected = current.add(signedQuantity);
+        var policy = negativePolicy(dryRun);
+        if (projected.signum() < 0) {
+            counts.inc("negativeStockRowsFound");
+            if (policy == DomainEnums.NegativeStockImportPolicy.SKIP_STOCK_MOVEMENT) {
+                counts.inc("negativeStockMovementsSkipped");
+                if (returnMovement) counts.inc("negativeStockReturnMovementsSkipped");
+                counts.inc("movementsSkippedByPolicy");
+                skippedMovementEffect(commit, sourceItem, invoiceItemId, "NEGATIVE_STOCK_SKIPPED", decision.snapshotId());
+                audit.logCurrent("SMART_IMPORT_STOCK_MOVEMENT_SKIPPED", "SmartImportCommit", commit.id, linked(
+                    "sessionId", commit.importSessionId, "sourceRow", sourceItem.sourceRowNumber,
+                    "reason", "NEGATIVE_STOCK_SKIPPED"));
+                return;
+            }
+            if (policy == DomainEnums.NegativeStockImportPolicy.BLOCK
+                || !stockLedger.negativeStockAllowed(tenantId)) {
+                counts.inc("negativeStockMovementsBlocked");
+                if (returnMovement) counts.inc("negativeStockReturnMovementsBlocked");
+                audit.logCurrent("SMART_IMPORT_NEGATIVE_STOCK_BLOCKED", "SmartImportCommit", commit.id, linked(
+                    "sessionId", commit.importSessionId, "sourceRow", sourceItem.sourceRowNumber,
+                    "productId", product.id, "warehouseId", warehouse.id));
+                if (returnMovement) {
+                    audit.logCurrent("SMART_IMPORT_RETURN_NEGATIVE_STOCK_BLOCKED", "SmartImportCommit", commit.id,
+                        linked("sessionId", commit.importSessionId, "sourceRow", sourceItem.sourceRowNumber,
+                            "productId", product.id, "warehouseId", warehouse.id));
+                }
+                throw ApiErrors.badRequest(movementType + " would make stock negative for " + product.name);
+            }
+            counts.inc("negativeStockMovementsImported");
+        }
+
+        var movement = stockLedger.createMovement(
+            tenantId, product.id, warehouse.id, movementType, quantity, unit.id, voucherRate(sourceItem),
+            referenceType, invoiceItemId, requireVoucherDate(voucher).atTime(12, 0).toInstant(ZoneOffset.UTC),
+            "Smart Import post-snapshot " + movementType.name().toLowerCase(Locale.ROOT)
+                + " for voucher " + requireVoucherNumber(voucher));
+        movement.sourceImportSessionId = commit.importSessionId;
+        movement.sourceFileId = sourceItem.sessionFileId;
+        movement.sourceRowNumber = sourceItem.sourceRowNumber;
+        movement.sourceFingerprint = fingerprint;
+        movement.snapshotBaselineId = decision.snapshotId();
+        movement.decisionReason = decision.reasonCode().name();
+        stockMovements.save(movement);
+        counts.inc("voucherStockMovementsCreated");
+        switch (movementType) {
+            case SALE -> counts.inc("salesStockMovementsCreated");
+            case PURCHASE -> counts.inc("purchaseStockMovementsCreated");
+            case RETURN_IN -> counts.inc("physicalSalesReturnsCommitted");
+            case RETURN_OUT -> counts.inc("physicalPurchaseReturnsCommitted");
+            default -> { }
+        }
+        effect(commit, sourceItem.sessionFileId, sourceItem.sourceRowNumber,
+            DomainEnums.SmartImportEffectEntityType.STOCK_MOVEMENT, movement.id,
+            DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
+                "movementType", movementType, "productId", product.id, "warehouseId", warehouse.id,
+                "quantity", quantity, "baseQuantity", movement.baseQuantity,
+                "referenceType", referenceType, "referenceId", invoiceItemId,
+                "snapshotBaselineId", decision.snapshotId(), "snapshotDate", decision.snapshotDate(),
+                "eligibilityReason", decision.reasonCode(), "sourceFingerprint", fingerprint,
+                "importSessionId", commit.importSessionId), true);
+        upsertMapping(commit, sourceItem.sessionFileId, "STOCK_EFFECT", null, fingerprint,
+            "STOCK_MOVEMENT", movement.id, null);
+        if (projected.signum() < 0) {
+            audit.logCurrent("SMART_IMPORT_NEGATIVE_STOCK_ALLOWED", "StockMovement", movement.id, linked(
+                "sessionId", commit.importSessionId, "projectedStock", projected));
+            if (returnMovement) {
+                audit.logCurrent("SMART_IMPORT_RETURN_NEGATIVE_STOCK_ALLOWED", "StockMovement", movement.id, linked(
+                    "sessionId", commit.importSessionId, "projectedStock", projected));
+            }
+        }
+    }
+
+    private Warehouse resolveStockMovementWarehouse(
+        UUID tenantId, SmartStagedVoucherItem sourceItem, Map<String, Warehouse> warehouseIndex
+    ) {
+        if (sourceItem.matchedWarehouseId != null) {
+            var matched = warehouses.findByTenantIdAndId(tenantId, sourceItem.matchedWarehouseId).orElse(null);
+            if (matched != null) return matched;
+        }
+        if (sourceItem.warehouseName == null || sourceItem.warehouseName.isBlank()) return null;
+        var indexed = warehouseIndex.get(normalizeName(sourceItem.warehouseName));
+        if (indexed != null) return indexed;
+        return warehouses.findByTenantIdAndNameIgnoreCase(tenantId, sourceItem.warehouseName).orElse(null);
+    }
+
+    private void skippedMovementEffect(
+        SmartImportCommit commit,
+        SmartStagedVoucherItem sourceItem,
+        UUID invoiceItemId,
+        String reason,
+        UUID snapshotId
+    ) {
+        effect(commit, sourceItem.sessionFileId, sourceItem.sourceRowNumber,
+            DomainEnums.SmartImportEffectEntityType.STOCK_MOVEMENT, invoiceItemId,
+            DomainEnums.SmartImportEffectAction.SKIPPED, Map.of(), linked(
+                "reason", reason, "snapshotBaselineId", snapshotId,
+                "importSessionId", commit.importSessionId), false);
+    }
+
     private void commitFinancialNote(
         UUID tenantId, SmartStagedVoucher voucher, List<SmartStagedVoucherItem> sourceItems,
-        DomainEnums.FinancialAdjustmentType adjustmentType, SmartImportCommit commit, CommitCounts counts,
+        DomainEnums.FinancialAdjustmentType adjustmentType, SmartImportCommit commit, ImportDryRun dryRun,
+        DomainEnums.ReturnStockImpactMode returnStockImpactMode,
+        Map<String, ImportDryRunItem> stockDryRunItems, CommitCounts counts,
         Map<UUID, String> fileHashes, Map<String, UnitOfMeasure> unitIndex,
         Map<String, Warehouse> warehouseIndex, Map<String, Product> productIndex
     ) {
@@ -926,35 +1610,45 @@ public class SmartImportCommitExecutor {
         var itemEntityType = adjustmentType == DomainEnums.FinancialAdjustmentType.CREDIT_NOTE
             ? DomainEnums.SmartImportEffectEntityType.CREDIT_NOTE_ITEM : DomainEnums.SmartImportEffectEntityType.DEBIT_NOTE_ITEM;
         var mappingType = adjustmentType.name();
-        if (existing != null) {
+        var createdAdjustment = existing == null;
+        if (!createdAdjustment) {
             counts.inc(adjustmentType == DomainEnums.FinancialAdjustmentType.CREDIT_NOTE
                 ? "duplicateCreditNotesSkipped" : "duplicateDebitNotesSkipped");
             effect(commit, voucher.sessionFileId, voucher.sourceRowNumber, documentEntityType, existing.id,
                 DomainEnums.SmartImportEffectAction.SKIPPED, Map.of(), linked("reason", "DUPLICATE_NOTE"), false);
             upsertMapping(commit, voucher.sessionFileId, mappingType, voucher.externalId, voucher.fingerprint,
                 mappingType, existing.id, fileHashes.get(voucher.sessionFileId));
-            return;
         }
 
-        var adjustment = new FinancialAdjustment();
-        own(adjustment, tenantId);
-        adjustment.adjustmentType = adjustmentType;
-        adjustment.customerId = customer == null ? null : customer.id;
-        adjustment.supplierId = supplier == null ? null : supplier.id;
-        adjustment.voucherNumber = requireVoucherNumber(voucher);
-        adjustment.voucherDate = requireVoucherDate(voucher);
-        adjustment.taxAmount = nvl(voucher.taxAmount);
-        adjustment.discountAmount = nvl(voucher.discountAmount);
-        adjustment.freightAmount = nvl(voucher.freightAmount);
-        adjustment.roundOffAmount = nvl(voucher.roundOffAmount);
-        adjustment.otherChargesAmount = nvl(voucher.otherChargesAmount);
-        adjustment.sourceExternalId = blankToNull(voucher.externalId);
-        adjustment.sourceFingerprint = blankToNull(voucher.fingerprint);
-        adjustment.rawMetadata = new LinkedHashMap<>(voucher.rawMetadataJson == null ? Map.of() : voucher.rawMetadataJson);
-        adjustment.rawMetadata.putAll(financialMetadata(voucher));
+        var adjustment = createdAdjustment ? new FinancialAdjustment() : existing;
+        if (createdAdjustment) {
+            own(adjustment, tenantId);
+            adjustment.adjustmentType = adjustmentType;
+            adjustment.customerId = customer == null ? null : customer.id;
+            adjustment.supplierId = supplier == null ? null : supplier.id;
+            adjustment.voucherNumber = requireVoucherNumber(voucher);
+            adjustment.voucherDate = requireVoucherDate(voucher);
+            adjustment.taxAmount = nvl(voucher.taxAmount);
+            adjustment.discountAmount = nvl(voucher.discountAmount);
+            adjustment.freightAmount = nvl(voucher.freightAmount);
+            adjustment.roundOffAmount = nvl(voucher.roundOffAmount);
+            adjustment.otherChargesAmount = nvl(voucher.otherChargesAmount);
+            adjustment.sourceExternalId = blankToNull(voucher.externalId);
+            adjustment.sourceFingerprint = blankToNull(voucher.fingerprint);
+            adjustment.rawMetadata = new LinkedHashMap<>(voucher.rawMetadataJson == null ? Map.of() : voucher.rawMetadataJson);
+            adjustment.rawMetadata.putAll(financialMetadata(voucher));
+        }
+        adjustment.returnClassification = voucher.returnClassification;
+        adjustment.returnResolutionStatus = voucher.returnResolutionStatus;
         adjustment = financialAdjustments.save(adjustment);
 
-        var subtotal = ZERO;
+        var resolvedFinancialAmount = resolvedFinancialAdjustmentAmount(voucher);
+        var subtotal = resolvedFinancialAmount;
+        if (resolvedFinancialAmount.signum() > 0) {
+            counts.add("financialAdjustmentLinesResolved", resolvedFinancialAdjustmentLineCount(voucher));
+        }
+        var existingItems = createdAdjustment ? new ArrayList<FinancialAdjustmentItem>()
+            : new ArrayList<>(financialAdjustmentItems.findByTenantIdAndFinancialAdjustmentId(tenantId, adjustment.id));
         for (var sourceItem : sourceItems) {
             var product = resolveVoucherProduct(tenantId, sourceItem, productIndex);
             var unit = ensureUnit(tenantId, commit, sourceItem.sessionFileId, sourceItem.sourceRowNumber,
@@ -962,39 +1656,110 @@ public class SmartImportCommitExecutor {
             var quantity = nvl(sourceItem.quantity).abs();
             var rate = voucherRate(sourceItem);
             var lineTotal = voucherLineTotal(sourceItem, quantity, rate);
-            var item = new FinancialAdjustmentItem();
-            own(item, tenantId);
-            item.financialAdjustmentId = adjustment.id;
-            item.productId = product.id;
-            item.unitId = unit.id;
-            item.warehouseId = resolveOptionalWarehouse(tenantId, sourceItem, warehouseIndex);
-            item.warehouseName = blankToNull(sourceItem.warehouseName);
-            item.quantity = quantity;
-            item.rate = rate;
-            item.lineTotal = lineTotal;
-            item.rawMetadata = new LinkedHashMap<>(sourceItem.rawMetadataJson == null ? Map.of() : sourceItem.rawMetadataJson);
-            item = financialAdjustmentItems.save(item);
+            var item = createdAdjustment ? null : existingItems.stream()
+                .filter(candidate -> Objects.equals(candidate.productId, product.id)
+                    && nvl(candidate.quantity).compareTo(quantity) == 0)
+                .findFirst().orElse(null);
+            if (item == null && !createdAdjustment) {
+                throw ApiErrors.conflict("Existing financial note items do not match the reviewed return lines");
+            }
+            if (item == null) {
+                item = new FinancialAdjustmentItem();
+                own(item, tenantId);
+                item.financialAdjustmentId = adjustment.id;
+                item.productId = product.id;
+                item.unitId = unit.id;
+                item.warehouseId = resolveOptionalWarehouse(tenantId, sourceItem, warehouseIndex);
+                item.warehouseName = blankToNull(sourceItem.warehouseName);
+                item.quantity = quantity;
+                item.rate = rate;
+                item.lineTotal = lineTotal;
+                item.rawMetadata = new LinkedHashMap<>(sourceItem.rawMetadataJson == null ? Map.of() : sourceItem.rawMetadataJson);
+                item = financialAdjustmentItems.save(item);
+                var itemCountKey = adjustmentType == DomainEnums.FinancialAdjustmentType.CREDIT_NOTE
+                    ? "creditNoteItemsCreated" : "debitNoteItemsCreated";
+                counts.inc(itemCountKey);
+                countRateMetadata(counts, sourceItem, adjustmentType == DomainEnums.FinancialAdjustmentType.DEBIT_NOTE);
+                effect(commit, sourceItem.sessionFileId, sourceItem.sourceRowNumber, itemEntityType, item.id,
+                    DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
+                        "adjustmentId", adjustment.id, "productId", product.id, "quantity", quantity, "rate", rate), true);
+            } else {
+                existingItems.remove(item);
+            }
             subtotal = subtotal.add(lineTotal);
-            var itemCountKey = adjustmentType == DomainEnums.FinancialAdjustmentType.CREDIT_NOTE
-                ? "creditNoteItemsCreated" : "debitNoteItemsCreated";
-            counts.inc(itemCountKey);
-            countRateMetadata(counts, sourceItem, adjustmentType == DomainEnums.FinancialAdjustmentType.DEBIT_NOTE);
-            effect(commit, sourceItem.sessionFileId, sourceItem.sourceRowNumber, itemEntityType, item.id,
-                DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
-                    "adjustmentId", adjustment.id, "productId", product.id, "quantity", quantity, "rate", rate), true);
+            item.returnDirection = sourceItem.returnDirection;
+            item.returnDisposition = sourceItem.returnDisposition;
+            var physical = sourceItem.returnDisposition == DomainEnums.ReturnDisposition.RESTOCK_TO_AVAILABLE
+                && (sourceItem.returnResolutionStatus == DomainEnums.ReturnResolutionStatus.AUTO_CONFIRMED_PHYSICAL
+                    || sourceItem.returnResolutionStatus == DomainEnums.ReturnResolutionStatus.USER_CONFIRMED_PHYSICAL);
+            if (sourceItem.returnResolutionStatus == DomainEnums.ReturnResolutionStatus.USER_CONFIRMED_PHYSICAL
+                || sourceItem.returnResolutionStatus == DomainEnums.ReturnResolutionStatus.USER_CONFIRMED_FINANCIAL_ONLY) {
+                counts.inc("returnItemsResolvedManually");
+            }
+            if (returnStockImpactMode == DomainEnums.ReturnStockImpactMode.APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE
+                && physical) {
+                var movementType = adjustmentType == DomainEnums.FinancialAdjustmentType.CREDIT_NOTE
+                    ? DomainEnums.MovementType.RETURN_IN : DomainEnums.MovementType.RETURN_OUT;
+                var warehouseId = resolveOptionalWarehouse(tenantId, sourceItem, warehouseIndex);
+                var fingerprint = warehouseId == null ? null : stockEffectFingerprint(
+                    tenantId, voucher, sourceItem, product.id, warehouseId, movementType, quantity);
+                var existingMovement = fingerprint == null ? null
+                    : stockMovements.findByTenantIdAndSourceFingerprint(tenantId, fingerprint).orElse(null);
+                commitVoucherStockMovement(tenantId, voucher, sourceItem, item.id, product, unit, movementType,
+                    adjustmentType == DomainEnums.FinancialAdjustmentType.CREDIT_NOTE
+                        ? "CREDIT_NOTE_ITEM" : "DEBIT_NOTE_ITEM",
+                    commit, dryRun, DomainEnums.VoucherStockImpactMode.APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE,
+                    stockDryRunItems, counts, warehouseIndex);
+                var movement = fingerprint == null ? null
+                    : stockMovements.findByTenantIdAndSourceFingerprint(tenantId, fingerprint).orElse(null);
+                if (movement != null) {
+                    item.stockMovementId = movement.id;
+                    item.stockEffectFingerprint = fingerprint;
+                    sourceItem.returnResolutionStatus = DomainEnums.ReturnResolutionStatus.STOCK_EFFECT_COMMITTED;
+                    stagedVoucherItems.save(sourceItem);
+                    if (existingMovement == null) {
+                        counts.inc("stockMovementsCreatedFromReturns");
+                        counts.inc(adjustmentType == DomainEnums.FinancialAdjustmentType.CREDIT_NOTE
+                            ? "returnInMovementsCreated" : "returnOutMovementsCreated");
+                    }
+                } else {
+                    counts.inc("returnStockMovementsDeferred");
+                }
+            } else {
+                counts.inc("returnStockMovementsDeferred");
+            }
+            financialAdjustmentItems.save(item);
         }
-        adjustment.subtotal = subtotal;
-        adjustment.totalAmount = financialTotal(subtotal, voucher);
+        if (createdAdjustment) {
+            adjustment.subtotal = subtotal;
+            adjustment.totalAmount = resolvedFinancialAmount.signum() > 0
+                ? subtotal : financialTotal(subtotal, voucher);
+        }
+        adjustment.returnResolutionStatus = sourceItems.stream().anyMatch(item ->
+            item.returnResolutionStatus == DomainEnums.ReturnResolutionStatus.STOCK_EFFECT_COMMITTED)
+            ? DomainEnums.ReturnResolutionStatus.STOCK_EFFECT_COMMITTED : voucher.returnResolutionStatus;
         financialAdjustments.save(adjustment);
-        counts.inc(adjustmentType == DomainEnums.FinancialAdjustmentType.CREDIT_NOTE
-            ? "creditNotesCreated" : "debitNotesCreated");
-        counts.set("returnStockMovementsDeferred", counts.get("returnStockMovementsDeferred") + sourceItems.size());
-        effect(commit, voucher.sessionFileId, voucher.sourceRowNumber, documentEntityType, adjustment.id,
-            DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
-                "voucherNumber", adjustment.voucherNumber, "voucherDate", adjustment.voucherDate,
-                "partyId", partyId, "totalAmount", adjustment.totalAmount, "stockImpact", "DEFERRED"), true);
-        upsertMapping(commit, voucher.sessionFileId, mappingType, voucher.externalId, voucher.fingerprint,
-            mappingType, adjustment.id, fileHashes.get(voucher.sessionFileId));
+        if (createdAdjustment) {
+            counts.inc(adjustmentType == DomainEnums.FinancialAdjustmentType.CREDIT_NOTE
+                ? "creditNotesCommitted" : "debitNotesCommitted");
+            switch (voucher.returnClassification) {
+                case FINANCIAL_ONLY -> counts.inc("financialOnlyNotesCommitted");
+                case MIXED_SALES_RETURN, MIXED_PURCHASE_RETURN -> counts.inc("mixedNotesCommitted");
+                case AMBIGUOUS_RETURN -> counts.inc("ambiguousReturnsDeferred");
+                default -> { }
+            }
+        }
+        if (createdAdjustment) {
+            counts.inc(adjustmentType == DomainEnums.FinancialAdjustmentType.CREDIT_NOTE
+                ? "creditNotesCreated" : "debitNotesCreated");
+            effect(commit, voucher.sessionFileId, voucher.sourceRowNumber, documentEntityType, adjustment.id,
+                DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
+                    "voucherNumber", adjustment.voucherNumber, "voucherDate", adjustment.voucherDate,
+                    "partyId", partyId, "totalAmount", adjustment.totalAmount,
+                    "stockImpact", returnStockImpactMode.name()), true);
+            upsertMapping(commit, voucher.sessionFileId, mappingType, voucher.externalId, voucher.fingerprint,
+                mappingType, adjustment.id, fileHashes.get(voucher.sessionFileId));
+        }
     }
 
     private FinancialAdjustment existingFinancialAdjustment(
@@ -1085,7 +1850,18 @@ public class SmartImportCommitExecutor {
             var matched = customers.findByTenantIdAndId(tenantId, voucher.matchedPartyId).orElse(null);
             if (matched != null) return matched;
         }
-        var normalized = normalizeName(firstNonBlank(voucher.normalizedPartyName, voucher.partyName));
+        return customerBySourceName(tenantId, firstNonBlank(voucher.normalizedPartyName, voucher.partyName));
+    }
+
+    private Customer customerBySourceName(UUID tenantId, String name) {
+        var normalized = normalizeName(name);
+        var mappedId = mappedPartyId(tenantId, "CUSTOMER", normalized);
+        if (mappedId != null) {
+            return customers.findByTenantIdAndId(tenantId, mappedId)
+                .orElseThrow(() -> ApiErrors.conflict("Mapped customer is no longer available"));
+        }
+        var exact = customers.findByTenantIdAndNameIgnoreCase(tenantId, normalized).orElse(null);
+        if (exact != null) return exact;
         return customers.findByTenantIdOrderByNameAsc(tenantId).stream()
             .filter(customer -> normalizeName(customer.name).equals(normalized)).findFirst().orElse(null);
     }
@@ -1095,9 +1871,39 @@ public class SmartImportCommitExecutor {
             var matched = suppliers.findByTenantIdAndId(tenantId, voucher.matchedPartyId).orElse(null);
             if (matched != null) return matched;
         }
-        var normalized = normalizeName(firstNonBlank(voucher.normalizedPartyName, voucher.partyName));
+        return supplierBySourceName(tenantId, firstNonBlank(voucher.normalizedPartyName, voucher.partyName));
+    }
+
+    private Supplier supplierBySourceName(UUID tenantId, String name) {
+        var normalized = normalizeName(name);
+        var mappedId = mappedPartyId(tenantId, "SUPPLIER", normalized);
+        if (mappedId != null) {
+            return suppliers.findByTenantIdAndId(tenantId, mappedId)
+                .orElseThrow(() -> ApiErrors.conflict("Mapped supplier is no longer available"));
+        }
+        var exact = suppliers.findByTenantIdAndNameIgnoreCase(tenantId, normalized).orElse(null);
+        if (exact != null) return exact;
         return suppliers.findByTenantIdOrderByNameAsc(tenantId).stream()
             .filter(supplier -> normalizeName(supplier.name).equals(normalized)).findFirst().orElse(null);
+    }
+
+    private UUID mappedPartyId(UUID tenantId, String partyType, String normalizedName) {
+        // Master aliases can resolve to one GSTIN even when their display names differ.
+        return mappings.findByTenantIdAndSourceSystemAndEntityTypeAndNormalizedKey(
+                tenantId, SOURCE_SYSTEM, partyType, partyType + "|" + normalizedName)
+            .filter(mapping -> partyType.equals(mapping.localEntityType))
+            .map(mapping -> mapping.localEntityId).orElse(null);
+    }
+
+    private void flushBatch(int processed) {
+        if (processed % WRITE_BATCH_SIZE == 0) flushAndClear();
+    }
+
+    private void flushAndClear() {
+        // Includes the first row to detach bulk-loaded staging JSON. Flush is NOT a commit:
+        // all batches remain in the same transaction and roll back together on failure.
+        entityManager.flush();
+        entityManager.clear();
     }
 
     private Product resolveVoucherProduct(UUID tenantId, SmartStagedVoucherItem item, Map<String, Product> productIndex) {
@@ -1157,6 +1963,28 @@ public class SmartImportCommitExecutor {
         return item.amount != null ? item.amount.abs() : quantity.multiply(rate);
     }
 
+    private boolean excludedVoucher(SmartStagedVoucher voucher) {
+        return voucher.rawMetadataJson != null
+            && Boolean.parseBoolean(Objects.toString(voucher.rawMetadataJson.get("excludedFromCommit"), "false"));
+    }
+
+    private BigDecimal resolvedFinancialAdjustmentAmount(SmartStagedVoucher voucher) {
+        if (voucher.rawMetadataJson == null) return ZERO;
+        var value = Objects.toString(voucher.rawMetadataJson.get("resolvedFinancialAdjustmentAmount"), "");
+        if (value.isBlank()) return ZERO;
+        try {
+            return new BigDecimal(value).abs();
+        } catch (NumberFormatException ignored) {
+            return ZERO;
+        }
+    }
+
+    private int resolvedFinancialAdjustmentLineCount(SmartStagedVoucher voucher) {
+        if (voucher.rawMetadataJson == null) return 0;
+        return voucher.rawMetadataJson.get("resolvedFinancialAdjustmentLines") instanceof List<?> lines
+            ? lines.size() : resolvedFinancialAdjustmentAmount(voucher).signum() > 0 ? 1 : 0;
+    }
+
     private BigDecimal financialTotal(BigDecimal subtotal, SmartStagedVoucher voucher) {
         return nvl(subtotal).subtract(nvl(voucher.discountAmount)).add(nvl(voucher.taxAmount))
             .add(nvl(voucher.freightAmount)).add(nvl(voucher.roundOffAmount)).add(nvl(voucher.otherChargesAmount));
@@ -1184,9 +2012,17 @@ public class SmartImportCommitExecutor {
 
     private void countRateMetadata(CommitCounts counts, SmartStagedVoucherItem item, boolean purchase) {
         var source = nullSafe(item.rateSource).toUpperCase(Locale.ROOT);
-        if ("DERIVED_FROM_AMOUNT".equals(source)) counts.inc("rateDerivedRows");
-        if ("ZERO_RATE_ITEM".equals(source)) counts.inc("zeroRateItems");
-        if ("ZERO_COST_ITEM".equals(source) || purchase && nvl(item.rate).signum() == 0) counts.inc("zeroCostItems");
+        if ("DERIVED_FROM_AMOUNT".equals(source) || "USER_DERIVED_FROM_AMOUNT".equals(source)) {
+            counts.inc("rateDerivedRows");
+        }
+        if ("USER_VERIFIED_RATE".equals(source)) counts.inc("verifiedRateRows");
+        if ("ZERO_RATE_ITEM".equals(source) || "USER_CONFIRMED_ZERO_VALUE".equals(source)) {
+            counts.inc("zeroRateItems");
+        }
+        if ("ZERO_COST_ITEM".equals(source)
+            || purchase && ("USER_CONFIRMED_ZERO_VALUE".equals(source) || nvl(item.rate).signum() == 0)) {
+            counts.inc("zeroCostItems");
+        }
     }
 
     private String requireVoucherNumber(SmartStagedVoucher voucher) {
@@ -1218,9 +2054,10 @@ public class SmartImportCommitExecutor {
             return products.findByTenantIdAndId(tenantId, row.matchedProductId)
                 .orElseThrow(() -> ApiErrors.badRequest("Matched product is not available in this tenant"));
         }
-        if (row.externalId != null) {
+        var externalId = SmartImportProductIdentity.externalId(row);
+        if (externalId != null) {
             var mapped = mappings.findFirstByTenantIdAndSourceSystemAndEntityTypeAndExternalId(
-                tenantId, SOURCE_SYSTEM, "PRODUCT", row.externalId).orElse(null);
+                tenantId, SOURCE_SYSTEM, "PRODUCT", externalId).orElse(null);
             if (mapped != null) {
                 var product = products.findByTenantIdAndId(tenantId, mapped.localEntityId).orElse(null);
                 if (product != null) return product;
@@ -1334,9 +2171,7 @@ public class SmartImportCommitExecutor {
             var match = customers.findByTenantIdAndGstinIgnoreCase(tenantId, row.gstin.trim()).orElse(null);
             if (match != null) return match;
         }
-        var normalized = normalizeName(firstNonBlank(row.normalizedName, row.rawName));
-        return customers.findByTenantIdOrderByNameAsc(tenantId).stream()
-            .filter(customer -> normalizeName(customer.name).equals(normalized)).findFirst().orElse(null);
+        return customerBySourceName(tenantId, firstNonBlank(row.normalizedName, row.rawName));
     }
 
     private Supplier resolveSupplier(UUID tenantId, SmartStagedParty row) {
@@ -1345,9 +2180,7 @@ public class SmartImportCommitExecutor {
             var match = suppliers.findByTenantIdAndGstinIgnoreCase(tenantId, row.gstin.trim()).orElse(null);
             if (match != null) return match;
         }
-        var normalized = normalizeName(firstNonBlank(row.normalizedName, row.rawName));
-        return suppliers.findByTenantIdOrderByNameAsc(tenantId).stream()
-            .filter(supplier -> normalizeName(supplier.name).equals(normalized)).findFirst().orElse(null);
+        return supplierBySourceName(tenantId, firstNonBlank(row.normalizedName, row.rawName));
     }
 
     private void createBarcodeIfPresent(UUID tenantId, UUID productId, String rawBarcode) {
@@ -1452,6 +2285,48 @@ public class SmartImportCommitExecutor {
         }
     }
 
+    private DomainEnums.VoucherStockImpactMode stockImpactMode(ImportDryRun dryRun) {
+        try {
+            var configured = String.valueOf(dryRun.summaryJson.getOrDefault(
+                "stockImpactMode", DomainEnums.VoucherStockImpactMode.CREATE_INVOICES_ONLY.name()));
+            var mode = DomainEnums.VoucherStockImpactMode.valueOf(configured);
+            if (mode == DomainEnums.VoucherStockImpactMode.CREATE_INVOICES_ONLY
+                || mode == DomainEnums.VoucherStockImpactMode.APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE) {
+                return mode;
+            }
+        } catch (IllegalArgumentException ignored) {
+            // Rejected below with the same safe message for malformed or unsupported modes.
+        }
+        throw ApiErrors.badRequest("Unsupported Smart Import voucher stock-impact mode");
+    }
+
+    private DomainEnums.ReturnStockImpactMode returnStockImpactMode(ImportDryRun dryRun) {
+        try {
+            return DomainEnums.ReturnStockImpactMode.valueOf(String.valueOf(dryRun.summaryJson.getOrDefault(
+                "returnStockImpactMode", DomainEnums.ReturnStockImpactMode.FINANCIAL_ONLY.name())));
+        } catch (IllegalArgumentException ignored) {
+            throw ApiErrors.badRequest("Unsupported Smart Import return stock-impact mode");
+        }
+    }
+
+    private DomainEnums.StockJournalImpactMode stockJournalImpactMode(ImportDryRun dryRun) {
+        try {
+            return DomainEnums.StockJournalImpactMode.valueOf(String.valueOf(dryRun.summaryJson.getOrDefault(
+                "stockJournalImpactMode", DomainEnums.StockJournalImpactMode.DEFER_STOCK_JOURNALS.name())));
+        } catch (IllegalArgumentException ignored) {
+            throw ApiErrors.badRequest("Unsupported Smart Import stock-journal impact mode");
+        }
+    }
+
+    private LocalDate date(Object value) {
+        try {
+            var text = Objects.toString(value, "");
+            return text.isBlank() ? null : LocalDate.parse(text);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
     private String unitCode(UUID tenantId, Product product) {
         return product.baseUnitId == null ? "PCS" : units.findByTenantIdAndId(tenantId, product.baseUnitId)
             .map(unit -> normalizeUnit(unit.code)).orElse("PCS");
@@ -1530,6 +2405,30 @@ public class SmartImportCommitExecutor {
         }
     }
 
+    private String stockDryRunKey(ImportDryRunItem item) {
+        if (item.targetEntityId != null) return item.targetEntityId.toString();
+        var stagedVoucherItemId = item.previewJson.get("stagedVoucherItemId");
+        return stagedVoucherItemId == null ? item.sourceFileId + ":" + item.sourceRowNumber
+            : stagedVoucherItemId.toString();
+    }
+
+    private String stockEffectFingerprint(
+        UUID tenantId,
+        SmartStagedVoucher voucher,
+        SmartStagedVoucherItem item,
+        UUID productId,
+        UUID warehouseId,
+        DomainEnums.MovementType movementType,
+        BigDecimal quantity
+    ) {
+        var voucherIdentity = firstNonBlank(voucher.externalId, voucher.fingerprint,
+            normalizeName(voucher.voucherType) + "|" + normalizeName(voucher.voucherNumber)
+                + "|" + voucher.voucherDate + "|" + normalizeName(voucher.partyName));
+        return sha256(tenantId + "|STOCK_EFFECT|" + voucherIdentity + "|" + movementType + "|"
+            + productId + "|" + warehouseId + "|" + normalizeUnit(item.unitCode) + "|"
+            + quantity.stripTrailingZeros().toPlainString() + "|" + item.sourceRowNumber);
+    }
+
     private String sha256(String raw) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
@@ -1572,16 +2471,38 @@ public class SmartImportCommitExecutor {
             "duplicateCreditNotesSkipped", "duplicateDebitNotesSkipped",
             "taxLinesCaptured", "discountLinesCaptured", "freightLinesCaptured", "roundOffLinesCaptured", "otherChargeLinesCaptured",
             "stockMovementsCreatedFromReturns", "returnStockMovementsDeferred",
+            "creditNotesCommitted", "debitNotesCommitted", "physicalSalesReturnsCommitted",
+            "physicalPurchaseReturnsCommitted", "returnInMovementsCreated", "returnOutMovementsCreated",
+            "financialOnlyNotesCommitted", "mixedNotesCommitted", "ambiguousReturnsDeferred",
+            "damagedReturnsDeferred", "sameDateReturnsDeferred", "returnsCoveredBySnapshot",
+            "returnsWithoutSnapshot", "warehouseBlockedReturns",
+            "negativeStockReturnMovementsBlocked", "negativeStockReturnMovementsSkipped",
+            "duplicateReturnMovementsSkipped", "returnItemsResolvedManually",
             "voucherStockMovementsCreated", "stockMovementsSkippedDueToInvoiceOnly",
-            "rateDerivedRows", "zeroRateItems", "zeroCostItems", "ledgerLinesSkipped",
+            "salesStockMovementsCreated", "purchaseStockMovementsCreated",
+            "voucherItemsCoveredBySnapshot", "sameDateVoucherItemsDeferred", "voucherItemsWithoutSnapshot",
+            "voucherItemsDeferred", "duplicateStockMovementsSkipped",
+            "negativeStockMovementsBlocked", "negativeStockMovementsSkipped", "negativeStockMovementsImported",
+            "movementsSkippedByPolicy", "invoicesOnlyCommitted", "productLevelSnapshotFallbacks",
+            "warehouseMatchedForStock", "warehouseAutoCreatedOrMapped", "warehouseUnresolved",
+            "rateDerivedRows", "verifiedRateRows", "zeroRateItems", "zeroCostItems", "ledgerLinesSkipped",
+            "financialAdjustmentLinesResolved", "vouchersExcludedByUser",
             "debtorRowsProcessed", "creditorRowsProcessed", "outstandingSnapshotsCreated",
             "duplicateOutstandingSnapshotsSkipped",
-            "customerPaymentsCreated", "supplierPaymentsCreated", "cashbookRowsMatched",
+            "customerPaymentsCreated", "supplierPaymentsCreated", "cashbookRowsMatched", "retailCounterSaleRowsResolved",
             "cashbookRowsUnmatched", "cashbookRowsReviewRequired",
             "paymentsLinkedToSalesInvoices", "paymentsLinkedToPurchaseInvoices", "duplicatePaymentsSkipped",
             "cashbookRowsManuallyResolved", "cashbookRowsIgnored",
             "manualCustomerPaymentsCreated", "manualSupplierPaymentsCreated",
             "manualPaymentsLinkedToSalesInvoices", "manualPaymentsLinkedToPurchaseInvoices",
+            "stockJournalsProcessed", "warehouseTransfersCommitted", "transferPairsCreated",
+            "transferOutMovementsCreated", "transferInMovementsCreated",
+            "warehouseTransfersCoveredBySnapshot", "sameDateWarehouseTransfersDeferred",
+            "warehouseTransfersWithoutBaseline", "unresolvedWarehouseTransfers",
+            "duplicateWarehouseTransfersSkipped", "warehouseTransfersBlockedByNegativeStock",
+            "warehouseTransfersSkippedByPolicy", "manufacturingJournalsDeferred",
+            "adjustmentJournalsDeferred", "ambiguousStockJournalsDeferred",
+            "manuallyResolvedWarehouseTransfers", "ignoredStockJournals",
             "vouchersDeferredForFuturePhase", "futurePhaseVoucherRowsSkipped",
             "futurePhaseCashbookRowsSkipped", "futurePhaseAgeingRowsSkipped"
         );

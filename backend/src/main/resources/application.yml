@@ -36,8 +36,8 @@ spring:
     password: ${RABBITMQ_PASSWORD:stockpilot}
   servlet:
     multipart:
-      max-file-size: ${UPLOAD_MAX_FILE_SIZE:150MB}
-      max-request-size: ${UPLOAD_MAX_REQUEST_SIZE:160MB}
+      max-file-size: ${UPLOAD_MAX_FILE_SIZE:500MB}
+      max-request-size: ${UPLOAD_MAX_REQUEST_SIZE:525MB}
 
 server:
   port: ${SERVER_PORT:${PORT:8080}}
@@ -62,7 +62,7 @@ management:
 
 app:
   import:
-    max-upload-size: ${IMPORT_MAX_UPLOAD_SIZE:${UPLOAD_MAX_FILE_SIZE:150MB}}
+    max-upload-size: ${IMPORT_MAX_UPLOAD_SIZE:${UPLOAD_MAX_FILE_SIZE:500MB}}
   jwt:
     secret: ${JWT_SECRET:local-dev-only-change-this-secret-local-dev-only-change-this-secret}
     access-token-minutes: ${JWT_ACCESS_TOKEN_MINUTES:120}
