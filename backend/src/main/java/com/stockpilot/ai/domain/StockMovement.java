@@ -24,6 +24,16 @@ public class StockMovement extends TenantOwnedEntity {
     public BigDecimal totalValue = BigDecimal.ZERO;
     public String referenceType;
     public UUID referenceId;
+    public UUID sourceImportSessionId;
+    public UUID sourceFileId;
+    public Integer sourceRowNumber;
+    public String sourceFingerprint;
+    public UUID snapshotBaselineId;
+    public String decisionReason;
+    public UUID transferGroupId;
+    public UUID linkedMovementId;
+    public String transferPairFingerprint;
+    public String transferLineFingerprint;
     public Instant movementDate = Instant.now();
     public String notes;
 }

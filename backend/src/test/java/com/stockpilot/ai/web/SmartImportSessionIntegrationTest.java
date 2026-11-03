@@ -9,6 +9,7 @@ import com.stockpilot.ai.domain.UserTenantMembership;
 import com.stockpilot.ai.domain.SalesInvoice;
 import com.stockpilot.ai.domain.PurchaseInvoice;
 import com.stockpilot.ai.domain.StockMovement;
+import com.stockpilot.ai.domain.StockSnapshotBaseline;
 import com.stockpilot.ai.domain.ExternalRecordMapping;
 import com.stockpilot.ai.repo.Repositories;
 import org.junit.jupiter.api.Test;
@@ -19,6 +20,7 @@ import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.MediaType;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.jdbc.Sql;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.web.servlet.request.MockMultipartHttpServletRequestBuilder;
@@ -39,6 +41,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
+// Match the production dry-run constraints from V11 and V12, not Hibernate's defaults.
+@Sql(statements = """
+    alter table import_dry_run_items
+    add constraint if not exists import_dry_run_items_dry_run_id_fkey
+    foreign key (dry_run_id) references import_dry_runs(id) on delete cascade;
+    alter table import_dry_runs alter column input_fingerprint varchar(64);
+    """, executionPhase = Sql.ExecutionPhase.BEFORE_TEST_CLASS)
 class SmartImportSessionIntegrationTest {
     @Autowired MockMvc mvc;
     @Autowired ObjectMapper mapper;
@@ -71,6 +80,819 @@ class SmartImportSessionIntegrationTest {
     @Autowired Repositories.SmartStagedCashbookEntryRepository stagedCashbook;
     @Autowired Repositories.CustomerRepository customers;
     @Autowired Repositories.SupplierRepository suppliers;
+    @Autowired Repositories.StockSnapshotBaselineRepository snapshotBaselines;
+    @Autowired Repositories.RetailCounterSaleRepository retailSales;
+    @Autowired Repositories.SmartStagedProductRepository stagedProducts;
+
+    @Test
+    void productMasterAliasesKeepEverySourceNameAvailableDuringCommit() throws Exception {
+        var registration = register("product-alias-commit");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        postJson(token, "/api/warehouses", "{\"name\":\"Main Location\",\"code\":\"PRODUCT-ALIAS-WH\"}");
+        var masters = new MockMultipartFile("files", "product-alias-masters.xml", "application/xml", """
+            <ENVELOPE><BODY><DATA><COLLECTION>
+            <STOCKITEM NAME="Sample Item A" GUID="stock-alias-001"><BASEUNITS>PCS</BASEUNITS></STOCKITEM>
+            <STOCKITEM NAME="SampleItem A" GUID="stock-alias-001"><BASEUNITS>PCS</BASEUNITS></STOCKITEM>
+            </COLLECTION></DATA></BODY></ENVELOPE>
+            """.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        var sales = new MockMultipartFile("files", "alias-sales.xml", "application/xml",
+            new String(fixture("sales.xml").getBytes(), java.nio.charset.StandardCharsets.UTF_8)
+                .replace("Sample Item A", "SampleItem A").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        var workspace = uploadClassifyAndStage(token, "Product source aliases", masters, sales);
+        var path = "/api/import-sessions/" + workspace.path("testSessionId").asText();
+        var preview = postJson(token, path + "/dry-run", "{\"strategy\":\"TRANSACTION_HISTORY\"}");
+        var result = postJson(token, path + "/commit", commitBody(preview.path("id").asText()));
+        assertThat(result.path("status").asText()).as(result.toPrettyString()).isEqualTo("COMMITTED");
+        assertThat(products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)).hasSize(1);
+        var product = products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId).getFirst();
+        assertThat(product.name).isEqualTo("Sample Item A");
+        var invoice = salesInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, "S-001").orElseThrow();
+        assertThat(salesInvoiceItems.findByTenantIdAndSalesInvoiceId(tenantId, invoice.id))
+            .singleElement().satisfies(item -> assertThat(item.productId).isEqualTo(product.id));
+    }
+
+    @Test
+    void voucherGuidCannotMergeDifferentProductsIncludingAlreadyStagedLegacyRows() throws Exception {
+        var registration = register("voucher-product-identity");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var vouchers = new MockMultipartFile("files", "different-items.xml", "application/xml", """
+            <ENVELOPE><BODY><DATA><TALLYMESSAGE><VOUCHER VCHTYPE="Sales" GUID="parent-voucher-not-a-product">
+            <DATE>20260615</DATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME><VOUCHERNUMBER>MULTI-001</VOUCHERNUMBER>
+            <PARTYLEDGERNAME>Walk In Customer</PARTYLEDGERNAME>
+            <ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>Notebook A</STOCKITEMNAME><ACTUALQTY>2 PCS</ACTUALQTY><RATE>10/PCS</RATE><AMOUNT>20</AMOUNT></ALLINVENTORYENTRIES.LIST>
+            <ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>Notebook B</STOCKITEMNAME><ACTUALQTY>3 PCS</ACTUALQTY><RATE>15/PCS</RATE><AMOUNT>45</AMOUNT></ALLINVENTORYENTRIES.LIST>
+            <ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>Pen C</STOCKITEMNAME><ACTUALQTY>4 PCS</ACTUALQTY><RATE>5/PCS</RATE><AMOUNT>20</AMOUNT></ALLINVENTORYENTRIES.LIST>
+            </VOUCHER></TALLYMESSAGE></DATA></BODY></ENVELOPE>
+            """.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        var workspace = uploadClassifyAndStage(token, "Voucher identity isolation", vouchers);
+        var sessionId = UUID.fromString(workspace.path("testSessionId").asText());
+        var rows = stagedProducts.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId, sessionId);
+        assertThat(rows).hasSize(3).allSatisfy(row -> assertThat(row.externalId).isNull());
+        // Reproduce sessions staged before this fix, without rebuilding or losing review choices.
+        rows.forEach(row -> row.externalId = "parent-voucher-not-a-product");
+        stagedProducts.saveAll(rows);
+        var path = "/api/import-sessions/" + sessionId;
+        var preview = postJson(token, path + "/dry-run", "{\"strategy\":\"TRANSACTION_HISTORY\"}");
+        var result = postJson(token, path + "/commit", commitBody(preview.path("id").asText()));
+        assertThat(result.path("status").asText()).as(result.toPrettyString()).isEqualTo("COMMITTED");
+        assertThat(products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)).hasSize(3);
+        var invoice = salesInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, "MULTI-001").orElseThrow();
+        assertThat(invoice.totalAmount).isEqualByComparingTo("85");
+        var items = salesInvoiceItems.findByTenantIdAndSalesInvoiceId(tenantId, invoice.id);
+        assertThat(items).hasSize(3);
+        assertThat(items.stream().map(item -> item.productId).distinct().count()).isEqualTo(3);
+        assertThat(externalMappings.findFirstByTenantIdAndSourceSystemAndEntityTypeAndExternalId(
+            tenantId, "SMART_IMPORT", "PRODUCT", "parent-voucher-not-a-product")).isEmpty();
+    }
+
+    @Test
+    void gstinMergedMasterAliasesRemainUsableForInvoicesNotesOutstandingAndPayments() throws Exception {
+        var registration = register("party-alias-commit");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        postJson(token, "/api/warehouses", "{\"name\":\"Main Location\",\"code\":\"ALIAS-WH\"}");
+        postJson(token, "/api/warehouses", "{\"name\":\"Main Godown\",\"code\":\"ALIAS-PURCHASE-WH\"}");
+        var workspace = uploadClassifyAndStage(token, "GSTIN aliases",
+            fixture("gstin_party_aliases.xml"), fixture("sales.xml"), fixture("purchase.xml"),
+            fixture("credit_note.xml"), fixture("debit_note.xml"), fixture("debtors_creditors.xml"),
+            fixture("cashbook_matched.xml"));
+        var path = "/api/import-sessions/" + workspace.path("testSessionId").asText();
+        var preview = postJson(token, path + "/dry-run",
+            "{\"strategy\":\"TRANSACTION_HISTORY\",\"stockImpactMode\":\"CREATE_INVOICES_ONLY\"}");
+        assertThat(preview.path("summary").path("blockingErrors").asInt()).isZero();
+        var committed = postJson(token, path + "/commit", commitBody(preview.path("id").asText()));
+        assertThat(committed.path("status").asText()).as(committed.toPrettyString()).isEqualTo("COMMITTED");
+        var customer = customers.findByTenantIdOrderByNameAsc(tenantId);
+        var supplier = suppliers.findByTenantIdOrderByNameAsc(tenantId);
+        assertThat(customer).singleElement().satisfies(row -> assertThat(row.name).isEqualTo("Sample-Customer"));
+        assertThat(supplier).singleElement().satisfies(row -> assertThat(row.name).isEqualTo("Sample-Supplier"));
+        assertThat(salesInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, "S-001").orElseThrow().customerId)
+            .isEqualTo(customer.getFirst().id);
+        assertThat(purchaseInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, "P-001").orElseThrow().supplierId)
+            .isEqualTo(supplier.getFirst().id);
+        for (var count : java.util.List.of("salesInvoicesCreated", "purchaseInvoicesCreated", "creditNotesCreated",
+                "debitNotesCreated", "customerPaymentsCreated", "supplierPaymentsCreated")) {
+            assertThat(committed.path("summary").path(count).asInt()).as(count).isEqualTo(1);
+        }
+        assertThat(committed.path("summary").path("outstandingSnapshotsCreated").asInt()).isEqualTo(2);
+        assertThat(getJson(token, path + "/commit-result").path("status").asText()).isEqualTo("COMMITTED");
+    }
+
+    @Test
+    void batchedCommitRetainsInvoiceTotalsAndRemainsIdempotent() throws Exception {
+        var registration = register("batch-commit");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var workspace = uploadClassifyAndStage(token, "Batched vouchers", repeatedSales(125));
+        var path = "/api/import-sessions/" + workspace.path("testSessionId").asText();
+        var preview = postJson(token, path + "/dry-run",
+            "{\"strategy\":\"TRANSACTION_HISTORY\",\"stockImpactMode\":\"CREATE_INVOICES_ONLY\"}");
+        var committed = postJson(token, path + "/commit", commitBody(preview.path("id").asText()));
+        assertThat(committed.path("status").asText()).as(committed.toPrettyString()).isEqualTo("COMMITTED");
+        assertThat(committed.path("summary").path("salesInvoicesCreated").asInt()).isEqualTo(125);
+        assertThat(committed.path("summary").path("salesInvoiceItemsCreated").asInt()).isEqualTo(125);
+        assertThat(salesInvoices.findByTenantId(tenantId))
+            .hasSize(125).allSatisfy(row -> assertThat(row.totalAmount).isEqualByComparingTo("30"));
+        var retried = postJson(token, path + "/commit", commitBody(preview.path("id").asText()));
+        assertThat(retried.path("idempotentRetry").asBoolean()).isTrue();
+        assertThat(salesInvoices.findByTenantId(tenantId)).hasSize(125);
+    }
+
+    @Test
+    void lateVoucherFailureRollsBackEarlierFlushedBatchesAndPreservesStaging() throws Exception {
+        var registration = register("late-batch-rollback");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var workspace = uploadClassifyAndStage(token, "Late batch failure", repeatedSales(80));
+        var sessionId = UUID.fromString(workspace.path("testSessionId").asText());
+        var path = "/api/import-sessions/" + sessionId;
+        var preview = postJson(token, path + "/dry-run",
+            "{\"strategy\":\"TRANSACTION_HISTORY\",\"stockImpactMode\":\"CREATE_INVOICES_ONLY\"}");
+        var last = stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(tenantId, sessionId).getLast();
+        var conflict = new ExternalRecordMapping();
+        conflict.tenantId = tenantId;
+        conflict.sourceSystem = "SMART_IMPORT";
+        conflict.entityType = "SALES_VOUCHER";
+        conflict.normalizedKey = last.fingerprint;
+        conflict.localEntityType = "SALES_INVOICE";
+        conflict.localEntityId = UUID.randomUUID();
+        conflict.lastSeenAt = java.time.Instant.now();
+        externalMappings.save(conflict);
+        var failed = postJson(token, path + "/commit", commitBody(preview.path("id").asText()));
+        assertThat(failed.path("status").asText()).isEqualTo("FAILED");
+        assertThat(failed.path("summary").path("transactionRolledBack").asBoolean()).isTrue();
+        assertThat(failed.path("summary").path("failureReason").asText()).contains("existing external mapping");
+        assertThat(salesInvoices.findByTenantId(tenantId)).isEmpty();
+        assertThat(products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)).isEmpty();
+        assertThat(customers.findByTenantIdOrderByNameAsc(tenantId)).isEmpty();
+        assertThat(smartEffects.findByTenantIdAndCommitIdOrderByCreatedAtAsc(tenantId, UUID.fromString(failed.path("id").asText()))).isEmpty();
+        assertThat(stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(tenantId, sessionId)).hasSize(80);
+        assertThat(getJson(token, path + "/commit-result").path("status").asText()).isEqualTo("FAILED");
+    }
+
+    private MockMultipartFile repeatedSales(int count) {
+        var xml = new StringBuilder("<ENVELOPE><BODY><DATA><TALLYMESSAGE>");
+        for (int i = 1; i <= count; i++) {
+            xml.append("""
+                <VOUCHER VCHTYPE="Sales"><DATE>20260615</DATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+                <VOUCHERNUMBER>BATCH-%03d</VOUCHERNUMBER><PARTYLEDGERNAME>Batch Customer</PARTYLEDGERNAME>
+                <ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>Batch Item</STOCKITEMNAME>
+                <ACTUALQTY>2 PCS</ACTUALQTY><RATE>15/PCS</RATE><AMOUNT>30</AMOUNT></ALLINVENTORYENTRIES.LIST>
+                </VOUCHER>
+                """.formatted(i));
+        }
+        xml.append("</TALLYMESSAGE></DATA></BODY></ENVELOPE>");
+        return new MockMultipartFile("files", "batch-sales.xml", "application/xml",
+            xml.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void undatedExportsRequireIndependentConfirmedDatesWithoutLosingPreviousPreview() throws Exception {
+        var token = register("missing-snapshot-dates").get("accessToken").asText();
+        var workspace = uploadClassifyAndStage(token, "Undated reports",
+            fixture("closing_stock_undated.xml"), fixture("sundry_debtors_report.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+        var path = "/api/import-sessions/" + sessionId + "/dry-run";
+        assertThat(workspace.path("summary").path("undatedStockSnapshots").asInt()).isEqualTo(1);
+        assertThat(workspace.path("summary").path("undatedOutstandingSnapshots").asInt()).isEqualTo(2);
+        var valid = confirmedSnapshotDates("2026-08-31", "2026-08-30");
+        for (var invalid : java.util.List.of("{}",
+            valid.replace("\"snapshotDateConfirmed\":true", "\"snapshotDateConfirmed\":false"),
+            valid.replace("\"outstandingSnapshotDateConfirmed\":true", "\"outstandingSnapshotDateConfirmed\":false"),
+            "{\"snapshotDate\":\"2026-08-31\",\"snapshotDateConfirmed\":true}")) {
+            mvc.perform(post(path).header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).content(invalid)).andExpect(status().isBadRequest());
+        }
+        var saved = postJson(token, path, valid);
+        mvc.perform(post(path).header("Authorization", "Bearer " + token)
+            .contentType(MediaType.APPLICATION_JSON).content("{}")) .andExpect(status().isBadRequest());
+        assertThat(getJson(token, path).get("id")).isEqualTo(saved.get("id"));
+    }
+
+    @Test
+    void confirmedDatesAreIdenticalInPreviewAndFinalStockAndOutstandingRecords() throws Exception {
+        var registration = register("confirmed-snapshot-dates");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        postJson(token, "/api/warehouses", "{\"name\":\"Main Location\",\"code\":\"DATE-WH\"}");
+        var workspace = uploadClassifyAndStage(token, "Historical undated reports",
+            fixture("closing_stock_undated.xml"), fixture("sundry_debtors_report.xml"), fixture("sundry_creditors_report.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+        var path = "/api/import-sessions/" + sessionId;
+        var dryRun = postJson(token, path + "/dry-run", confirmedSnapshotDates("2026-08-31", "2026-08-30"));
+        assertThat(dryRun.path("summary").path("blockingErrors").asInt()).isZero();
+        assertThat(dryRun.path("summary").path("snapshotDatePolicyVersion").asInt()).isEqualTo(1);
+        assertThat(getJson(token, path + "/dry-run/items?itemType=STOCK_SNAPSHOT")
+            .path("content").get(0).path("preview").path("snapshotDate").asText()).isEqualTo("2026-08-31");
+        var outstandingPreview = getJson(token, path + "/dry-run/items?itemType=OUTSTANDING_SNAPSHOT").path("content");
+        assertThat(outstandingPreview).isNotEmpty();
+        outstandingPreview.forEach(item -> assertThat(item.path("preview").path("snapshotDate").asText()).isEqualTo("2026-08-30"));
+        var committed = postJson(token, path + "/commit", commitBody(dryRun.path("id").asText()));
+        assertThat(committed.path("status").asText()).isEqualTo("COMMITTED");
+        assertThat(committed.path("summary").path("requestedSnapshotDate").asText()).isEqualTo("2026-08-31");
+        assertThat(snapshotBaselines.findByTenantIdAndSourceImportSessionId(tenantId, UUID.fromString(sessionId)))
+            .singleElement().satisfies(row -> assertThat(row.snapshotDate).isEqualTo(LocalDate.of(2026, 8, 31)));
+        assertThat(stockMovements.findAll().stream().filter(row -> tenantId.equals(row.tenantId)).toList())
+            .singleElement().satisfies(row -> assertThat(row.movementDate).isEqualTo(java.time.Instant.parse("2026-08-31T23:59:59Z")));
+        assertThat(outstandingSnapshots.findByTenantIdAndSourceImportSessionIdOrderBySourceRowNumberAsc(tenantId, UUID.fromString(sessionId)))
+            .hasSize(outstandingPreview.size()).allSatisfy(row -> assertThat(row.snapshotDate).isEqualTo(LocalDate.of(2026, 8, 30)));
+    }
+
+    @Test
+    void sourceStockDateTakesPrecedenceOverManuallyConfirmedFallback() throws Exception {
+        var registration = register("source-snapshot-date");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        postJson(token, "/api/warehouses", "{\"name\":\"Main Location\",\"code\":\"SOURCE-DATE-WH\"}");
+        var workspace = uploadClassifyAndStage(token, "Dated report", fixture("closing_stock_full_company.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+        var path = "/api/import-sessions/" + sessionId;
+        var dryRun = postJson(token, path + "/dry-run", confirmedSnapshotDates("2026-08-31", "2026-08-31"));
+        assertThat(getJson(token, path + "/dry-run/items?itemType=STOCK_SNAPSHOT")
+            .path("content").get(0).path("preview").path("snapshotDate").asText()).isEqualTo("2026-06-30");
+        assertThat(postJson(token, path + "/commit", commitBody(dryRun.path("id").asText())).path("status").asText()).isEqualTo("COMMITTED");
+        assertThat(snapshotBaselines.findByTenantIdAndSourceImportSessionId(tenantId, UUID.fromString(sessionId)))
+            .singleElement().satisfies(row -> assertThat(row.snapshotDate).isEqualTo(LocalDate.of(2026, 6, 30)));
+    }
+
+    @Test
+    void legacyOrUnconfirmedPreviewCannotCommitEvenWithZeroBlockingErrors() throws Exception {
+        var registration = register("unsafe-date-preview");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var workspace = uploadClassifyAndStage(token, "Legacy preview", fixture("closing_stock_undated.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+        var path = "/api/import-sessions/" + sessionId;
+        var preview = postJson(token, path + "/dry-run", confirmedSnapshotDates("2026-08-31", "2026-08-31"));
+        var persisted = dryRuns.findByTenantIdAndImportSessionIdAndId(tenantId, UUID.fromString(sessionId), UUID.fromString(preview.path("id").asText())).orElseThrow();
+        persisted.summaryJson.remove("snapshotDatePolicyVersion");
+        dryRuns.save(persisted);
+        mvc.perform(post(path + "/commit").header("Authorization", "Bearer " + token)
+            .contentType(MediaType.APPLICATION_JSON).content(commitBody(persisted.id.toString()))).andExpect(status().isBadRequest());
+        persisted.summaryJson.put("snapshotDatePolicyVersion", 1);
+        persisted.summaryJson.put("snapshotDateConfirmed", false);
+        dryRuns.save(persisted);
+        mvc.perform(post(path + "/commit").header("Authorization", "Bearer " + token)
+            .contentType(MediaType.APPLICATION_JSON).content(commitBody(persisted.id.toString()))).andExpect(status().isBadRequest());
+        assertThat(smartCommits.findByTenantIdAndImportSessionId(tenantId, UUID.fromString(sessionId))).isEmpty();
+        assertThat(products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)).isEmpty();
+    }
+
+    @Test
+    void changingConfirmedDateChangesFingerprintAndRejectsOldOrTamperedPreview() throws Exception {
+        var registration = register("changed-date-preview");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var workspace = uploadClassifyAndStage(token, "Date changes", fixture("closing_stock_undated.xml"), fixture("sundry_debtors_report.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+        var path = "/api/import-sessions/" + sessionId;
+        var first = postJson(token, path + "/dry-run", confirmedSnapshotDates("2026-08-31", "2026-08-31"));
+        var firstSaved = dryRuns.findByTenantIdAndImportSessionIdAndId(tenantId, UUID.fromString(sessionId), UUID.fromString(first.path("id").asText())).orElseThrow();
+        var second = postJson(token, path + "/dry-run", confirmedSnapshotDates("2026-08-31", "2026-08-30"));
+        var secondSaved = dryRuns.findByTenantIdAndImportSessionIdAndId(tenantId, UUID.fromString(sessionId), UUID.fromString(second.path("id").asText())).orElseThrow();
+        assertThat(secondSaved.inputFingerprint).isNotEqualTo(firstSaved.inputFingerprint).hasSize(64);
+        mvc.perform(post(path + "/commit").header("Authorization", "Bearer " + token)
+            .contentType(MediaType.APPLICATION_JSON).content(commitBody(firstSaved.id.toString()))).andExpect(status().isBadRequest());
+        secondSaved.summaryJson.put("requestedSnapshotDate", "2026-08-29");
+        dryRuns.save(secondSaved);
+        mvc.perform(post(path + "/commit").header("Authorization", "Bearer " + token)
+            .contentType(MediaType.APPLICATION_JSON).content(commitBody(secondSaved.id.toString()))).andExpect(status().isConflict());
+        var otherToken = register("other-date-tenant").get("accessToken").asText();
+        mvc.perform(post(path + "/dry-run").header("Authorization", "Bearer " + otherToken)
+            .contentType(MediaType.APPLICATION_JSON).content(confirmedSnapshotDates("2026-08-31", "2026-08-31"))).andExpect(status().isNotFound());
+    }
+
+    @Test
+    void confirmedStockDateAlsoControlsPostSnapshotMovementsInPreviewAndCommit() throws Exception {
+        var registration = register("confirmed-date-movements");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var product = postJson(token, "/api/products", """
+            {"sku":"CONFIRM-DATE-A","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        var warehouse = postJson(token, "/api/warehouses", "{\"name\":\"Main Location\",\"code\":\"DATE-MOVEMENT-WH\"}");
+        var workspace = uploadClassifyAndStage(token, "Undated snapshot with later sale",
+            fixture("closing_stock_undated.xml"), fixture("sales_after_snapshot.xml"));
+        var path = "/api/import-sessions/" + workspace.get("testSessionId").asText();
+        var dryRun = postJson(token, path + "/dry-run", """
+            {"strategy":"HYBRID_RECONCILIATION","stockImpactMode":"APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE",
+             "snapshotDate":"2026-06-30","snapshotDateConfirmed":true}
+            """);
+        assertThat(dryRun.path("summary").path("salesStockMovementsPlanned").asInt()).isEqualTo(1);
+        var committed = postJson(token, path + "/commit", commitBody(dryRun.path("id").asText()));
+        assertThat(committed.path("status").asText()).isEqualTo("COMMITTED");
+        assertThat(committed.path("summary").path("salesStockMovementsCreated").asInt()).isEqualTo(1);
+        assertThat(stockMovements.currentStock(tenantId, UUID.fromString(product.path("id").asText()),
+            UUID.fromString(warehouse.path("id").asText()))).isEqualByComparingTo("98");
+    }
+
+    private String confirmedSnapshotDates(String stock, String outstanding) {
+        return """
+            {"stockImpactMode":"CREATE_INVOICES_ONLY","snapshotDate":"%s","snapshotDateConfirmed":true,
+             "outstandingSnapshotDate":"%s","outstandingSnapshotDateConfirmed":true}
+            """.formatted(stock, outstanding);
+    }
+
+    @Test
+    void retailCounterSalesRecordAllCollectionMethodsWithoutInventingItemsOrChangingStock() throws Exception {
+        for (var method : DomainEnums.RetailCollectionMethod.values()) {
+            var registration = register("retail-" + method);
+            var token = registration.get("accessToken").asText();
+            var tenantId = UUID.fromString(registration.get("tenantId").asText());
+            var review = stageUnmatchedCashbook(token, "Retail collection");
+            var before = java.util.List.of(stockMovements.count(), products.count(), salesInvoices.count(),
+                customerPayments.count(), supplierPayments.count(), purchaseInvoices.count(), customers.count());
+            var result = postJson(token, retailPath(review), retailBody(method.name()));
+            assertThat(result.get("retailSaleRecorded").asBoolean()).isTrue();
+            assertThat(result.get("paymentPosted").asBoolean()).isFalse();
+            assertThat(result.get("resolutionStatus").asText()).isEqualTo("RETAIL_SALE_RECORDED");
+            assertThat(java.util.List.of(stockMovements.count(), products.count(), salesInvoices.count(),
+                customerPayments.count(), supplierPayments.count(), purchaseInvoices.count(), customers.count())).isEqualTo(before);
+            var sales = getJson(token, "/api/sales/retail-counter?size=25");
+            assertThat(sales.get("totalElements").asInt()).isEqualTo(1);
+            assertThat(sales.get("content").get(0).get("amount").decimalValue()).isEqualByComparingTo("500");
+            assertThat(sales.get("content").get(0).get("collectionMethod").asText()).isEqualTo(method.name());
+            assertThat(getJson(token, "/api/import-sessions/" + review.get("sessionId").asText() + "/cashbook-review")).isEmpty();
+            assertThat(auditLogs.findByTenantIdOrderByCreatedAtDesc(tenantId).stream().map(log -> log.action))
+                .contains("RETAIL_COUNTER_SALE_RECORDED", "CASHBOOK_REVIEW_RESOLVED")
+                .doesNotContain("PAYMENT_MANUALLY_MATCHED");
+        }
+    }
+
+    @Test
+    void retailConfirmationRejectsMissingAcknowledgementsAndInvalidSourceValues() throws Exception {
+        var registration = register("retail-validation");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var review = stageUnmatchedCashbook(token, "Confirmations");
+        var valid = retailBody("CASH");
+        for (var invalid : java.util.List.of(valid.replace("RECORD RETAIL SALES", ""),
+            valid.replace("\"receivedFromRetailSales\":true", "\"receivedFromRetailSales\":false"),
+            valid.replace("\"notAlreadyRecorded\":true", "\"notAlreadyRecorded\":false"),
+            valid.replace("\"collectionMethod\":\"CASH\"", "\"collectionMethod\":null"))) {
+            mvc.perform(post(retailPath(review)).header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).content(invalid)).andExpect(status().isBadRequest());
+        }
+        var row = stagedCashbook.findById(UUID.fromString(review.get("entryId").asText())).orElseThrow();
+        for (var amount : java.util.List.of("0", "-500", "0.001")) {
+            row.amount = new BigDecimal(amount);
+            stagedCashbook.save(row);
+            mvc.perform(post(retailPath(review)).header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).content(valid)).andExpect(status().isBadRequest());
+        }
+        assertThat(retailSales.countByTenantId(tenantId)).isZero();
+    }
+
+    @Test
+    void retailPaymentDirectionRequiresExplanationAndPreservesSource() throws Exception {
+        var token = register("retail-direction").get("accessToken").asText();
+        var review = stageUnmatchedCashbook(token, "Direction review");
+        var row = stagedCashbook.findById(UUID.fromString(review.get("entryId").asText())).orElseThrow();
+        row.direction = DomainEnums.SmartCashbookDirection.PAYMENT;
+        stagedCashbook.save(row);
+        var body = retailBody("CASH_AND_UPI");
+        mvc.perform(post(retailPath(review)).header("Authorization", "Bearer " + token)
+            .contentType(MediaType.APPLICATION_JSON).content(body.replace("Daily shop collections", "")))
+            .andExpect(status().isBadRequest());
+        postJson(token, retailPath(review), body);
+        var sale = getJson(token, "/api/sales/retail-counter").get("content").get(0);
+        assertThat(sale.get("sourceDirection").asText()).isEqualTo("PAYMENT");
+        assertThat(sale.get("note").asText()).isEqualTo("Daily shop collections");
+        assertThat(stagedCashbook.findById(row.id).orElseThrow().direction).isEqualTo(DomainEnums.SmartCashbookDirection.PAYMENT);
+    }
+
+    @Test
+    void retailRecordsSurviveRebuildRepeatedClickAndReimportAndAreSkippedByFinalCommit() throws Exception {
+        var registration = register("retail-dedup");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var review = stageUnmatchedCashbook(token, "Original collection");
+        var sessionId = review.get("sessionId").asText();
+        postJson(token, retailPath(review), retailBody("UPI"));
+        var retry = postJson(token, retailPath(review), retailBody("UPI"));
+        assertThat(retry.get("duplicateRetailSaleSkipped").asBoolean()).isTrue();
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        assertThat(getJson(token, "/api/import-sessions/" + sessionId + "/cashbook-review")).isEmpty();
+        var next = stageUnmatchedCashbook(token, "Same source uploaded again");
+        var nextId = next.get("sessionId").asText();
+        assertThat(getJson(token, "/api/import-sessions/" + nextId + "/cashbook-review")).isEmpty();
+        var dryRun = postJson(token, "/api/import-sessions/" + nextId + "/dry-run", "{\"strategy\":\"TRANSACTION_HISTORY\"}");
+        assertThat(dryRun.get("summary").get("retailCounterSaleRowsResolved").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("cashbookRowsUnmatched").asInt()).isZero();
+        var commit = postJson(token, "/api/import-sessions/" + nextId + "/commit", commitBody(dryRun.get("id").asText()));
+        assertThat(commit.get("summary").get("retailCounterSaleRowsResolved").asInt()).isEqualTo(1);
+        assertThat(commit.get("summary").get("customerPaymentsCreated").asInt()).isZero();
+        assertThat(commit.get("summary").get("supplierPaymentsCreated").asInt()).isZero();
+        assertThat(retailSales.countByTenantId(tenantId)).isEqualTo(1);
+    }
+
+    @Test
+    void retailAndPaymentPostingCannotCountTheSameFingerprintTwice() throws Exception {
+        var token = register("retail-payment-conflict").get("accessToken").asText();
+        var customer = postJson(token, "/api/customers", "{\"name\":\"Named customer\",\"creditLimit\":5000}");
+        var first = stageUnmatchedCashbook(token, "First copy");
+        var second = stageUnmatchedCashbook(token, "Second copy");
+        postJson(token, retailPath(first), retailBody("CASH"));
+        mvc.perform(post(retailPath(second)).header("Authorization", "Bearer " + token)
+            .contentType(MediaType.APPLICATION_JSON).content(cashbookResolution("MAP_CUSTOMER", customer.get("id").asText())))
+            .andExpect(status().isConflict());
+
+        var token2 = register("payment-retail-conflict").get("accessToken").asText();
+        var customer2 = postJson(token2, "/api/customers", "{\"name\":\"Another customer\",\"creditLimit\":5000}");
+        var payment = stageUnmatchedCashbook(token2, "Payment first");
+        var retail = stageUnmatchedCashbook(token2, "Retail second");
+        postJson(token2, retailPath(payment), cashbookResolution("MAP_CUSTOMER", customer2.get("id").asText()));
+        mvc.perform(post(retailPath(retail)).header("Authorization", "Bearer " + token2)
+            .contentType(MediaType.APPLICATION_JSON).content(retailBody("CASH"))).andExpect(status().isConflict());
+    }
+
+    @Test
+    void retailResolutionAfterCommitUpdatesReconciliation() throws Exception {
+        var token = register("retail-post-commit").get("accessToken").asText();
+        var review = stageUnmatchedCashbook(token, "Review after commit");
+        var sessionId = review.get("sessionId").asText();
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", "{\"strategy\":\"TRANSACTION_HISTORY\"}");
+        postJson(token, "/api/import-sessions/" + sessionId + "/commit", commitBody(dryRun.get("id").asText()));
+        postJson(token, retailPath(review), retailBody("UPI"));
+        var summary = getJson(token, "/api/import-sessions/" + sessionId + "/commit-result").get("summary");
+        assertThat(summary.get("cashbookRowsUnmatched").asInt()).isZero();
+        assertThat(summary.get("retailCounterSaleRowsResolved").asInt()).isEqualTo(1);
+    }
+
+    @Test
+    void retailSalesAreTenantScopedAndCustomerAndReadOnlyUsersCannotPost() throws Exception {
+        var registration = register("retail-security");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var other = register("retail-other").get("accessToken").asText();
+        var review = stageUnmatchedCashbook(token, "Restricted retail review");
+        mvc.perform(post(retailPath(review)).header("Authorization", "Bearer " + other)
+            .contentType(MediaType.APPLICATION_JSON).content(retailBody("CASH"))).andExpect(status().isNotFound());
+        for (var role : java.util.List.of(DomainEnums.Role.CUSTOMER_USER, DomainEnums.Role.VIEWER)) {
+            var roleToken = tokenForRole(tenantId, role);
+            mvc.perform(post(retailPath(review)).header("Authorization", "Bearer " + roleToken)
+                .contentType(MediaType.APPLICATION_JSON).content(retailBody("CASH"))).andExpect(status().isForbidden());
+        }
+        mvc.perform(get("/api/sales/retail-counter").header("Authorization", "Bearer " + tokenForRole(tenantId, DomainEnums.Role.CUSTOMER_USER)))
+            .andExpect(status().isForbidden());
+        postJson(token, retailPath(review), retailBody("CASH"));
+        assertThat(getJson(other, "/api/sales/retail-counter").get("totalElements").asInt()).isZero();
+    }
+
+    @Test
+    void bulkRetailRecordsExplicitSelectionAndSkipsDuplicatesWithoutBusinessSideEffects() throws Exception {
+        var registration = register("retail-bulk");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var sessionId = createSession(token, "Bulk Cash and GPay").get("id").asText();
+        upload(token, sessionId, fixture("cashbook_bulk_retail.csv"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        var review = getJson(token, "/api/import-sessions/" + sessionId + "/cashbook-review");
+        assertThat(review.size()).isEqualTo(3);
+        var selectedIds = new java.util.ArrayList<String>();
+        review.forEach(row -> {
+            if (row.get("partyName").asText().contains("Counter")) {
+                selectedIds.add(row.get("id").asText());
+            }
+        });
+        assertThat(selectedIds).hasSize(2);
+        var before = java.util.List.of(stockMovements.count(), products.count(), salesInvoices.count(),
+            customerPayments.count(), supplierPayments.count(), purchaseInvoices.count(), customers.count());
+
+        var result = postJson(token, bulkRetailPath(sessionId),
+            bulkRetailBody(selectedIds, "CASH_AND_UPI", "Verified counter collections"));
+
+        assertThat(result.get("requestedCount").asInt()).isEqualTo(2);
+        assertThat(result.get("recordedCount").asInt()).isEqualTo(2);
+        assertThat(result.get("duplicateCount").asInt()).isZero();
+        assertThat(result.get("failedCount").asInt()).isZero();
+        assertThat(result.get("recordedAmount").decimalValue()).isEqualByComparingTo("650.75");
+        assertThat(result.get("results").findValuesAsText("status")).containsOnly("RECORDED");
+        assertThat(java.util.List.of(stockMovements.count(), products.count(), salesInvoices.count(),
+            customerPayments.count(), supplierPayments.count(), purchaseInvoices.count(), customers.count())).isEqualTo(before);
+        assertThat(retailSales.countByTenantId(tenantId)).isEqualTo(2);
+        var remaining = getJson(token, "/api/import-sessions/" + sessionId + "/cashbook-review");
+        assertThat(remaining.size()).isEqualTo(1);
+        assertThat(remaining.get(0).get("partyName").asText()).isEqualTo("Owner Transfer");
+
+        var retry = postJson(token, bulkRetailPath(sessionId),
+            bulkRetailBody(selectedIds, "CASH_AND_UPI", "Verified counter collections"));
+        assertThat(retry.get("recordedCount").asInt()).isZero();
+        assertThat(retry.get("duplicateCount").asInt()).isEqualTo(2);
+        assertThat(retry.get("failedCount").asInt()).isZero();
+        assertThat(retailSales.countByTenantId(tenantId)).isEqualTo(2);
+        assertThat(auditLogs.findByTenantIdOrderByCreatedAtDesc(tenantId).stream().map(log -> log.action))
+            .contains("CASHBOOK_BULK_RETAIL_RESOLVED", "RETAIL_COUNTER_SALE_RECORDED", "CASHBOOK_REVIEW_RESOLVED");
+    }
+
+    @Test
+    void bulkRetailReportsPartialFailureAndLeavesFailedRowsForReview() throws Exception {
+        var registration = register("retail-bulk-partial");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var sessionId = createSession(token, "Partial bulk retail").get("id").asText();
+        upload(token, sessionId, fixture("cashbook_bulk_retail.csv"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        var review = getJson(token, "/api/import-sessions/" + sessionId + "/cashbook-review");
+        var selectedIds = java.util.List.of(review.get(0).get("id").asText(), review.get(1).get("id").asText());
+
+        var result = postJson(token, bulkRetailPath(sessionId), bulkRetailBody(selectedIds, "CASH", ""));
+
+        assertThat(result.get("recordedCount").asInt()).isEqualTo(1);
+        assertThat(result.get("duplicateCount").asInt()).isZero();
+        assertThat(result.get("failedCount").asInt()).isEqualTo(1);
+        assertThat(result.get("partialSuccess").asBoolean()).isTrue();
+        assertThat(result.get("recordedAmount").decimalValue()).isEqualByComparingTo("150.25");
+        assertThat(result.get("results").findValuesAsText("status")).containsExactly("RECORDED", "FAILED");
+        var failed = result.get("results").get(1);
+        assertThat(failed.get("sourceRowNumber").asInt()).isEqualTo(2);
+        assertThat(failed.get("message").asText()).contains("Explain why");
+        assertThat(retailSales.countByTenantId(tenantId)).isEqualTo(1);
+        assertThat(getJson(token, "/api/import-sessions/" + sessionId + "/cashbook-review").size()).isEqualTo(2);
+
+        var recovered = postJson(token, bulkRetailPath(sessionId),
+            bulkRetailBody(java.util.List.of(failed.get("entryId").asText()), "UPI", "Verified GPay shop collection"));
+        assertThat(recovered.get("recordedCount").asInt()).isEqualTo(1);
+        assertThat(recovered.get("failedCount").asInt()).isZero();
+        assertThat(retailSales.countByTenantId(tenantId)).isEqualTo(2);
+    }
+
+    @Test
+    void bulkRetailIsTenantScopedPermissionCheckedAndRejectsAmbiguousSelection() throws Exception {
+        var registration = register("retail-bulk-security");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var sessionId = createSession(token, "Protected bulk retail").get("id").asText();
+        upload(token, sessionId, fixture("cashbook_bulk_retail.csv"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        var entryId = getJson(token, "/api/import-sessions/" + sessionId + "/cashbook-review").get(0).get("id").asText();
+        var body = bulkRetailBody(java.util.List.of(entryId), "CASH", "Verified cash sale");
+        var other = register("retail-bulk-other").get("accessToken").asText();
+
+        mvc.perform(post(bulkRetailPath(sessionId)).header("Authorization", "Bearer " + other)
+            .contentType(MediaType.APPLICATION_JSON).content(body)).andExpect(status().isNotFound());
+        for (var role : java.util.List.of(DomainEnums.Role.CUSTOMER_USER, DomainEnums.Role.VIEWER)) {
+            mvc.perform(post(bulkRetailPath(sessionId))
+                .header("Authorization", "Bearer " + tokenForRole(tenantId, role))
+                .contentType(MediaType.APPLICATION_JSON).content(body)).andExpect(status().isForbidden());
+        }
+        mvc.perform(post(bulkRetailPath(sessionId)).header("Authorization", "Bearer " + token)
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(body.replace("RECORD 1 RETAIL SALES", "RECORD RETAIL SALES")))
+            .andExpect(status().isBadRequest());
+        mvc.perform(post(bulkRetailPath(sessionId)).header("Authorization", "Bearer " + token)
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(bulkRetailBody(java.util.List.of(entryId, entryId), "CASH", "Duplicate selection")))
+            .andExpect(status().isBadRequest());
+        assertThat(retailSales.countByTenantId(tenantId)).isZero();
+    }
+
+    private String retailBody(String method) {
+        return """
+            {"action":"RECORD_RETAIL_SALE","collectionMethod":"%s","confirmation":"RECORD RETAIL SALES",
+             "receivedFromRetailSales":true,"notAlreadyRecorded":true,"note":"Daily shop collections"}
+            """.formatted(method);
+    }
+
+    private String bulkRetailPath(String sessionId) {
+        return "/api/import-sessions/" + sessionId + "/cashbook-review/retail-sales/bulk";
+    }
+
+    private String bulkRetailBody(java.util.List<String> entryIds, String method, String note) throws Exception {
+        var body = mapper.createObjectNode();
+        var ids = body.putArray("entryIds");
+        entryIds.forEach(ids::add);
+        body.put("collectionMethod", method);
+        body.put("confirmation", "RECORD " + entryIds.size() + " RETAIL SALES");
+        body.put("note", note);
+        body.put("receivedFromRetailSales", true);
+        body.put("notAlreadyRecorded", true);
+        return mapper.writeValueAsString(body);
+    }
+
+    @Test
+    void concurrentRetailResolutionsAcrossSessionsCreateOneRecord() throws Exception {
+        var registration = register("retail-concurrent");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var first = stageUnmatchedCashbook(token, "Concurrent first");
+        var second = stageUnmatchedCashbook(token, "Concurrent second");
+        var start = new java.util.concurrent.CountDownLatch(1);
+        try (var executor = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var a = executor.submit(() -> { start.await(); return postJson(token, retailPath(first), retailBody("CASH")); });
+            var b = executor.submit(() -> { start.await(); return postJson(token, retailPath(second), retailBody("CASH")); });
+            start.countDown();
+            var results = java.util.List.of(a.get(20, java.util.concurrent.TimeUnit.SECONDS), b.get(20, java.util.concurrent.TimeUnit.SECONDS));
+            assertThat(results.stream().filter(result -> result.get("duplicateRetailSaleSkipped").asBoolean()).count()).isEqualTo(1);
+            assertThat(retailSales.countByTenantId(tenantId)).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void retailRecordedAfterAnotherSessionsDryRunCannotBecomeAnAutomaticPayment() throws Exception {
+        var registration = register("retail-auto-payment");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var review = stageUnmatchedCashbook(token, "Retail source");
+        postJson(token, "/api/customers", "{\"name\":\"Unknown Customer\",\"creditLimit\":5000}");
+        var other = stageUnmatchedCashbook(token, "Now automatically matched");
+        var sessionId = other.get("sessionId").asText();
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", "{\"strategy\":\"TRANSACTION_HISTORY\"}");
+        assertThat(dryRun.get("summary").get("customerPaymentsPreviewed").asInt()).isEqualTo(1);
+        postJson(token, retailPath(review), retailBody("CASH"));
+        var result = postJson(token, "/api/import-sessions/" + sessionId + "/commit", commitBody(dryRun.get("id").asText()));
+        assertThat(result.get("status").asText()).isEqualTo("FAILED");
+        assertThat(result.get("summary").get("failureReason").asText()).contains("reconciliation differs");
+        dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", "{\"strategy\":\"TRANSACTION_HISTORY\"}");
+        result = postJson(token, "/api/import-sessions/" + sessionId + "/commit", commitBody(dryRun.get("id").asText()));
+        assertThat(result.get("summary").get("customerPaymentsCreated").asInt()).isZero();
+        assertThat(result.get("summary").get("retailCounterSaleRowsResolved").asInt()).isEqualTo(1);
+        assertThat(customerPayments.countByTenantIdAndSourceImportSessionId(tenantId, UUID.fromString(sessionId))).isZero();
+    }
+
+    private String retailPath(JsonNode review) {
+        return "/api/import-sessions/" + review.get("sessionId").asText() + "/cashbook-review/" + review.get("entryId").asText() + "/resolve";
+    }
+
+    @Test
+    void stockJournalDefaultModeDefersTransferWithoutInventoryEffect() throws Exception {
+        var registration = register("smart-transfer-default-defer");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var setup = createTransferInventory(token, tenantId);
+        var movementCount = stockMovements.count();
+        var sessionId = createSession(token, "Deferred stock journal").get("id").asText();
+        upload(token, sessionId, fixture("stock_journal_transfer.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        var workspace = postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+
+        assertThat(workspace.get("summary").get("stockJournalsDetected").asInt()).isEqualTo(1);
+        assertThat(workspace.get("summary").get("warehouseTransfersDetected").asInt()).isEqualTo(1);
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run",
+            "{\"stockJournalImpactMode\":\"DEFER_STOCK_JOURNALS\"}");
+
+        assertThat(dryRun.get("summary").get("stockJournalImpactMode").asText()).isEqualTo("DEFER_STOCK_JOURNALS");
+        assertThat(dryRun.get("summary").get("transferOutMovementsPlanned").asInt()).isZero();
+        assertThat(dryRun.get("summary").get("transferInMovementsPlanned").asInt()).isZero();
+        assertThat(stockMovements.count()).isEqualTo(movementCount);
+        assertTransferStock(tenantId, setup, "100", "40");
+    }
+
+    @Test
+    void confirmedPostSnapshotTransferCreatesAtomicPairAndKeepsCompanyStockZeroNet() throws Exception {
+        var registration = register("smart-transfer-commit");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var setup = createTransferInventory(token, tenantId);
+        var sessionId = createSession(token, "Confirmed transfer").get("id").asText();
+        upload(token, sessionId, fixture("stock_journal_transfer.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {"stockJournalImpactMode":"APPLY_CONFIRMED_WAREHOUSE_TRANSFERS_AFTER_SNAPSHOT_DATE","negativeStockPolicy":"BLOCK"}
+            """);
+        assertThat(dryRun.get("summary").get("warehouseTransfersEligible").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("transferOutMovementsPlanned").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("transferInMovementsPlanned").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("netCompanyStockEffect").decimalValue()).isEqualByComparingTo("0");
+
+        var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+            commitBody(dryRun.get("id").asText()));
+        assertThat(committed.get("summary").get("warehouseTransfersCommitted").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("transferOutMovementsCreated").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("transferInMovementsCreated").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("netCompanyStockQuantityChange").decimalValue()).isEqualByComparingTo("0");
+        assertTransferStock(tenantId, setup, "80", "60");
+
+        var movements = stockMovements.findAll().stream()
+            .filter(row -> tenantId.equals(row.tenantId)
+                && (row.movementType == DomainEnums.MovementType.TRANSFER_OUT
+                    || row.movementType == DomainEnums.MovementType.TRANSFER_IN))
+            .toList();
+        assertThat(movements).hasSize(2);
+        assertThat(movements).extracting(row -> row.transferGroupId).doesNotContainNull().containsOnly(movements.getFirst().transferGroupId);
+        assertThat(movements.get(0).linkedMovementId).isEqualTo(movements.get(1).id);
+        assertThat(movements.get(1).linkedMovementId).isEqualTo(movements.get(0).id);
+    }
+
+    @Test
+    void repeatedTransferUploadIsIdempotentAcrossSessions() throws Exception {
+        var registration = register("smart-transfer-idempotent");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var setup = createTransferInventory(token, tenantId);
+
+        for (int attempt = 0; attempt < 2; attempt++) {
+            var sessionId = createSession(token, "Transfer attempt " + attempt).get("id").asText();
+            upload(token, sessionId, fixture("stock_journal_transfer.xml"));
+            postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+            postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+            var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+                {"stockJournalImpactMode":"APPLY_CONFIRMED_WAREHOUSE_TRANSFERS_AFTER_SNAPSHOT_DATE","negativeStockPolicy":"BLOCK"}
+                """);
+            var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+                commitBody(dryRun.get("id").asText()));
+            if (attempt == 1) {
+                assertThat(committed.get("summary").get("duplicateWarehouseTransfersSkipped").asInt()).isEqualTo(1);
+                assertThat(committed.get("summary").get("transferPairsCreated").asInt()).isZero();
+            }
+        }
+        assertTransferStock(tenantId, setup, "80", "60");
+    }
+
+    @Test
+    void manufacturingStockJournalIsPreservedAndDeferred() throws Exception {
+        var token = register("smart-transfer-manufacturing").get("accessToken").asText();
+        var sessionId = createSession(token, "Manufacturing journal").get("id").asText();
+        upload(token, sessionId, fixture("stock_journal_manufacturing.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        var workspace = postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+
+        assertThat(workspace.get("transferCandidates").findValuesAsText("classification"))
+            .contains("MIXED_MANUFACTURING_JOURNAL");
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {"stockJournalImpactMode":"APPLY_CONFIRMED_WAREHOUSE_TRANSFERS_AFTER_SNAPSHOT_DATE"}
+            """);
+        assertThat(dryRun.get("summary").get("manufacturingJournalsDeferred").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("transferOutMovementsPlanned").asInt()).isZero();
+        assertThat(dryRun.get("summary").get("transferInMovementsPlanned").asInt()).isZero();
+    }
+
+    @Test
+    void transferNegativeStockPolicyBlocksOrSkipsTheCompletePair() throws Exception {
+        for (var policy : new String[] {"BLOCK", "SKIP_STOCK_MOVEMENT"}) {
+            var registration = register("smart-transfer-negative-" + policy.toLowerCase());
+            var token = registration.get("accessToken").asText();
+            var tenantId = UUID.fromString(registration.get("tenantId").asText());
+            var setup = createTransferInventory(token, tenantId);
+            saveMovementAt(tenantId, setup.product(), setup.source(), "-90",
+                java.time.Instant.parse("2026-04-01T12:00:00Z"));
+            var sessionId = createSession(token, "Negative source " + policy).get("id").asText();
+            upload(token, sessionId, fixture("stock_journal_transfer.xml"));
+            postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+            postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+
+            var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+                {"stockJournalImpactMode":"APPLY_CONFIRMED_WAREHOUSE_TRANSFERS_AFTER_SNAPSHOT_DATE","negativeStockPolicy":"%s"}
+                """.formatted(policy));
+            assertThat(dryRun.get("summary").get("transferOutMovementsPlanned").asInt()).isZero();
+            assertThat(dryRun.get("summary").get("transferInMovementsPlanned").asInt()).isZero();
+            if ("BLOCK".equals(policy)) {
+                assertThat(dryRun.get("summary").get("warehouseTransfersBlockedByNegativeStock").asInt()).isEqualTo(1);
+                assertThat(dryRun.get("summary").get("blockingErrors").asInt()).isEqualTo(1);
+            } else {
+                assertThat(dryRun.get("summary").get("warehouseTransfersSkippedByPolicy").asInt()).isEqualTo(1);
+                var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+                    commitBody(dryRun.get("id").asText()));
+                assertThat(committed.get("summary").get("transferPairsCreated").asInt()).isZero();
+            }
+            assertTransferStock(tenantId, setup, "10", "40");
+        }
+    }
+
+    @Test
+    void transferReviewRequiresExactConfirmationAndBlocksCustomerUserAndOtherTenant() throws Exception {
+        var registration = register("smart-transfer-review-security");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        createTransferInventory(token, tenantId);
+        var sessionId = createSession(token, "Transfer review security").get("id").asText();
+        upload(token, sessionId, fixture("stock_journal_transfer.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        var review = getJson(token, "/api/import-sessions/" + sessionId + "/transfer-review");
+        var candidate = review.get(0);
+
+        mvc.perform(post("/api/import-sessions/{sessionId}/transfer-review/{candidateId}/resolve",
+                sessionId, candidate.get("id").asText())
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(transferResolution(candidate, "WRONG CONFIRMATION")))
+            .andExpect(status().isBadRequest());
+
+        var resolved = postJson(token,
+            "/api/import-sessions/" + sessionId + "/transfer-review/" + candidate.get("id").asText() + "/resolve",
+            transferResolution(candidate, "POST STOCK TRANSFER"));
+        assertThat(resolved.get("resolutionStatus").asText()).isEqualTo("USER_CONFIRMED");
+        assertThat(auditLogs.findByTenantIdOrderByCreatedAtDesc(tenantId).stream().map(log -> log.action))
+            .contains("SMART_IMPORT_WAREHOUSE_TRANSFER_MANUALLY_RESOLVED");
+
+        var otherToken = register("smart-transfer-review-other").get("accessToken").asText();
+        mvc.perform(get("/api/import-sessions/{sessionId}/transfer-review", sessionId)
+                .header("Authorization", "Bearer " + otherToken))
+            .andExpect(status().isNotFound());
+
+        var customerToken = tokenForRole(tenantId, DomainEnums.Role.CUSTOMER_USER);
+        mvc.perform(get("/api/import-sessions/{sessionId}/transfer-review", sessionId)
+                .header("Authorization", "Bearer " + customerToken))
+            .andExpect(status().isForbidden());
+    }
 
     @Test
     void createsAndListsImportSession() throws Exception {
@@ -96,6 +918,36 @@ class SmartImportSessionIntegrationTest {
         assertThat(classified.get("files")).hasSize(2);
         assertThat(classified.get("files").findValuesAsText("detectedFileType"))
             .containsExactlyInAnyOrder("SALES_VOUCHERS", "PURCHASE_VOUCHERS");
+    }
+
+    @Test
+    void classifiesAndRoutesMixedTallyExportsAndOutstandingRowsByTheirActualContent() throws Exception {
+        var token = register("smart-mixed-tally").get("accessToken").asText();
+        var sessionId = createSession(token, "Combined Tally exports").get("id").asText();
+
+        upload(token, sessionId,
+            fixture("mixed_masters.xml"),
+            fixture("mixed_vouchers.xml"),
+            fixture("sundry_debtors_report.xml"),
+            fixture("sundry_creditors_report.xml"));
+        var classified = postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+
+        assertThat(classified.get("files").findValuesAsText("detectedFileType"))
+            .contains("MIXED_TALLY_MASTERS", "MIXED_TALLY_VOUCHERS", "DEBTOR_CREDITOR_ANALYSIS");
+        var workspace = postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        assertThat(workspace.get("summary").get("productsStaged").asInt()).isEqualTo(2);
+        assertThat(workspace.get("summary").get("partiesStaged").asInt()).isEqualTo(5);
+        assertThat(workspace.get("summary").get("vouchersStaged").asInt()).isEqualTo(4);
+        assertThat(workspace.get("summary").get("voucherItemsStaged").asInt()).isEqualTo(2);
+        assertThat(workspace.get("summary").get("cashbookEntriesStaged").asInt()).isEqualTo(2);
+        assertThat(workspace.get("summary").get("debtorRowsStaged").asInt()).isEqualTo(2);
+        assertThat(workspace.get("summary").get("creditorRowsStaged").asInt()).isEqualTo(1);
+        assertThat(workspace.get("vouchers").findValuesAsText("voucherType"))
+            .containsExactlyInAnyOrder("Sales", "Purchase", "Credit Note", "Debit Note");
+        assertThat(workspace.get("cashbookEntries").findValuesAsText("direction"))
+            .containsExactlyInAnyOrder("RECEIPT", "PAYMENT");
+        assertThat(workspace.get("parties").findValuesAsText("name"))
+            .contains("Report Customer One", "Report Customer Two", "Report Supplier One");
     }
 
     @Test
@@ -418,6 +1270,15 @@ class SmartImportSessionIntegrationTest {
         assertThat(dryRun.get("status").asText()).isEqualTo("COMPLETED");
         assertThat(dryRun.get("summary").get("dryRunOnly").asBoolean()).isTrue();
         assertThat(dryRun.get("summary").get("finalBusinessWrites").asInt()).isZero();
+        var persisted = getJson(token, "/api/import-sessions/" + sessionId + "/dry-run");
+        assertThat(persisted.get("id")).isEqualTo(dryRun.get("id"));
+        assertThat(persisted.get("status").asText()).isEqualTo("COMPLETED");
+        assertThat(persisted.get("summary")).isEqualTo(dryRun.get("summary"));
+        assertThat(dryRuns.findByTenantIdAndImportSessionIdAndId(
+            tenantId, UUID.fromString(sessionId), UUID.fromString(dryRun.get("id").asText()))
+            .orElseThrow().inputFingerprint).matches("[0-9a-f]{64}");
+        assertThat(dryRunItems.findByTenantIdAndDryRunIdOrderByCreatedAtAsc(
+            tenantId, UUID.fromString(dryRun.get("id").asText()))).isNotEmpty();
         assertThat(products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)).hasSize(productCount);
         assertThat(salesInvoices.findByTenantId(tenantId)).hasSize(salesCount);
         assertThat(purchaseInvoices.findByTenantId(tenantId)).hasSize(purchaseCount);
@@ -496,7 +1357,7 @@ class SmartImportSessionIntegrationTest {
     }
 
     @Test
-    void transactionHistoryDryRunPreviewsPurchaseAndSaleMovements() throws Exception {
+    void transactionHistoryDefaultsToInvoiceOnlyUntilAnApplicableSnapshotExists() throws Exception {
         var token = register("smart-dry-run-history").get("accessToken").asText();
         var product = postJson(token, "/api/products", """
             {"sku":"HIST-A","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
@@ -516,7 +1377,8 @@ class SmartImportSessionIntegrationTest {
         assertThat(dryRun.get("strategy").asText()).isEqualTo("TRANSACTION_HISTORY");
         assertThat(dryRun.get("summary").get("purchaseInvoicesPreviewed").asInt()).isEqualTo(1);
         assertThat(dryRun.get("summary").get("salesInvoicesPreviewed").asInt()).isEqualTo(1);
-        assertThat(dryRun.get("summary").get("stockMovementsPreviewed").asInt()).isEqualTo(2);
+        assertThat(dryRun.get("summary").get("stockMovementsPreviewed").asInt()).isZero();
+        assertThat(dryRun.get("summary").get("stockMovementsSkippedDueToInvoiceOnly").asInt()).isEqualTo(2);
     }
 
     @Test
@@ -566,6 +1428,13 @@ class SmartImportSessionIntegrationTest {
         var second = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", "{\"strategy\":\"TRANSACTION_HISTORY\"}");
 
         assertThat(second.get("id").asText()).isNotEqualTo(first.get("id").asText());
+        assertThat(second.get("status").asText()).isEqualTo("COMPLETED");
+        assertThat(dryRuns.findById(UUID.fromString(first.get("id").asText()))).isEmpty();
+        assertThat(dryRunItems.findByTenantIdAndDryRunIdOrderByCreatedAtAsc(
+            tenantId, UUID.fromString(first.get("id").asText()))).isEmpty();
+        var persisted = getJson(token, "/api/import-sessions/" + sessionId + "/dry-run");
+        assertThat(persisted.get("id")).isEqualTo(second.get("id"));
+        assertThat(persisted.get("summary")).isEqualTo(second.get("summary"));
         assertThat(dryRuns.findFirstByTenantIdAndImportSessionIdOrderByStartedAtDesc(tenantId, UUID.fromString(sessionId))).isPresent();
         var itemPage = getJson(token, "/api/import-sessions/" + sessionId + "/dry-run/items?size=100");
         assertThat(itemPage.get("content").size()).isGreaterThan(0);
@@ -972,7 +1841,7 @@ class SmartImportSessionIntegrationTest {
     }
 
     @Test
-    void phase4B1RejectsStockAffectingVoucherMode() throws Exception {
+    void smartImportRejectsUnrestrictedHistoricalStockMovementMode() throws Exception {
         var registration = register("smart-commit-unsupported-mode");
         var token = registration.get("accessToken").asText();
         postJson(token, "/api/products", """
@@ -983,13 +1852,467 @@ class SmartImportSessionIntegrationTest {
         upload(token, sessionId, fixture("sales.xml"));
         postJson(token, "/api/import-sessions/" + sessionId + "/classify");
         postJson(token, "/api/import-sessions/" + sessionId + "/stage");
-        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run",
-            "{\"strategy\":\"TRANSACTION_HISTORY\",\"stockImpactMode\":\"CREATE_INVOICES_AND_STOCK_MOVEMENTS\"}");
-
-        mvc.perform(post("/api/import-sessions/{id}/commit", sessionId)
+        mvc.perform(post("/api/import-sessions/{id}/dry-run", sessionId)
                 .header("Authorization", "Bearer " + token)
-                .contentType(MediaType.APPLICATION_JSON).content(commitBody(dryRun.get("id").asText())))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"strategy\":\"TRANSACTION_HISTORY\",\"stockImpactMode\":\"CREATE_INVOICES_AND_STOCK_MOVEMENTS\"}"))
             .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void postSnapshotModeCommitsOnlyStrictlyLaterSalesAndPurchases() throws Exception {
+        var registration = register("smart-post-snapshot-commit");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var product = postJson(token, "/api/products", """
+            {"sku":"POST-SNAP-A","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        var warehouse = postJson(token, "/api/warehouses", "{\"name\":\"Main Location\",\"code\":\"POST-SNAP-WH\"}");
+        saveMovementAt(tenantId, product, warehouse, "100", java.time.Instant.parse("2026-06-29T12:00:00Z"));
+
+        var sessionId = createSession(token, "Post snapshot commit").get("id").asText();
+        upload(token, sessionId,
+            fixture("closing_stock_full_company.xml"),
+            fixture("sales.xml"),
+            fixture("sales_on_snapshot.xml"),
+            fixture("sales_after_snapshot.xml"),
+            fixture("purchase_after_snapshot.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {"strategy":"HYBRID_RECONCILIATION","stockImpactMode":"APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE","negativeStockPolicy":"BLOCK"}
+            """);
+
+        assertThat(dryRun.get("summary").get("salesStockMovementsPlanned").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("purchaseStockMovementsPlanned").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("voucherItemsCoveredBySnapshot").asInt()).isEqualTo(2);
+        assertThat(dryRun.get("summary").get("sameDateVoucherItemsDeferred").asInt()).isEqualTo(1);
+
+        var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+            commitBody(dryRun.get("id").asText()));
+
+        assertThat(committed.get("status").asText()).isEqualTo("COMMITTED");
+        assertThat(committed.get("summary").get("salesStockMovementsCreated").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("purchaseStockMovementsCreated").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("voucherItemsCoveredBySnapshot").asInt()).isEqualTo(2);
+        assertThat(stockMovements.currentStock(
+            tenantId, UUID.fromString(product.get("id").asText()), UUID.fromString(warehouse.get("id").asText())))
+            .isEqualByComparingTo("108");
+        var postSnapshotSale = salesInvoices
+            .findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, "S-POST-001")
+            .orElseThrow();
+        var postSnapshotSaleItem = salesInvoiceItems
+            .findByTenantIdAndSalesInvoiceId(tenantId, postSnapshotSale.id)
+            .getFirst();
+        assertThat(stockMovements.findByTenantIdAndReferenceTypeAndReferenceId(
+            tenantId, "SALES_INVOICE_ITEM", postSnapshotSaleItem.id)).singleElement()
+            .satisfies(movement -> {
+                assertThat(movement.movementType).isEqualTo(DomainEnums.MovementType.SALE);
+                assertThat(movement.sourceFingerprint).isNotBlank();
+                assertThat(movement.snapshotBaselineId).isNotNull();
+                assertThat(movement.decisionReason).isEqualTo("AFTER_SNAPSHOT");
+            });
+    }
+
+    @Test
+    void confirmedPhysicalReturnsAfterSnapshotCreateReturnInAndReturnOut() throws Exception {
+        var registration = register("smart-physical-returns");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var product = postJson(token, "/api/products", """
+            {"sku":"RETURN-A","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        var warehouse = postJson(token, "/api/warehouses",
+            "{\"name\":\"Main Location\",\"code\":\"RETURN-WH\"}");
+        postJson(token, "/api/customers", "{\"name\":\"Sample Customer\",\"creditLimit\":10000}");
+        postJson(token, "/api/suppliers", "{\"name\":\"Sample Supplier\",\"creditDays\":30}");
+        saveMovementAt(tenantId, product, warehouse, "100",
+            java.time.Instant.parse("2026-06-29T12:00:00Z"));
+
+        var sessionId = createSession(token, "Physical returns").get("id").asText();
+        upload(token, sessionId, fixture("closing_stock_full_company.xml"),
+            fixture("credit_return_after_snapshot.xml"), fixture("debit_return_after_snapshot.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        var staged = postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+
+        assertThat(staged.get("vouchers").findValuesAsText("returnClassification"))
+            .contains("PHYSICAL_SALES_RETURN", "PHYSICAL_PURCHASE_RETURN");
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {
+              "strategy":"HYBRID_RECONCILIATION",
+              "stockImpactMode":"CREATE_INVOICES_ONLY",
+              "returnStockImpactMode":"APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE",
+              "negativeStockPolicy":"BLOCK"
+            }
+            """);
+        assertThat(dryRun.get("summary").get("returnInMovementsPlanned").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("returnOutMovementsPlanned").asInt()).isEqualTo(1);
+
+        var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+            commitBody(dryRun.get("id").asText()));
+
+        assertThat(committed.get("status").asText()).isEqualTo("COMMITTED");
+        assertThat(committed.get("summary").get("returnInMovementsCreated").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("returnOutMovementsCreated").asInt()).isEqualTo(1);
+        assertThat(stockMovements.findByTenantIdAndProductIdOrderByMovementDateDesc(
+            tenantId, UUID.fromString(product.get("id").asText())).stream()
+            .filter(movement -> movement.movementType == DomainEnums.MovementType.RETURN_IN
+                || movement.movementType == DomainEnums.MovementType.RETURN_OUT))
+            .extracting(movement -> movement.movementType)
+            .containsExactlyInAnyOrder(DomainEnums.MovementType.RETURN_IN, DomainEnums.MovementType.RETURN_OUT);
+        assertThat(stockMovements.currentStock(
+            tenantId, UUID.fromString(product.get("id").asText()), UUID.fromString(warehouse.get("id").asText())))
+            .isEqualByComparingTo("99");
+
+        var repeatedSessionId = createSession(token, "Repeated physical returns").get("id").asText();
+        upload(token, repeatedSessionId, fixture("closing_stock_full_company.xml"),
+            fixture("credit_return_after_snapshot.xml"), fixture("debit_return_after_snapshot.xml"));
+        postJson(token, "/api/import-sessions/" + repeatedSessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + repeatedSessionId + "/stage");
+        var repeatedDryRun = postJson(token, "/api/import-sessions/" + repeatedSessionId + "/dry-run", """
+            {
+              "strategy":"HYBRID_RECONCILIATION",
+              "stockImpactMode":"CREATE_INVOICES_ONLY",
+              "returnStockImpactMode":"APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE",
+              "negativeStockPolicy":"BLOCK"
+            }
+            """);
+        var repeatedCommit = postJson(token, "/api/import-sessions/" + repeatedSessionId + "/commit",
+            commitBody(repeatedDryRun.get("id").asText()));
+
+        assertThat(repeatedCommit.get("summary").get("returnInMovementsCreated").asInt()).isZero();
+        assertThat(repeatedCommit.get("summary").get("returnOutMovementsCreated").asInt()).isZero();
+        assertThat(repeatedCommit.get("summary").get("duplicateReturnMovementsSkipped").asInt()).isEqualTo(2);
+        assertThat(stockMovements.findByTenantIdAndProductIdOrderByMovementDateDesc(
+            tenantId, UUID.fromString(product.get("id").asText())).stream()
+            .filter(movement -> movement.movementType == DomainEnums.MovementType.RETURN_IN
+                || movement.movementType == DomainEnums.MovementType.RETURN_OUT)).hasSize(2);
+    }
+
+    @Test
+    void returnStockEffectsOnOrBeforeSnapshotRemainFinancialOnly() throws Exception {
+        var registration = register("smart-covered-returns");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var product = postJson(token, "/api/products", """
+            {"sku":"RETURN-COVERED","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        var warehouse = postJson(token, "/api/warehouses",
+            "{\"name\":\"Main Location\",\"code\":\"RETURN-COVERED-WH\"}");
+        postJson(token, "/api/customers", "{\"name\":\"Sample Customer\",\"creditLimit\":10000}");
+        postJson(token, "/api/suppliers", "{\"name\":\"Sample Supplier\",\"creditDays\":30}");
+        saveMovementAt(tenantId, product, warehouse, "100",
+            java.time.Instant.parse("2026-06-29T12:00:00Z"));
+
+        var sessionId = createSession(token, "Covered physical returns").get("id").asText();
+        upload(token, sessionId, fixture("closing_stock_full_company.xml"),
+            fixture("credit_return_on_snapshot.xml"), fixture("debit_return_before_snapshot.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {
+              "strategy":"HYBRID_RECONCILIATION",
+              "stockImpactMode":"CREATE_INVOICES_ONLY",
+              "returnStockImpactMode":"APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE",
+              "negativeStockPolicy":"BLOCK"
+            }
+            """);
+
+        assertThat(dryRun.get("summary").get("returnInMovementsPlanned").asInt()).isZero();
+        assertThat(dryRun.get("summary").get("returnOutMovementsPlanned").asInt()).isZero();
+        assertThat(dryRun.get("summary").get("returnItemsCoveredBySnapshot").asInt()).isEqualTo(2);
+        assertThat(dryRun.get("summary").get("sameDateReturnItemsDeferred").asInt()).isEqualTo(1);
+
+        var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+            commitBody(dryRun.get("id").asText()));
+        assertThat(committed.get("summary").get("returnsCoveredBySnapshot").asInt()).isEqualTo(2);
+        assertThat(committed.get("summary").get("sameDateReturnsDeferred").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("stockMovementsCreatedFromReturns").asInt()).isZero();
+        assertThat(stockMovements.currentStock(
+            tenantId, UUID.fromString(product.get("id").asText()), UUID.fromString(warehouse.get("id").asText())))
+            .isEqualByComparingTo("100");
+    }
+
+    @Test
+    void ambiguousReturnRequiresTenantScopedConfirmedReviewAndBlocksCustomerUser() throws Exception {
+        var registration = register("smart-return-review");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var product = postJson(token, "/api/products", """
+            {"sku":"RETURN-REVIEW","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        var warehouse = postJson(token, "/api/warehouses",
+            "{\"name\":\"Return Counter\",\"code\":\"RETURN-REVIEW-WH\"}");
+        postJson(token, "/api/customers", "{\"name\":\"Sample Customer\",\"creditLimit\":10000}");
+        saveMovementAt(tenantId, product, warehouse, "100",
+            java.time.Instant.parse("2026-06-29T12:00:00Z"));
+
+        var sessionId = createSession(token, "Ambiguous return review").get("id").asText();
+        upload(token, sessionId, fixture("closing_stock_full_company.xml"), fixture("ambiguous_credit_return.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        var review = getJson(token, "/api/import-sessions/" + sessionId + "/return-review");
+        assertThat(review).hasSize(1);
+        var itemId = review.get(0).get("id").asText();
+
+        var customerToken = tokenForRole(tenantId, DomainEnums.Role.CUSTOMER_USER);
+        mvc.perform(get("/api/import-sessions/{id}/return-review", sessionId)
+                .header("Authorization", "Bearer " + customerToken))
+            .andExpect(status().isForbidden());
+
+        mvc.perform(post("/api/import-sessions/{id}/return-review/{itemId}/resolve", sessionId, itemId)
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                    {"action":"CONFIRM_PHYSICAL_SALES_RETURN","productId":"%s","warehouseId":"%s",
+                     "quantity":4,"disposition":"RESTOCK_TO_AVAILABLE","confirmation":"WRONG"}
+                    """.formatted(product.get("id").asText(), warehouse.get("id").asText())))
+            .andExpect(status().isBadRequest());
+
+        var other = register("smart-return-review-other");
+        var otherToken = other.get("accessToken").asText();
+        var otherProduct = postJson(otherToken, "/api/products", """
+            {"sku":"OTHER-RETURN","name":"Other Product","unitCode":"PCS","defaultPurchasePrice":1,"defaultSalesPrice":2,"reorderPoint":1}
+            """);
+        var otherWarehouse = postJson(otherToken, "/api/warehouses",
+            "{\"name\":\"Other Warehouse\",\"code\":\"OTHER-RETURN-WH\"}");
+        mvc.perform(post("/api/import-sessions/{id}/return-review/{itemId}/resolve", sessionId, itemId)
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                    {"action":"CONFIRM_PHYSICAL_SALES_RETURN","productId":"%s","warehouseId":"%s",
+                     "quantity":4,"disposition":"RESTOCK_TO_AVAILABLE","confirmation":"POST RETURN STOCK"}
+                    """.formatted(otherProduct.get("id").asText(), otherWarehouse.get("id").asText())))
+            .andExpect(status().isBadRequest());
+
+        postJson(token, "/api/import-sessions/" + sessionId + "/return-review/" + itemId + "/resolve", """
+            {"action":"CONFIRM_PHYSICAL_SALES_RETURN","productId":"%s","warehouseId":"%s",
+             "quantity":4,"disposition":"RESTOCK_TO_AVAILABLE","confirmation":"POST RETURN STOCK"}
+            """.formatted(product.get("id").asText(), warehouse.get("id").asText()));
+        assertThat(getJson(token, "/api/import-sessions/" + sessionId + "/return-review")).isEmpty();
+
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {
+              "strategy":"HYBRID_RECONCILIATION",
+              "stockImpactMode":"CREATE_INVOICES_ONLY",
+              "returnStockImpactMode":"APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE",
+              "negativeStockPolicy":"BLOCK"
+            }
+            """);
+        assertThat(dryRun.get("summary").get("returnInMovementsPlanned").asInt()).isEqualTo(1);
+        var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+            commitBody(dryRun.get("id").asText()));
+        assertThat(committed.get("summary").get("returnItemsResolvedManually").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("returnInMovementsCreated").asInt()).isEqualTo(1);
+    }
+
+    @Test
+    void purchaseReturnNegativeStockCanBeBlockedOrFinanciallyCommittedWithMovementSkipped() throws Exception {
+        var registration = register("smart-negative-return");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var product = postJson(token, "/api/products", """
+            {"sku":"RETURN-NEGATIVE","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        var warehouse = postJson(token, "/api/warehouses",
+            "{\"name\":\"Main Location\",\"code\":\"RETURN-NEGATIVE-WH\"}");
+        postJson(token, "/api/suppliers", "{\"name\":\"Sample Supplier\",\"creditDays\":30}");
+        saveMovementAt(tenantId, product, warehouse, "100",
+            java.time.Instant.parse("2026-06-29T12:00:00Z"));
+
+        var sessionId = createSession(token, "Negative purchase return").get("id").asText();
+        upload(token, sessionId, fixture("closing_stock_full_company.xml"), fixture("debit_return_negative_stock.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        var blocked = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {
+              "strategy":"HYBRID_RECONCILIATION",
+              "stockImpactMode":"CREATE_INVOICES_ONLY",
+              "returnStockImpactMode":"APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE",
+              "negativeStockPolicy":"BLOCK"
+            }
+            """);
+        assertThat(blocked.get("summary").get("returnMovementsBlockedByNegativeStock").asInt()).isEqualTo(1);
+        assertThat(blocked.get("summary").get("blockingErrors").asInt()).isGreaterThan(0);
+
+        var skipped = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {
+              "strategy":"HYBRID_RECONCILIATION",
+              "stockImpactMode":"CREATE_INVOICES_ONLY",
+              "returnStockImpactMode":"APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE",
+              "negativeStockPolicy":"SKIP_STOCK_MOVEMENT"
+            }
+            """);
+        assertThat(skipped.get("summary").get("blockingErrors").asInt()).isZero();
+        var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+            commitBody(skipped.get("id").asText()));
+        assertThat(committed.get("summary").get("debitNotesCreated").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("negativeStockReturnMovementsSkipped").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("returnOutMovementsCreated").asInt()).isZero();
+        assertThat(stockMovements.currentStock(
+            tenantId, UUID.fromString(product.get("id").asText()), UUID.fromString(warehouse.get("id").asText())))
+            .isEqualByComparingTo("100");
+    }
+
+    @Test
+    void postSnapshotModeBlocksWhenNoApplicableSnapshotExists() throws Exception {
+        var registration = register("smart-post-snapshot-missing");
+        var token = registration.get("accessToken").asText();
+        postJson(token, "/api/products", """
+            {"sku":"NO-SNAPSHOT-A","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        postJson(token, "/api/warehouses", "{\"name\":\"Main Location\",\"code\":\"NO-SNAPSHOT-WH\"}");
+        var sessionId = createSession(token, "Missing snapshot").get("id").asText();
+        upload(token, sessionId, fixture("sales_after_snapshot.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {"strategy":"TRANSACTION_HISTORY","stockImpactMode":"APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE"}
+            """);
+
+        assertThat(dryRun.get("summary").get("voucherItemsWithoutSnapshot").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("blockingErrors").asInt()).isEqualTo(1);
+        var items = getJson(token,
+            "/api/import-sessions/" + sessionId + "/dry-run/items?itemType=STOCK_MOVEMENT");
+        assertThat(items.get("content").get(0).get("errorCode").asText())
+            .isEqualTo("NO_APPLICABLE_STOCK_SNAPSHOT");
+    }
+
+    @Test
+    void postSnapshotModeBlocksUnreviewedVoucherWarehouse() throws Exception {
+        var registration = register("smart-post-snapshot-warehouse-review");
+        var token = registration.get("accessToken").asText();
+        postJson(token, "/api/products", """
+            {"sku":"WAREHOUSE-REVIEW-A","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        postJson(token, "/api/warehouses",
+            "{\"name\":\"Snapshot Warehouse\",\"code\":\"SNAPSHOT-ONLY-WH\"}");
+        var sessionId = createSession(token, "Unreviewed voucher warehouse").get("id").asText();
+        upload(token, sessionId, fixture("closing_stock_full_company.xml"), fixture("sales_after_snapshot.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {"strategy":"HYBRID_RECONCILIATION","stockImpactMode":"APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE"}
+            """);
+
+        assertThat(dryRun.get("summary").get("voucherItemsBlockedByWarehouse").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("blockingErrors").asInt()).isGreaterThanOrEqualTo(1);
+        var items = getJson(token,
+            "/api/import-sessions/" + sessionId + "/dry-run/items?itemType=STOCK_MOVEMENT");
+        assertThat(items.get("content").get(0).get("errorCode").asText())
+            .isEqualTo("UNRESOLVED_VOUCHER_WAREHOUSE");
+    }
+
+    @Test
+    void postSnapshotSkipNegativePolicyCreatesInvoiceWithoutMovement() throws Exception {
+        var registration = register("smart-post-snapshot-negative-skip");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var product = postJson(token, "/api/products", """
+            {"sku":"POST-NEG-SKIP","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        var warehouse = postJson(token, "/api/warehouses",
+            "{\"name\":\"Main Location\",\"code\":\"POST-NEG-SKIP-WH\"}");
+        var sessionId = createSession(token, "Post snapshot negative skip").get("id").asText();
+        upload(token, sessionId, fixture("closing_stock_zero.xml"), fixture("sales_after_snapshot.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {"strategy":"HYBRID_RECONCILIATION","stockImpactMode":"APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE","negativeStockPolicy":"SKIP_STOCK_MOVEMENT"}
+            """);
+
+        assertThat(dryRun.get("summary").get("movementsSkippedByPolicy").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("blockingErrors").asInt()).isZero();
+        var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+            commitBody(dryRun.get("id").asText()));
+
+        assertThat(committed.get("status").asText()).isEqualTo("COMMITTED");
+        assertThat(committed.get("summary").get("salesInvoicesCreated").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("negativeStockMovementsSkipped").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("salesStockMovementsCreated").asInt()).isZero();
+        assertThat(stockMovements.currentStock(
+            tenantId, UUID.fromString(product.get("id").asText()), UUID.fromString(warehouse.get("id").asText())))
+            .isEqualByComparingTo("0");
+    }
+
+    @Test
+    void stockChangeAfterDryRunRollsBackPostSnapshotInvoiceAndMovement() throws Exception {
+        var registration = register("smart-post-snapshot-stale-stock");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var product = postJson(token, "/api/products", """
+            {"sku":"POST-STALE-A","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        var warehouse = postJson(token, "/api/warehouses",
+            "{\"name\":\"Main Location\",\"code\":\"POST-STALE-WH\"}");
+        saveMovementAt(tenantId, product, warehouse, "100",
+            java.time.Instant.parse("2026-06-29T12:00:00Z"));
+        var sessionId = createSession(token, "Stale stock assumption").get("id").asText();
+        upload(token, sessionId, fixture("closing_stock_full_company.xml"), fixture("sales_after_snapshot.xml"));
+        postJson(token, "/api/import-sessions/" + sessionId + "/classify");
+        postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", """
+            {"strategy":"HYBRID_RECONCILIATION","stockImpactMode":"APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE"}
+            """);
+        saveMovementAt(tenantId, product, warehouse, "1",
+            java.time.Instant.parse("2026-07-01T12:00:00Z"));
+
+        var failed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+            commitBody(dryRun.get("id").asText()));
+
+        assertThat(failed.get("status").asText()).isEqualTo("FAILED");
+        assertThat(failed.get("summary").get("transactionRolledBack").asBoolean()).isTrue();
+        assertThat(salesInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, "S-POST-001")).isEmpty();
+        assertThat(stockMovements.currentStock(
+            tenantId, UUID.fromString(product.get("id").asText()), UUID.fromString(warehouse.get("id").asText())))
+            .isEqualByComparingTo("101");
+    }
+
+    @Test
+    void repeatedPostSnapshotUploadInNewSessionDoesNotDuplicateStockEffect() throws Exception {
+        var registration = register("smart-post-snapshot-replay");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var product = postJson(token, "/api/products", """
+            {"sku":"POST-REPLAY-A","name":"Sample Item A","unitCode":"PCS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        var warehouse = postJson(token, "/api/warehouses",
+            "{\"name\":\"Main Location\",\"code\":\"POST-REPLAY-WH\"}");
+        saveMovementAt(tenantId, product, warehouse, "100",
+            java.time.Instant.parse("2026-06-29T12:00:00Z"));
+
+        var firstSession = createSession(token, "First post snapshot upload").get("id").asText();
+        upload(token, firstSession, fixture("closing_stock_full_company.xml"), fixture("sales_after_snapshot.xml"));
+        postJson(token, "/api/import-sessions/" + firstSession + "/classify");
+        postJson(token, "/api/import-sessions/" + firstSession + "/stage");
+        var firstDryRun = postJson(token, "/api/import-sessions/" + firstSession + "/dry-run", """
+            {"strategy":"HYBRID_RECONCILIATION","stockImpactMode":"APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE"}
+            """);
+        var firstCommit = postJson(token, "/api/import-sessions/" + firstSession + "/commit",
+            commitBody(firstDryRun.get("id").asText()));
+        assertThat(firstCommit.get("summary").get("salesStockMovementsCreated").asInt()).isEqualTo(1);
+
+        var secondSession = createSession(token, "Repeated post snapshot upload").get("id").asText();
+        upload(token, secondSession, fixture("closing_stock_full_company.xml"), fixture("sales_after_snapshot.xml"));
+        postJson(token, "/api/import-sessions/" + secondSession + "/classify");
+        postJson(token, "/api/import-sessions/" + secondSession + "/stage");
+        var secondDryRun = postJson(token, "/api/import-sessions/" + secondSession + "/dry-run", """
+            {"strategy":"HYBRID_RECONCILIATION","stockImpactMode":"APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE"}
+            """);
+        var secondCommit = postJson(token, "/api/import-sessions/" + secondSession + "/commit",
+            commitBody(secondDryRun.get("id").asText()));
+
+        assertThat(secondCommit.get("summary").get("duplicateSalesVouchersSkipped").asInt()).isEqualTo(1);
+        assertThat(secondCommit.get("summary").get("salesStockMovementsCreated").asInt()).isZero();
+        assertThat(stockMovements.findByTenantIdAndProductIdOrderByMovementDateDesc(
+            tenantId, UUID.fromString(product.get("id").asText())).stream()
+            .filter(movement -> movement.movementType == DomainEnums.MovementType.SALE))
+            .singleElement();
+        assertThat(stockMovements.currentStock(
+            tenantId, UUID.fromString(product.get("id").asText()), UUID.fromString(warehouse.get("id").asText())))
+            .isEqualByComparingTo("98");
     }
 
     @Test
@@ -1223,6 +2546,12 @@ class SmartImportSessionIntegrationTest {
         var workspace = postJson(token, "/api/import-sessions/" + sessionId + "/stage");
         assertThat(workspace.get("cashbookEntries").findValuesAsText("cashbookMatchStatus"))
             .containsExactlyInAnyOrder("MATCHED_SALES_INVOICE", "MATCHED_PURCHASE_INVOICE");
+        // A payment's bank reference need not equal its matched invoice number.
+        var matchedRows = stagedCashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(
+            tenantId, UUID.fromString(sessionId));
+        assertThat(matchedRows).allSatisfy(row -> assertThat(row.matchedStagedVoucherId).isNotNull());
+        matchedRows.forEach(row -> row.referenceNumber = "BANK-TRANSACTION-" + row.sourceRowNumber);
+        stagedCashbook.saveAllAndFlush(matchedRows);
         var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run",
             "{\"stockImpactMode\":\"CREATE_INVOICES_ONLY\"}");
         assertThat(dryRun.get("summary").get("cashbookRowsReady").asInt()).isEqualTo(2);
@@ -1255,18 +2584,43 @@ class SmartImportSessionIntegrationTest {
         var workspace = postJson(token, "/api/import-sessions/" + sessionId + "/stage");
         assertThat(workspace.get("cashbookEntries").get(0).get("cashbookMatchStatus").asText())
             .isEqualTo("UNMATCHED_REVIEW");
+        // Simulate a persisted ready label written by the old number-only matcher.
+        var legacy = stagedCashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(
+            tenantId, UUID.fromString(sessionId)).getFirst();
+        legacy.cashbookMatchStatus = DomainEnums.CashbookMatchStatus.MATCHED_SALES_INVOICE;
+        legacy.matchedPartyType = DomainEnums.SmartPartyType.CUSTOMER;
+        legacy.reviewStatus = DomainEnums.SmartReviewStatus.AUTO_RESOLVED;
+        stagedCashbook.saveAndFlush(legacy);
         var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run",
             "{\"strategy\":\"TRANSACTION_HISTORY\"}");
         assertThat(dryRun.get("summary").get("reviewRequiredCount").asInt()).isZero();
+        assertThat(dryRun.get("summary").get("cashbookRowsReady").asInt()).isZero();
+        assertThat(getJson(token, "/api/import-sessions/" + sessionId + "/cashbook-review")).hasSize(1);
         var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
             commitBody(dryRun.get("id").asText()));
 
         assertThat(committed.get("summary").get("cashbookRowsUnmatched").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("warnings").asInt()).isEqualTo(1);
+        assertThat(committed.get("summary").get("cashbookMessage").asText()).contains("1 cashbook rows were not posted");
         assertThat(committed.get("summary").get("customerPaymentsCreated").asInt()).isZero();
         assertThat(stagedCashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(
             tenantId, UUID.fromString(sessionId))).hasSize(1);
         assertThat(auditLogs.findByTenantIdOrderByCreatedAtDesc(tenantId).stream().map(log -> log.action))
             .contains("SMART_IMPORT_CASHBOOK_REVIEW_REQUIRED");
+        legacy = stagedCashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(
+            tenantId, UUID.fromString(sessionId)).getFirst();
+        legacy.cashbookMatchStatus = DomainEnums.CashbookMatchStatus.MATCHED_SALES_INVOICE;
+        legacy.reviewStatus = DomainEnums.SmartReviewStatus.AUTO_RESOLVED;
+        stagedCashbook.saveAndFlush(legacy);
+        var rechecked = postJson(token, "/api/import-sessions/" + sessionId + "/cashbook-review/recheck");
+        assertThat(rechecked.get("unpostedReviewCount").asInt()).isEqualTo(1);
+        assertThat(rechecked.get("businessRecordsChanged").asInt()).isZero();
+        assertThat(getJson(token, "/api/import-sessions/" + sessionId + "/cashbook-review")).hasSize(1);
+        postJson(token, "/api/import-sessions/" + sessionId + "/cashbook-review/" + legacy.id + "/resolve",
+            "{\"action\":\"IGNORE\",\"note\":\"Expense, not a customer payment\"}");
+        rechecked = postJson(token, "/api/import-sessions/" + sessionId + "/cashbook-review/recheck");
+        assertThat(rechecked.get("unpostedReviewCount").asInt()).isZero();
+        assertThat(customerPayments.countByTenantIdAndSourceImportSessionId(tenantId, UUID.fromString(sessionId))).isZero();
     }
 
     @Test
@@ -1418,6 +2772,10 @@ class SmartImportSessionIntegrationTest {
         var otherToken = register("cashbook-review-other-tenant").get("accessToken").asText();
         var customerToken = tokenForRole(tenantId, DomainEnums.Role.CUSTOMER_USER);
 
+        mvc.perform(post("/api/import-sessions/{id}/cashbook-review/recheck", sessionId)
+            .header("Authorization", "Bearer " + otherToken)).andExpect(status().isNotFound());
+        mvc.perform(post("/api/import-sessions/{id}/cashbook-review/recheck", sessionId)
+            .header("Authorization", "Bearer " + customerToken)).andExpect(status().isForbidden());
         mvc.perform(get("/api/import-sessions/{id}/cashbook-review", sessionId)
                 .header("Authorization", "Bearer " + otherToken)).andExpect(status().isNotFound());
         mvc.perform(post("/api/import-sessions/{id}/cashbook-review/{entryId}/resolve", sessionId, entryId)
@@ -1448,6 +2806,309 @@ class SmartImportSessionIntegrationTest {
         assertThat(auditLogs.findByTenantIdOrderByCreatedAtDesc(tenantId).stream().map(log -> log.action))
             .contains("CASHBOOK_ENTRY_IGNORED");
     }
+
+    @Test
+    void zeroValueRateResolutionSupportsExactBulkPreviewAndSurvivesRebuild() throws Exception {
+        var registration = register("rate-review-zero-bulk");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var workspace = uploadClassifyAndStage(token, "Zero value review", fixture("voucher_rate_review.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+        var issue = findRateIssue(workspace, "S-FREE-1");
+
+        var preview = postJson(token, "/api/import-sessions/" + sessionId + "/rate-review/bulk/preview", """
+            {"sourceIssueId":"%s","action":"CONFIRM_ZERO_VALUE"}
+            """.formatted(issue.get("id").asText()));
+        assertThat(preview.get("matchingRows").asInt()).isEqualTo(2);
+        assertThat(preview.get("matchingVouchers").asInt()).isEqualTo(2);
+        assertThat(preview.get("confirmation").asText()).isEqualTo("APPLY TO 2 MATCHING ROWS");
+
+        mvc.perform(post("/api/import-sessions/{id}/rate-review/bulk/resolve", sessionId)
+                .header("Authorization", "Bearer " + token).contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                    {"sourceIssueId":"%s","action":"CONFIRM_ZERO_VALUE","expectedCount":2,"confirmation":"APPLY TO 1 MATCHING ROWS"}
+                    """.formatted(issue.get("id").asText())))
+            .andExpect(status().isBadRequest());
+
+        var resolved = postJson(token, "/api/import-sessions/" + sessionId + "/rate-review/bulk/resolve", """
+            {"sourceIssueId":"%s","action":"CONFIRM_ZERO_VALUE","expectedCount":2,"confirmation":"APPLY TO 2 MATCHING ROWS"}
+            """.formatted(issue.get("id").asText()));
+        assertThat(rateIssuesForProduct(resolved, "Free Sample Pen")).isZero();
+        assertThat(resolved.get("voucherItems").findValuesAsText("rateSource").stream()
+            .filter("USER_CONFIRMED_ZERO_VALUE"::equals).count()).isEqualTo(2);
+
+        var rebuilt = postJson(token, "/api/import-sessions/" + sessionId + "/rebuild");
+        assertThat(rateIssuesForProduct(rebuilt, "Free Sample Pen")).isZero();
+        assertThat(auditLogs.findByTenantIdOrderByCreatedAtDesc(tenantId).stream().map(log -> log.action))
+            .contains("SMART_IMPORT_RATE_REVIEW_BULK_RESOLVED");
+    }
+
+    @Test
+    void deriveVerifiedAndKeepUnresolvedRateActionsValidateSourceEvidence() throws Exception {
+        var registration = register("rate-review-derived-manual");
+        var token = registration.get("accessToken").asText();
+        var workspace = uploadClassifyAndStage(token, "Derived and manual rates", fixture("voucher_rate_review.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+
+        var derivedIssue = findRateIssue(workspace, "S-DERIVE-1");
+        var afterDerive = postJson(token, "/api/import-sessions/" + sessionId + "/rate-review/"
+            + derivedIssue.get("id").asText() + "/resolve", """
+            {"action":"DERIVE_RATE","confirmation":"DERIVE RATE"}
+            """);
+        var derivedItem = findVoucherItem(afterDerive, "Derived Rate Item");
+        assertThat(derivedItem.get("rate").decimalValue()).isEqualByComparingTo("100");
+        assertThat(derivedItem.get("rateSource").asText()).isEqualTo("USER_DERIVED_FROM_AMOUNT");
+        assertThat(derivedItem.get("id")).isEqualTo(findVoucherItem(workspace, "Derived Rate Item").get("id"));
+
+        var manualIssue = findRateIssue(afterDerive, "P-MANUAL-1");
+        mvc.perform(post("/api/import-sessions/{id}/rate-review/{issueId}/resolve", sessionId,
+                manualIssue.get("id").asText()).header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).content("""
+                    {"action":"ENTER_VERIFIED_RATE","verifiedRate":42.50,"reason":"","confirmation":"APPLY VERIFIED RATE"}
+                    """))
+            .andExpect(status().isBadRequest());
+
+        var kept = postJson(token, "/api/import-sessions/" + sessionId + "/rate-review/"
+            + manualIssue.get("id").asText() + "/resolve", "{\"action\":\"KEEP_UNRESOLVED\"}");
+        assertThat(findRateIssue(kept, "P-MANUAL-1")).isNotNull();
+
+        var afterManual = postJson(token, "/api/import-sessions/" + sessionId + "/rate-review/"
+            + manualIssue.get("id").asText() + "/resolve", """
+            {"action":"ENTER_VERIFIED_RATE","verifiedRate":42.50,"reason":"Checked original Tally purchase voucher","confirmation":"APPLY VERIFIED RATE"}
+            """);
+        var manualItem = findVoucherItem(afterManual, "Verified Rate Item");
+        assertThat(manualItem.get("rate").decimalValue()).isEqualByComparingTo("42.5");
+        assertThat(manualItem.get("rateSource").asText()).isEqualTo("USER_VERIFIED_RATE");
+        assertThat(manualItem.get("id")).isEqualTo(findVoucherItem(workspace, "Verified Rate Item").get("id"));
+        assertThat(rateIssuesForProduct(afterManual, "Verified Rate Item")).isZero();
+        var updatedVoucher = stagedVouchers.findById(UUID.fromString(manualItem.get("voucherId").asText())).orElseThrow();
+        assertThat(updatedVoucher.totalAmount).isEqualByComparingTo("170");
+        var rebuilt = postJson(token, "/api/import-sessions/" + sessionId + "/rebuild");
+        assertThat(findVoucherItem(rebuilt, "Verified Rate Item").get("rate").decimalValue()).isEqualByComparingTo("42.5");
+    }
+
+    @Test
+    void bulkVerifiedRatesUpdateMultipleLinesPerVoucherWithoutRestagingAndInvalidateDryRun() throws Exception {
+        var token = register("verified-rate-bulk").get("accessToken").asText();
+        var workspace = uploadClassifyAndStage(token, "Bulk verified rates", fixture("verified_rate_bulk.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+        var issueId = findRateIssue(workspace, "RATE-1").get("id").asText();
+        postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", "{\"strategy\":\"TRANSACTION_HISTORY\"}");
+        var preview = postJson(token, "/api/import-sessions/" + sessionId + "/rate-review/bulk/preview", """
+            {"sourceIssueId":"%s","action":"ENTER_VERIFIED_RATE","verifiedRate":7.80}
+            """.formatted(issueId));
+        assertThat(preview.get("matchingRows").asInt()).isEqualTo(3);
+        assertThat(preview.get("matchingVouchers").asInt()).isEqualTo(2);
+        var resolved = postJson(token, "/api/import-sessions/" + sessionId + "/rate-review/bulk/resolve", """
+            {"sourceIssueId":"%s","action":"ENTER_VERIFIED_RATE","verifiedRate":7.80,
+             "reason":"Verified against original Tally vouchers","expectedCount":3,"confirmation":"APPLY TO 3 MATCHING ROWS"}
+            """.formatted(issueId));
+        assertThat(rateIssuesForProduct(resolved, "Rate Pen")).isZero();
+        assertThat(resolved.get("voucherItems").findValuesAsText("id")).containsExactlyElementsOf(workspace.get("voucherItems").findValuesAsText("id"));
+        for (var item : resolved.get("voucherItems")) {
+            assertThat(item.get("rate").decimalValue()).isEqualByComparingTo("7.8");
+            assertThat(item.get("rateSource").asText()).isEqualTo("USER_VERIFIED_RATE");
+        }
+        for (var voucher : resolved.get("vouchers")) {
+            assertThat(voucher.get("totalAmount").decimalValue()).isEqualByComparingTo(
+                "RATE-1".equals(voucher.get("voucherNumber").asText()) ? "39" : "31.2");
+        }
+        assertThat(getJson(token, "/api/import-sessions/" + sessionId + "/dry-run").path("available").asBoolean()).isFalse();
+        var reloaded = getJson(token, "/api/import-sessions/" + sessionId + "/staging");
+        assertThat(rateIssuesForProduct(reloaded, "Rate Pen")).isZero();
+        var rebuilt = postJson(token, "/api/import-sessions/" + sessionId + "/rebuild");
+        assertThat(rateIssuesForProduct(rebuilt, "Rate Pen")).isZero();
+        for (var voucher : rebuilt.get("vouchers")) {
+            assertThat(voucher.get("totalAmount").decimalValue()).isEqualByComparingTo(
+                "RATE-1".equals(voucher.get("voucherNumber").asText()) ? "39" : "31.2");
+        }
+    }
+
+    @Test
+    void amountOnlyDebitNoteCanBeReviewedAndCommittedAsFinancialAdjustment() throws Exception {
+        var registration = register("rate-review-financial-adjustment");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var beforeProducts = products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId).size();
+        var workspace = uploadClassifyAndStage(token, "Amount-only note", fixture("amount_only_debit_note.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+        var issue = findRateIssue(workspace, "DN-6");
+
+        var resolved = postJson(token, "/api/import-sessions/" + sessionId + "/rate-review/"
+            + issue.get("id").asText() + "/resolve", """
+            {"action":"TREAT_AS_FINANCIAL_ADJUSTMENT","reason":"Advance discount has no inventory quantity","confirmation":"TREAT AS FINANCIAL ADJUSTMENT"}
+            """);
+        assertThat(resolved.get("summary").get("voucherItemsStaged").asInt()).isZero();
+        assertThat(resolved.get("summary").get("productsStaged").asInt()).isZero();
+
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run",
+            "{\"strategy\":\"TRANSACTION_HISTORY\",\"returnStockImpactMode\":\"FINANCIAL_ONLY\"}");
+        assertThat(dryRun.get("summary").get("blockingErrors").asInt()).isZero();
+        var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+            commitBody(dryRun.get("id").asText()));
+        assertThat(committed.get("summary").get("financialAdjustmentLinesResolved").asInt()).isEqualTo(1);
+        assertThat(financialAdjustments.findByTenantIdOrderByVoucherDateDesc(tenantId)).singleElement()
+            .satisfies(note -> {
+                assertThat(note.adjustmentType).isEqualTo(DomainEnums.FinancialAdjustmentType.DEBIT_NOTE);
+                assertThat(note.totalAmount).isEqualByComparingTo("153.60");
+            });
+        assertThat(products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)).hasSize(beforeProducts);
+        assertThat(stockMovements.findAll().stream().filter(row -> tenantId.equals(row.tenantId))).isEmpty();
+    }
+
+    @Test
+    void excludedRateVoucherIsSkippedWithoutCreatingBusinessRecords() throws Exception {
+        var registration = register("rate-review-exclude");
+        var token = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var workspace = uploadClassifyAndStage(token, "Excluded rate voucher", fixture("excluded_invalid_rate_sale.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+        var issue = findRateIssue(workspace, "S-EXCLUDE-1");
+
+        var resolved = postJson(token, "/api/import-sessions/" + sessionId + "/rate-review/"
+            + issue.get("id").asText() + "/resolve", """
+            {"action":"EXCLUDE_VOUCHER","reason":"Source voucher requires correction","confirmation":"EXCLUDE VOUCHER"}
+            """);
+        assertThat(resolved.get("vouchers").get(0).get("id")).isEqualTo(workspace.get("vouchers").get(0).get("id"));
+        assertThat(rateIssuesForProduct(resolved, "Unknown Price Item")).isZero();
+        assertThat(resolved.get("summary").get("voucherItemsStaged").asInt()).isZero();
+        assertThat(resolved.get("summary").get("productsStaged").asInt()).isZero();
+
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run",
+            "{\"strategy\":\"TRANSACTION_HISTORY\"}");
+        assertThat(dryRun.get("summary").get("vouchersExcludedByUser").asInt()).isEqualTo(1);
+        var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit",
+            commitBody(dryRun.get("id").asText()));
+        assertThat(committed.get("summary").get("vouchersExcludedByUser").asInt()).isEqualTo(1);
+        assertThat(salesInvoices.findAll().stream().filter(row -> tenantId.equals(row.tenantId))).isEmpty();
+        assertThat(products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)).isEmpty();
+    }
+
+    @Test
+    void bulkExclusionClearsAllVoucherErrorsWithoutRestagingAndPreservesSharedCandidates() throws Exception {
+        var registration = register("rate-bulk-exclusion");
+        var token = registration.get("accessToken").asText();
+        var workspace = uploadClassifyAndStage(token, "Bulk exclusion", fixture("bulk_excluded_rate_vouchers.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+        var issueId = findRateIssue(workspace, "BULK-1").get("id").asText();
+        var untouchedIssueId = findRateIssue(workspace, "RETAIN-2").get("id").asText();
+        postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", "{\"strategy\":\"TRANSACTION_HISTORY\"}");
+        var preview = postJson(token, "/api/import-sessions/" + sessionId + "/rate-review/bulk/preview", """
+            {"sourceIssueId":"%s","action":"EXCLUDE_VOUCHER"}
+            """.formatted(issueId));
+        assertThat(preview.get("matchingRows").asInt()).isEqualTo(2);
+        var resolved = postJson(token, "/api/import-sessions/" + sessionId + "/rate-review/bulk/resolve", """
+            {"sourceIssueId":"%s","action":"EXCLUDE_VOUCHER","reason":"Checked source vouchers",
+             "expectedCount":2,"confirmation":"APPLY TO 2 MATCHING ROWS"}
+            """.formatted(issueId));
+        assertThat(rateIssuesForProduct(resolved, "Shared Item")).isZero();
+        assertThat(rateIssuesForProduct(resolved, "Excluded Only Item")).isZero();
+        assertThat(findRateIssue(resolved, "RETAIN-2").get("id").asText()).isEqualTo(untouchedIssueId);
+        assertThat(resolved.get("vouchers").findValuesAsText("id")).containsExactlyElementsOf(workspace.get("vouchers").findValuesAsText("id"));
+        assertThat(resolved.get("products").findValuesAsText("name")).contains("Shared Item").doesNotContain("Excluded Only Item");
+        assertThat(resolved.get("parties").findValuesAsText("name")).contains("Shared Customer").doesNotContain("Excluded Customer");
+        assertThat(getJson(token, "/api/import-sessions/" + sessionId + "/dry-run").path("available").asBoolean()).isFalse();
+        var reloaded = getJson(token, "/api/import-sessions/" + sessionId + "/staging");
+        assertThat(rateIssuesForProduct(reloaded, "Shared Item")).isZero();
+        var rebuilt = postJson(token, "/api/import-sessions/" + sessionId + "/rebuild", "{}");
+        assertThat(rateIssuesForProduct(rebuilt, "Shared Item")).isZero();
+        assertThat(rateIssuesForProduct(rebuilt, "Excluded Only Item")).isZero();
+        assertThat(findRateIssue(rebuilt, "RETAIN-2")).isNotNull();
+        var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run", "{\"strategy\":\"TRANSACTION_HISTORY\"}");
+        assertThat(dryRun.get("summary").get("vouchersExcludedByUser").asInt()).isEqualTo(2);
+    }
+
+    @Test
+    void rateReviewEndpointsAreTenantScopedAndCustomerUserBlocked() throws Exception {
+        var registration = register("rate-review-security");
+        var ownerToken = registration.get("accessToken").asText();
+        var tenantId = UUID.fromString(registration.get("tenantId").asText());
+        var workspace = uploadClassifyAndStage(ownerToken, "Secure rate review", fixture("excluded_invalid_rate_sale.xml"));
+        var sessionId = workspace.get("testSessionId").asText();
+        var issueId = findRateIssue(workspace, "S-EXCLUDE-1").get("id").asText();
+        var body = "{\"action\":\"KEEP_UNRESOLVED\"}";
+        var otherToken = register("rate-review-other-tenant").get("accessToken").asText();
+        var customerToken = tokenForRole(tenantId, DomainEnums.Role.CUSTOMER_USER);
+
+        mvc.perform(post("/api/import-sessions/{id}/rate-review/{issueId}/resolve", sessionId, issueId)
+                .header("Authorization", "Bearer " + otherToken).contentType(MediaType.APPLICATION_JSON).content(body))
+            .andExpect(status().isNotFound());
+        mvc.perform(post("/api/import-sessions/{id}/rate-review/{issueId}/resolve", sessionId, issueId)
+                .header("Authorization", "Bearer " + customerToken).contentType(MediaType.APPLICATION_JSON).content(body))
+            .andExpect(status().isForbidden());
+    }
+
+    private JsonNode findRateIssue(JsonNode workspace, String voucherNumber) {
+        for (var issue : workspace.get("reviewItems")) {
+            if (!("INVALID_RATE".equals(issue.get("code").asText())
+                || "ZERO_RATE_ITEM".equals(issue.get("code").asText()))) continue;
+            if (voucherNumber.equals(issue.path("context").path("voucherNumber").asText())) return issue;
+        }
+        throw new AssertionError("Rate review issue not found for voucher " + voucherNumber);
+    }
+
+    private int rateIssuesForProduct(JsonNode workspace, String productName) {
+        var count = 0;
+        for (var issue : workspace.get("reviewItems")) {
+            if (("INVALID_RATE".equals(issue.get("code").asText())
+                || "ZERO_RATE_ITEM".equals(issue.get("code").asText()))
+                && productName.equals(issue.path("context").path("productName").asText())) count++;
+        }
+        return count;
+    }
+
+    private JsonNode findVoucherItem(JsonNode workspace, String productName) {
+        for (var item : workspace.get("voucherItems")) {
+            if (productName.equals(item.path("productName").asText())) return item;
+        }
+        throw new AssertionError("Voucher item not found for " + productName);
+    }
+
+    private TransferInventory createTransferInventory(String token, UUID tenantId) throws Exception {
+        var product = postJson(token, "/api/products", """
+            {"sku":"TRANSFER-001","name":"Transfer Product","unitCode":"NOS","defaultPurchasePrice":10,"defaultSalesPrice":15,"reorderPoint":5}
+            """);
+        var source = postJson(token, "/api/warehouses", "{\"name\":\"Warehouse East\",\"code\":\"WH-EAST\"}");
+        var destination = postJson(token, "/api/warehouses", "{\"name\":\"Warehouse West\",\"code\":\"WH-WEST\"}");
+        saveMovementAt(tenantId, product, source, "100", java.time.Instant.parse("2026-03-30T12:00:00Z"));
+        saveMovementAt(tenantId, product, destination, "40", java.time.Instant.parse("2026-03-30T12:00:00Z"));
+        saveTransferBaseline(tenantId, product, source, "100");
+        saveTransferBaseline(tenantId, product, destination, "40");
+        return new TransferInventory(product, source, destination);
+    }
+
+    private void saveTransferBaseline(UUID tenantId, JsonNode product, JsonNode warehouse, String quantity) {
+        var baseline = new StockSnapshotBaseline();
+        baseline.tenantId = tenantId;
+        baseline.productId = UUID.fromString(product.get("id").asText());
+        baseline.warehouseId = UUID.fromString(warehouse.get("id").asText());
+        baseline.adjustmentWarehouseId = baseline.warehouseId;
+        baseline.snapshotDate = LocalDate.of(2026, 3, 31);
+        baseline.importedQuantity = new BigDecimal(quantity);
+        snapshotBaselines.save(baseline);
+    }
+
+    private void assertTransferStock(UUID tenantId, TransferInventory setup, String source, String destination) {
+        assertThat(stockMovements.currentStock(tenantId,
+            UUID.fromString(setup.product().get("id").asText()),
+            UUID.fromString(setup.source().get("id").asText()))).isEqualByComparingTo(source);
+        assertThat(stockMovements.currentStock(tenantId,
+            UUID.fromString(setup.product().get("id").asText()),
+            UUID.fromString(setup.destination().get("id").asText()))).isEqualByComparingTo(destination);
+    }
+
+    private String transferResolution(JsonNode candidate, String confirmation) {
+        return """
+            {"action":"CONFIRM_WAREHOUSE_TRANSFER","productId":"%s","sourceWarehouseId":"%s","destinationWarehouseId":"%s","quantity":%s,"confirmation":"%s"}
+            """.formatted(
+            candidate.get("productId").asText(),
+            candidate.get("sourceWarehouseId").asText(),
+            candidate.get("destinationWarehouseId").asText(),
+            candidate.get("normalizedQuantity").asText(),
+            confirmation);
+    }
+
+    private record TransferInventory(JsonNode product, JsonNode source, JsonNode destination) { }
 
     private JsonNode stageUnmatchedCashbook(String token, String name) throws Exception {
         var sessionId = createSession(token, name).get("id").asText();
@@ -1555,7 +3216,9 @@ class SmartImportSessionIntegrationTest {
         var sessionId = createSession(token, name).get("id").asText();
         upload(token, sessionId, files);
         postJson(token, "/api/import-sessions/" + sessionId + "/classify");
-        return postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        var workspace = postJson(token, "/api/import-sessions/" + sessionId + "/stage");
+        ((com.fasterxml.jackson.databind.node.ObjectNode) workspace).put("testSessionId", sessionId);
+        return workspace;
     }
 
     private String tokenForRole(UUID tenantId, DomainEnums.Role role) {

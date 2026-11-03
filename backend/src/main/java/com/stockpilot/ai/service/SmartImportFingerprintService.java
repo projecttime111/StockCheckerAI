@@ -20,6 +20,7 @@ public class SmartImportFingerprintService {
     private final Repositories.SmartStagedStockSnapshotRepository stagedSnapshots;
     private final Repositories.SmartStagedVoucherRepository stagedVouchers;
     private final Repositories.SmartStagedVoucherItemRepository stagedVoucherItems;
+    private final Repositories.SmartStagedTransferCandidateRepository stagedTransfers;
     private final Repositories.SmartStagedCashbookEntryRepository stagedCashbook;
     private final Repositories.SmartStagedStockAgeingRepository stagedAgeing;
 
@@ -33,6 +34,7 @@ public class SmartImportFingerprintService {
         Repositories.SmartStagedStockSnapshotRepository stagedSnapshots,
         Repositories.SmartStagedVoucherRepository stagedVouchers,
         Repositories.SmartStagedVoucherItemRepository stagedVoucherItems,
+        Repositories.SmartStagedTransferCandidateRepository stagedTransfers,
         Repositories.SmartStagedCashbookEntryRepository stagedCashbook,
         Repositories.SmartStagedStockAgeingRepository stagedAgeing
     ) {
@@ -45,6 +47,7 @@ public class SmartImportFingerprintService {
         this.stagedSnapshots = stagedSnapshots;
         this.stagedVouchers = stagedVouchers;
         this.stagedVoucherItems = stagedVoucherItems;
+        this.stagedTransfers = stagedTransfers;
         this.stagedCashbook = stagedCashbook;
         this.stagedAgeing = stagedAgeing;
     }
@@ -68,11 +71,30 @@ public class SmartImportFingerprintService {
         append(canonical, "SNAPSHOT", stagedSnapshots.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId, sessionId));
         append(canonical, "VOUCHER", stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(tenantId, sessionId));
         append(canonical, "VOUCHER_ITEM", stagedVoucherItems.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId, sessionId));
+        appendTransfers(canonical, tenantId, sessionId);
         append(canonical, "CASHBOOK", stagedCashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(tenantId, sessionId));
         append(canonical, "AGEING", stagedAgeing.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId, sessionId));
+        return sha256(canonical.toString());
+    }
+
+    public String captureDryRun(
+        UUID tenantId,
+        UUID sessionId,
+        String stockImpactMode,
+        String returnStockImpactMode,
+        String stockJournalImpactMode,
+        String negativeStockPolicy,
+        String snapshotDateSelection
+    ) {
+        // Hash the options with the staging fingerprint; V12 stores a 64-character SHA-256 value.
+        return sha256(String.join(":", capture(tenantId, sessionId), safe(stockImpactMode),
+            safe(returnStockImpactMode), safe(stockJournalImpactMode), safe(negativeStockPolicy), safe(snapshotDateSelection)));
+    }
+
+    private String sha256(String value) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
-                .digest(canonical.toString().getBytes(StandardCharsets.UTF_8)));
+                .digest(value.getBytes(StandardCharsets.UTF_8)));
         } catch (Exception ex) {
             throw new IllegalStateException("SHA-256 is unavailable", ex);
         }
@@ -82,6 +104,22 @@ public class SmartImportFingerprintService {
         for (var row : rows) {
             canonical.append("STAGED|").append(type).append('|').append(row.id).append('|')
                 .append(row.updatedAt).append('\n');
+        }
+    }
+
+    private void appendTransfers(StringBuilder canonical, UUID tenantId, UUID sessionId) {
+        for (var row : stagedTransfers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(
+            tenantId, sessionId)) {
+            // Snapshot IDs/dates are dry-run evidence, not user-controlled staging input. Keeping
+            // them out prevents a dry run from invalidating itself while resolution changes below
+            // still make the plan stale.
+            canonical.append("STAGED|TRANSFER|").append(row.id).append('|')
+                .append(row.classification).append('|').append(row.resolutionStatus).append('|')
+                .append(row.matchedProductId).append('|').append(row.sourceWarehouseId).append('|')
+                .append(row.destinationWarehouseId).append('|').append(row.normalizedQuantity).append('|')
+                .append(safe(row.transferFingerprint)).append('|').append(safe(row.transferLineFingerprint)).append('|')
+                .append(row.resolvedBy).append('|').append(row.resolvedAt).append('|')
+                .append(safe(row.decisionReasons)).append('\n');
         }
     }
 

@@ -23,7 +23,7 @@ import {
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { ReactNode, useEffect, useState } from "react";
-import { api, clearSession, getSessionPermissions, getSessionRole, setSessionPermissions } from "@/lib/api";
+import { api, clearSession, DEMO_MODE, getToken, getSessionPermissions, getSessionRole, setSessionPermissions } from "@/lib/api";
 
 type Role =
   | "OWNER"
@@ -122,13 +122,18 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
   const pathname = usePathname();
   const router = useRouter();
   const queryClient = useQueryClient();
-  const [role, setRole] = useState<Role>("OWNER");
+  const [role, setRole] = useState<Role | null>(null);
   const [permissions, setPermissions] = useState<string[]>([]);
   const [workspaceName, setWorkspaceName] = useState("Workspace");
 
   useEffect(() => {
+    if (!DEMO_MODE && !getToken()) {
+      clearSession();
+      router.replace(`/login?next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+      return;
+    }
     const storedRole = getSessionRole() as Role | null;
-    setRole(storedRole ?? "OWNER");
+    setRole(storedRole);
     setPermissions(getSessionPermissions());
 
     let active = true;
@@ -154,7 +159,7 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
     return () => {
       active = false;
     };
-  }, []);
+  }, [router]);
 
   const activeRole = role;
   const visibleGroups = activeRole === "CUSTOMER_USER"
@@ -207,7 +212,7 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
           <div className="flex min-h-16 flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6">
             <div>
               <h1 className="text-xl font-semibold tracking-normal text-ink">{title}</h1>
-              <p className="text-sm text-ink/55">{workspaceName} - {roleLabels[activeRole] ?? "Workspace"} - Connect Tally or Excel. Predict stockouts. Reduce dead stock. Improve profit.</p>
+              <p className="text-sm text-ink/55">{workspaceName} - {activeRole ? roleLabels[activeRole] : "Workspace"} - Connect Tally or Excel. Predict stockouts. Reduce dead stock. Improve profit.</p>
             </div>
             <div className="flex items-center gap-2">
               {actions}
@@ -253,12 +258,13 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
   );
 }
 
-function canAccess(item: NavItem, role: Role, permissions: string[]) {
+function canAccess(item: NavItem, role: Role | null, permissions: string[]) {
   return canUsePermission(item.permission, role, permissions, item.roles);
 }
 
-function canUsePermission(permission: string | undefined, role: Role, permissions: string[], fallbackRoles: Role[]) {
-  if (permission && permissions.length > 0) {
+function canUsePermission(permission: string | undefined, role: Role | null, permissions: string[], fallbackRoles: Role[]) {
+  if (!role) return false;
+  if (permission) {
     return permissions.includes(permission);
   }
   return fallbackRoles.includes(role);

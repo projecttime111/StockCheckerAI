@@ -2,6 +2,8 @@ package com.stockpilot.ai.service;
 
 import com.stockpilot.ai.config.TenantContext;
 import com.stockpilot.ai.domain.CustomerPayment;
+import com.stockpilot.ai.domain.Customer;
+import com.stockpilot.ai.domain.Supplier;
 import com.stockpilot.ai.domain.DomainEnums;
 import com.stockpilot.ai.domain.ImportSession;
 import com.stockpilot.ai.domain.PurchaseInvoice;
@@ -30,6 +32,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 @Service
@@ -47,6 +50,8 @@ public class CashbookReviewService {
     private final Repositories.SmartImportCommitRepository commits;
     private final Repositories.ImportPlanIssueRepository issues;
     private final AuditService audit;
+    private final RetailCounterSaleService retailSales;
+    private final SmartImportCashbookMatchingService matching;
 
     public CashbookReviewService(
         Repositories.ImportSessionRepository sessions,
@@ -59,7 +64,9 @@ public class CashbookReviewService {
         Repositories.SupplierPaymentRepository supplierPayments,
         Repositories.SmartImportCommitRepository commits,
         Repositories.ImportPlanIssueRepository issues,
-        AuditService audit
+        AuditService audit,
+        RetailCounterSaleService retailSales,
+        SmartImportCashbookMatchingService matching
     ) {
         this.sessions = sessions;
         this.cashbook = cashbook;
@@ -72,36 +79,120 @@ public class CashbookReviewService {
         this.commits = commits;
         this.issues = issues;
         this.audit = audit;
+        this.retailSales = retailSales;
+        this.matching = matching;
+    }
+
+    @Transactional
+    public Map<String, Object> recheck(UUID sessionId) {
+        retailSales.lockCashbook(TenantContext.tenantId());
+        var session = session(sessionId);
+        var commit = commits.findByTenantIdAndImportSessionIdForUpdate(session.tenantId, session.id).orElse(null);
+        if (session.status == DomainEnums.ImportSessionStatus.CANCELLED
+            || commit != null && commit.status == DomainEnums.SmartImportCommitStatus.COMMITTING) {
+            throw ApiErrors.conflict("Cashbook cannot be rechecked while cancelled or committing");
+        }
+        matching.refresh(session.tenantId, session.id);
+        var rows = cashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(session.tenantId, session.id);
+        if (commit != null && commit.status == DomainEnums.SmartImportCommitStatus.COMMITTED) {
+            for (var row : rows) {
+                if (SmartImportCashbookMatchingService.ready(row) && row.customerPaymentId == null && row.supplierPaymentId == null) {
+                    row.cashbookMatchStatus = DomainEnums.CashbookMatchStatus.LOW_CONFIDENCE_REVIEW;
+                    row.reviewStatus = DomainEnums.SmartReviewStatus.PENDING;
+                    row.matchReason = "This entry was not posted by the completed import. Confirm its party or invoice before posting.";
+                }
+            }
+            cashbook.saveAllAndFlush(rows);
+        }
+        matching.refreshReviewIssues(session.tenantId, session.id);
+        var unmatched = rows.stream().filter(r -> r.resolutionStatus == DomainEnums.CashbookResolutionStatus.UNRESOLVED
+            && r.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.UNMATCHED_REVIEW).count();
+        var review = rows.stream().filter(r -> r.resolutionStatus == DomainEnums.CashbookResolutionStatus.UNRESOLVED
+            && r.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.LOW_CONFIDENCE_REVIEW).count();
+        if (commit != null && commit.status == DomainEnums.SmartImportCommitStatus.COMMITTED) {
+            var summary = new LinkedHashMap<>(commit.summaryJson);
+            summary.put("cashbookRowsUnmatched", unmatched);
+            summary.put("cashbookRowsReviewRequired", review);
+            summary.put("futurePhaseCashbookRowsSkipped", unmatched + review);
+            summary.put("warnings", unmatched + review);
+            summary.put("cashbookMessage", (unmatched + review) + " unposted entries require review. Already-posted payments were not changed.");
+            summary.put("cashbookRecheckedAt", Instant.now().toString());
+            commit.summaryJson = summary;
+            commits.save(commit);
+        }
+        audit.logCurrent("CASHBOOK_UNPOSTED_RECHECKED", "ImportSession", session.id,
+            Map.of("unpostedReviewCount", unmatched + review, "businessRecordsChanged", 0));
+        return Map.of("unpostedReviewCount", unmatched + review, "businessRecordsChanged", 0);
     }
 
     @Transactional(readOnly = true)
     public List<Map<String, Object>> unresolved(UUID sessionId) {
         var session = session(sessionId);
-        return cashbook.findByTenantIdAndImportSessionIdAndResolutionStatusOrderByEntryDateAscSourceRowNumberAsc(
+        var rows = cashbook.findByTenantIdAndImportSessionIdAndResolutionStatusOrderByEntryDateAscSourceRowNumberAsc(
                 session.tenantId, session.id, DomainEnums.CashbookResolutionStatus.UNRESOLVED).stream()
-            .filter(this::needsReview)
-            .map(row -> reviewRow(session.tenantId, row))
-            .toList();
+            .filter(this::needsReview).toList();
+        if (rows.isEmpty()) return List.of();
+        var page = PageRequest.of(0, 100, Sort.by(Sort.Direction.DESC, "invoiceDate"));
+        var catalog = new CandidateCatalog(customers.findByTenantIdOrderByNameAsc(session.tenantId),
+            suppliers.findByTenantIdOrderByNameAsc(session.tenantId),
+            salesInvoices.findByTenantId(session.tenantId, page).getContent(),
+            purchaseInvoices.findByTenantId(session.tenantId, page).getContent());
+        return rows.stream().map(row -> reviewRow(catalog, row)).toList();
     }
 
     @Transactional
     public Map<String, Object> resolve(
         UUID sessionId, UUID entryId, SmartImportDtos.CashbookReviewResolutionRequest request
     ) {
+        retailSales.lockCashbook(TenantContext.tenantId());
         var session = session(sessionId);
         if (session.status == DomainEnums.ImportSessionStatus.CANCELLED) {
             throw ApiErrors.conflict("Cancelled import sessions cannot resolve cashbook entries");
         }
         var row = cashbook.findByTenantIdAndImportSessionIdAndIdForUpdate(session.tenantId, session.id, entryId)
             .orElseThrow(() -> ApiErrors.notFound("Cashbook review entry not found"));
+        if (row.resolutionStatus == DomainEnums.CashbookResolutionStatus.RETAIL_SALE_RECORDED
+            && request.action() == DomainEnums.CashbookResolutionAction.RECORD_RETAIL_SALE) {
+            var outcome = retailSales.record(row, request);
+            return retailResponse(session, row, outcome.duplicate());
+        }
         if (row.resolutionStatus != DomainEnums.CashbookResolutionStatus.UNRESOLVED) {
             throw ApiErrors.conflict("This cashbook entry has already been resolved");
         }
-        if (!needsReview(row)) {
+        var repeatsPayment = (row.customerPaymentId != null || row.supplierPaymentId != null)
+            && (request.action() == DomainEnums.CashbookResolutionAction.MAP_CUSTOMER
+                || request.action() == DomainEnums.CashbookResolutionAction.MAP_SUPPLIER
+                || request.action() == DomainEnums.CashbookResolutionAction.MAP_SALES_INVOICE
+                || request.action() == DomainEnums.CashbookResolutionAction.MAP_PURCHASE_INVOICE);
+        if (!needsReview(row) && !repeatsPayment) {
             throw ApiErrors.conflict("This cashbook entry does not require manual resolution");
         }
 
+        if (request.action() == DomainEnums.CashbookResolutionAction.RECORD_RETAIL_SALE) {
+            var outcome = retailSales.record(row, request);
+            cashbook.save(row);
+            resolvePlanIssue(session, row, request.action());
+            audit.logCurrent("CASHBOOK_REVIEW_RESOLVED", "SmartStagedCashbookEntry", row.id,
+                Map.of("action", request.action(), "retailCounterSaleId", outcome.saleId(), "duplicateSkipped", outcome.duplicate()));
+            commits.findByTenantIdAndImportSessionIdForUpdate(session.tenantId, session.id).ifPresent(commit -> {
+                var summary = new LinkedHashMap<String, Object>(commit.summaryJson == null ? Map.of() : commit.summaryJson);
+                decrement(summary, row.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.UNMATCHED_REVIEW
+                    ? "cashbookRowsUnmatched" : "cashbookRowsReviewRequired");
+                decrement(summary, "futurePhaseCashbookRowsSkipped");
+                summary.put("warnings", number(summary.get("futurePhaseCashbookRowsSkipped")));
+                increment(summary, "retailCounterSaleRowsResolved");
+                commit.summaryJson = summary;
+                commits.save(commit);
+            });
+            return retailResponse(session, row, outcome.duplicate());
+        }
+
+        if (retailSales.recorded(session.tenantId, row.fingerprint).isPresent()) {
+            throw ApiErrors.conflict("This source entry is already recorded as a retail counter sale");
+        }
+
         if (request.action() == DomainEnums.CashbookResolutionAction.KEEP_UNRESOLVED) {
+            row.manualResolutionAction = request.action();
             row.resolutionNote = clean(request.note());
             cashbook.save(row);
             return response(session.tenantId, row, false, false);
@@ -208,6 +299,14 @@ public class CashbookReviewService {
         return new PaymentOutcome(false, true, false, invoice != null);
     }
 
+    private Map<String, Object> retailResponse(ImportSession session, SmartStagedCashbookEntry row, boolean duplicate) {
+        var result = response(session.tenantId, row, false, false);
+        result.put("retailCounterSaleId", row.retailCounterSaleId);
+        result.put("retailSaleRecorded", true);
+        result.put("duplicateRetailSaleSkipped", duplicate);
+        return result;
+    }
+
     private PaymentOutcome postSupplier(
         ImportSession session, SmartStagedCashbookEntry row, UUID supplierId, PurchaseInvoice invoice, String note
     ) {
@@ -266,9 +365,9 @@ public class CashbookReviewService {
         audit.logCurrent("CASHBOOK_ENTRY_IGNORED", "SmartStagedCashbookEntry", row.id, details);
     }
 
-    private Map<String, Object> reviewRow(UUID tenantId, SmartStagedCashbookEntry row) {
+    private Map<String, Object> reviewRow(CandidateCatalog catalog, SmartStagedCashbookEntry row) {
         var response = baseRow(row);
-        response.put("candidates", candidates(tenantId, row));
+        response.put("candidates", candidates(catalog, row));
         return response;
     }
 
@@ -291,33 +390,36 @@ public class CashbookReviewService {
             "referenceNumber", text(row.referenceNumber), "cashbookMatchStatus", row.cashbookMatchStatus,
             "resolutionStatus", row.resolutionStatus, "matchConfidence", row.matchConfidence,
             "matchReason", text(row.matchReason), "customerPaymentId", row.customerPaymentId,
+            "sourceLedgerDetails", row.rawMetadataJson == null ? "" : text(Objects.toString(row.rawMetadataJson.get("Ledger Adjustment Details"), "")),
             "supplierPaymentId", row.supplierPaymentId, "resolvedAt", row.resolvedAt,
             "resolutionNote", text(row.resolutionNote)
         );
     }
 
-    private List<Map<String, Object>> candidates(UUID tenantId, SmartStagedCashbookEntry row) {
+    private record CandidateCatalog(List<Customer> customers, List<Supplier> suppliers,
+                                    List<SalesInvoice> sales, List<PurchaseInvoice> purchases) { }
+
+    private List<Map<String, Object>> candidates(CandidateCatalog catalog, SmartStagedCashbookEntry row) {
         var candidates = new ArrayList<Map<String, Object>>();
-        customers.findByTenantIdOrderByNameAsc(tenantId).stream()
+        catalog.customers.stream()
             .map(customer -> partyCandidate("CUSTOMER", DomainEnums.CashbookResolutionAction.MAP_CUSTOMER,
                 customer.id, customer.name, customer.gstin, row))
             .sorted(candidateOrder()).limit(15).forEach(candidates::add);
-        suppliers.findByTenantIdOrderByNameAsc(tenantId).stream()
+        catalog.suppliers.stream()
             .map(supplier -> partyCandidate("SUPPLIER", DomainEnums.CashbookResolutionAction.MAP_SUPPLIER,
                 supplier.id, supplier.name, supplier.gstin, row))
             .sorted(candidateOrder()).limit(15).forEach(candidates::add);
 
-        var page = PageRequest.of(0, 100, Sort.by(Sort.Direction.DESC, "invoiceDate"));
-        var customerNames = customers.findByTenantIdOrderByNameAsc(tenantId).stream()
+        var customerNames = catalog.customers.stream()
             .collect(java.util.stream.Collectors.toMap(customer -> customer.id, customer -> customer.name));
-        salesInvoices.findByTenantId(tenantId, page).stream()
+        catalog.sales.stream()
             .map(invoice -> invoiceCandidate("SALES_INVOICE", DomainEnums.CashbookResolutionAction.MAP_SALES_INVOICE,
                 invoice.id, invoice.invoiceNumber, invoice.invoiceDate, invoice.totalAmount,
                 customerNames.get(invoice.customerId), row))
             .sorted(candidateOrder()).limit(15).forEach(candidates::add);
-        var supplierNames = suppliers.findByTenantIdOrderByNameAsc(tenantId).stream()
+        var supplierNames = catalog.suppliers.stream()
             .collect(java.util.stream.Collectors.toMap(supplier -> supplier.id, supplier -> supplier.name));
-        purchaseInvoices.findByTenantId(tenantId, page).stream()
+        catalog.purchases.stream()
             .map(invoice -> invoiceCandidate("PURCHASE_INVOICE", DomainEnums.CashbookResolutionAction.MAP_PURCHASE_INVOICE,
                 invoice.id, invoice.invoiceNumber, invoice.invoiceDate, invoice.totalAmount,
                 supplierNames.get(invoice.supplierId), row))
@@ -350,10 +452,13 @@ public class CashbookReviewService {
     ) {
         var confidence = new BigDecimal("0.25");
         var reason = "Recent tenant invoice";
-        if (!normalize(row.referenceNumber).isBlank()
-            && normalize(row.referenceNumber).equals(normalize(number))) {
-            confidence = BigDecimal.ONE;
-            reason = "Invoice reference matches exactly";
+        var reference = SmartImportCashbookMatchingService.invoiceReference(row);
+        if (reference != null && normalize(reference).equals(normalize(number))
+            && normalizeName(row.partyName).equals(normalizeName(partyName))
+            && date != null && row.entryDate != null && !date.isAfter(row.entryDate)
+            && row.amount != null && amount != null && row.amount.abs().compareTo(amount.abs()) <= 0) {
+            confidence = new BigDecimal("0.95");
+            reason = "Invoice reference and party match; confirm allocation";
         } else {
             var amountMatch = row.amount != null && amount != null && row.amount.abs().compareTo(amount.abs()) == 0;
             var dateNear = row.entryDate != null && date != null
@@ -409,6 +514,7 @@ public class CashbookReviewService {
                 if (invoiceLinked && supplier) increment(summary, "manualPaymentsLinkedToPurchaseInvoices");
             }
             summary.put("manualResolutionMessage", "Manual cashbook resolutions are included in this reconciliation.");
+            summary.put("warnings", number(summary.get("futurePhaseCashbookRowsSkipped")));
             commit.summaryJson = summary;
             commit.updatedBy = TenantContext.userId();
             commits.save(commit);

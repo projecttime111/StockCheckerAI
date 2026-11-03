@@ -50,6 +50,7 @@ public class SecurityConfig {
                     "/api/auth/forgot-password",
                     "/api/auth/reset-password",
                     "/actuator/health",
+                    "/actuator/health/**",
                     "/actuator/info"
                 ).permitAll();
                 if (swaggerPublicEnabled) {

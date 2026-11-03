@@ -1,6 +1,7 @@
 import { demoApi } from "./demoApi";
 
 export const DEMO_MODE = process.env.NEXT_PUBLIC_DEMO_MODE === "true";
+export const SESSION_CLEARED_EVENT = "stockpilot:session-cleared";
 const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/\/+$/, "");
 
 if (process.env.NODE_ENV === "production" && !DEMO_MODE) {
@@ -88,9 +89,13 @@ export function setSession(token: string, role?: string, permissions?: string[])
   window.localStorage.setItem("stockpilot.token", token);
   if (role) {
     window.localStorage.setItem("stockpilot.role", role);
+  } else {
+    window.localStorage.removeItem("stockpilot.role");
   }
   if (permissions) {
     setSessionPermissions(permissions);
+  } else {
+    window.localStorage.removeItem("stockpilot.permissions");
   }
 }
 
@@ -98,13 +103,25 @@ export function clearSession() {
   window.localStorage.removeItem("stockpilot.token");
   window.localStorage.removeItem("stockpilot.role");
   window.localStorage.removeItem("stockpilot.permissions");
+  window.dispatchEvent(new Event(SESSION_CLEARED_EVENT));
+}
+
+export function loginDestination(role: string, search = window.location.search) {
+  const fallback = role === "CUSTOMER_USER" ? "/portal" : "/dashboard";
+  const next = new URLSearchParams(search).get("next");
+  if (!next?.startsWith("/") || next.startsWith("//") || next.includes("\\")) return fallback;
+  const destination = new URL(next, window.location.origin);
+  if (destination.origin !== window.location.origin || /^\/(login|register|reset-password|forgot-password)(\/|$)/.test(destination.pathname)) return fallback;
+  if (role === "CUSTOMER_USER" && !/^\/portal(\/|$)/.test(destination.pathname)) return fallback;
+  return destination.pathname + destination.search + destination.hash;
 }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (DEMO_MODE) {
     return demoApi<T>(path, init);
   }
-  const token = getToken();
+  const publicAuth = /^\/api\/auth\/(login|google|register|forgot-password|reset-password|verify-email|resend-verification)$/.test(path);
+  const token = publicAuth ? null : getToken();
   const headers = new Headers(init.headers);
   if (!(init.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
@@ -115,8 +132,12 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, { ...init, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ message: response.statusText }));
-    if (response.status === 401) {
+    if (response.status === 401 && token && getToken() === token) {
       clearSession();
+      if (window.location.pathname !== "/login") {
+        const next = window.location.pathname + window.location.search;
+        window.location.replace(`/login?expired=1&next=${encodeURIComponent(next)}`);
+      }
     }
     throw new ApiClientError(body.message ?? "Request failed", response.status, body.error);
   }

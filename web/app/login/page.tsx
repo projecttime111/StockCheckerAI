@@ -4,7 +4,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { BarChart3 } from "lucide-react";
 import Link from "next/link";
 import { FormEvent, useEffect, useState } from "react";
-import { api, ApiClientError, clearSession, DEMO_MODE, setSession, setSessionPermissions } from "@/lib/api";
+import { api, ApiClientError, clearSession, DEMO_MODE, loginDestination, setSession, setSessionPermissions } from "@/lib/api";
 import { Field, PrimaryButton, TextInput } from "@/components/FormControls";
 import { GoogleSignInButton } from "@/components/GoogleSignInButton";
 
@@ -33,6 +33,9 @@ export default function LoginPage() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+    if (params.get("expired") === "1") {
+      setRegistrationMessage("Your session expired. Please sign in again.");
+    }
     if (params.get("registered") !== "true") return;
     const registeredEmail = params.get("email")?.trim() ?? "";
     if (registeredEmail) {
@@ -57,7 +60,7 @@ export default function LoginPage() {
       } catch {
         setSessionPermissions([]);
       }
-      window.location.assign(data.role === "CUSTOMER_USER" ? "/portal" : "/dashboard");
+      window.location.assign(loginDestination(data.role));
     }
   });
   const resendVerification = useMutation({

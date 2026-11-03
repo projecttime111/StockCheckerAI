@@ -35,6 +35,7 @@ mobile/coverage/
 # Logs
 *.log
 logs/
+.codex-logs/
 
 # IDE
 .idea/

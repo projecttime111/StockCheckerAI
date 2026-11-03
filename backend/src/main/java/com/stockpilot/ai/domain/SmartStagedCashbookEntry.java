@@ -28,6 +28,8 @@ public class SmartStagedCashbookEntry extends TenantOwnedEntity {
     public DomainEnums.SmartCashbookDirection direction = DomainEnums.SmartCashbookDirection.UNKNOWN;
     public UUID matchedPartyId;
     public UUID matchedInvoiceId;
+    public UUID matchedStagedVoucherId;
+    public String matchedPartyName;
     @Enumerated(EnumType.STRING)
     public DomainEnums.SmartPartyType matchedPartyType = DomainEnums.SmartPartyType.UNKNOWN;
     @Enumerated(EnumType.STRING)
@@ -43,6 +45,7 @@ public class SmartStagedCashbookEntry extends TenantOwnedEntity {
     @Enumerated(EnumType.STRING)
     public DomainEnums.CashbookResolutionAction manualResolutionAction;
     public UUID customerPaymentId;
+    public UUID retailCounterSaleId;
     public UUID supplierPaymentId;
     public UUID resolvedBy;
     public Instant resolvedAt;

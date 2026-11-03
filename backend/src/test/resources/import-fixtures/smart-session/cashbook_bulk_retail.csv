@@ -1,0 +1,4 @@
+Date,Party Name,Amount,Direction,Reference Number
+2026-06-20,Cash Counter,150.25,RECEIPT,CASH-1
+2026-06-21,GPay Counter,500.50,PAYMENT,GPAY-1
+2026-06-22,Owner Transfer,900.00,RECEIPT,TRANSFER-1

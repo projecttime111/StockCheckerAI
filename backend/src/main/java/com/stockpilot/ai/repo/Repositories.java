@@ -23,6 +23,17 @@ public final class Repositories {
 
     public interface TenantRepository extends JpaRepository<Tenant, UUID> {
         Optional<Tenant> findByIdAndStatus(UUID id, DomainEnums.TenantStatus status);
+
+        @Lock(LockModeType.PESSIMISTIC_WRITE)
+        @Query("select t from Tenant t where t.id = :id")
+        Optional<Tenant> findByIdForCashbookUpdate(@Param("id") UUID id);
+    }
+
+    public interface RetailCounterSaleRepository extends JpaRepository<RetailCounterSale, UUID> {
+        Optional<RetailCounterSale> findByTenantIdAndSourceFingerprint(UUID tenantId, String sourceFingerprint);
+        List<RetailCounterSale> findByTenantIdAndSourceFingerprintIn(UUID tenantId, List<String> sourceFingerprints);
+        Page<RetailCounterSale> findByTenantId(UUID tenantId, Pageable pageable);
+        long countByTenantId(UUID tenantId);
     }
 
     public interface UserRepository extends JpaRepository<UserAccount, UUID> {
@@ -108,6 +119,7 @@ public final class Repositories {
     }
 
     public interface WarehouseRepository extends JpaRepository<Warehouse, UUID> {
+        List<Warehouse> findByTenantId(UUID tenantId);
         List<Warehouse> findByTenantIdAndActiveTrueOrderByNameAsc(UUID tenantId);
         Optional<Warehouse> findByTenantIdAndId(UUID tenantId, UUID id);
         Optional<Warehouse> findByTenantIdAndNameIgnoreCase(UUID tenantId, String name);
@@ -117,6 +129,9 @@ public final class Repositories {
         Page<StockMovement> findByTenantId(UUID tenantId, Pageable pageable);
         List<StockMovement> findByTenantIdAndProductIdOrderByMovementDateDesc(UUID tenantId, UUID productId);
         List<StockMovement> findByTenantIdAndReferenceTypeAndReferenceId(UUID tenantId, String referenceType, UUID referenceId);
+        Optional<StockMovement> findByTenantIdAndSourceFingerprint(UUID tenantId, String sourceFingerprint);
+        List<StockMovement> findByTenantIdAndTransferPairFingerprint(UUID tenantId, String transferPairFingerprint);
+        List<StockMovement> findByTenantIdAndTransferLineFingerprint(UUID tenantId, String transferLineFingerprint);
         List<StockMovement> findByTenantIdAndMovementTypeAndMovementDateAfter(UUID tenantId, DomainEnums.MovementType movementType, Instant after);
         Optional<StockMovement> findFirstByTenantIdAndProductIdAndMovementTypeOrderByMovementDateDesc(UUID tenantId, UUID productId, DomainEnums.MovementType movementType);
 
@@ -184,6 +199,7 @@ public final class Repositories {
 
     public interface SupplierPaymentRepository extends JpaRepository<SupplierPayment, UUID> {
         Optional<SupplierPayment> findByTenantIdAndSourceFingerprint(UUID tenantId, String sourceFingerprint);
+        List<SupplierPayment> findByTenantIdAndSourceFingerprintIn(UUID tenantId, List<String> sourceFingerprints);
         List<SupplierPayment> findByTenantIdAndSupplierIdOrderByPaymentDateDesc(UUID tenantId, UUID supplierId);
         List<SupplierPayment> findByTenantIdAndSupplierIdAndPaymentDateAfter(UUID tenantId, UUID supplierId, LocalDate paymentDate);
         long countByTenantIdAndSourceImportSessionId(UUID tenantId, UUID sourceImportSessionId);
@@ -258,6 +274,7 @@ public final class Repositories {
         List<CustomerPayment> findByTenantIdAndCustomerIdOrderByPaymentDateDesc(UUID tenantId, UUID customerId);
         List<CustomerPayment> findByTenantIdAndCustomerIdAndPaymentDateAfter(UUID tenantId, UUID customerId, LocalDate paymentDate);
         Optional<CustomerPayment> findByTenantIdAndSourceFingerprint(UUID tenantId, String sourceFingerprint);
+        List<CustomerPayment> findByTenantIdAndSourceFingerprintIn(UUID tenantId, List<String> sourceFingerprints);
         long countByTenantIdAndSourceImportSessionId(UUID tenantId, UUID sourceImportSessionId);
     }
 
@@ -276,6 +293,8 @@ public final class Repositories {
     }
 
     public interface ImportBatchRepository extends JpaRepository<ImportBatch, UUID> {
+        Optional<ImportBatch> findFirstByTenantIdAndSourceTypeInAndStatusOrderByUpdatedAtDesc(
+            UUID tenantId, List<DomainEnums.SourceType> sourceTypes, DomainEnums.ImportStatus status);
         Optional<ImportBatch> findByTenantIdAndId(UUID tenantId, UUID id);
         Page<ImportBatch> findByTenantId(UUID tenantId, Pageable pageable);
         Page<ImportBatch> findByTenantIdAndSourceTypeIn(UUID tenantId, List<DomainEnums.SourceType> sourceTypes, Pageable pageable);
@@ -361,6 +380,8 @@ public final class Repositories {
     }
 
     public interface SmartImportCommitRepository extends JpaRepository<SmartImportCommit, UUID> {
+        Optional<SmartImportCommit> findFirstByTenantIdAndStatusOrderByFinishedAtDesc(
+            UUID tenantId, DomainEnums.SmartImportCommitStatus status);
         Optional<SmartImportCommit> findByTenantIdAndImportSessionId(UUID tenantId, UUID importSessionId);
         Optional<SmartImportCommit> findByTenantIdAndImportSessionIdAndId(UUID tenantId, UUID importSessionId, UUID id);
 
@@ -370,7 +391,21 @@ public final class Repositories {
             @Param("tenantId") UUID tenantId, @Param("sessionId") UUID sessionId);
     }
 
+    public interface SmartEffectCount {
+        DomainEnums.SmartImportEffectEntityType getEntityType();
+        long getTotal();
+    }
+
     public interface SmartImportEffectRepository extends JpaRepository<SmartImportEffect, UUID> {
+        @Query("""
+            select effect.entityType as entityType, count(distinct effect.entityId) as total
+            from SmartImportEffect effect
+            where effect.tenantId = :tenantId and effect.commitId = :commitId
+              and effect.reversedAt is null and effect.action in :actions
+            group by effect.entityType
+            """)
+        List<SmartEffectCount> countEntitiesByTenantIdAndCommitId(@Param("tenantId") UUID tenantId,
+            @Param("commitId") UUID commitId, @Param("actions") List<DomainEnums.SmartImportEffectAction> actions);
         List<SmartImportEffect> findByTenantIdAndCommitIdOrderByCreatedAtAsc(UUID tenantId, UUID commitId);
         void deleteByTenantIdAndCommitId(UUID tenantId, UUID commitId);
     }
@@ -407,13 +442,46 @@ public final class Repositories {
         void deleteByTenantIdAndImportSessionId(UUID tenantId, UUID importSessionId);
     }
 
+    public interface StockSnapshotBaselineRepository extends JpaRepository<StockSnapshotBaseline, UUID> {
+        List<StockSnapshotBaseline> findByTenantIdAndProductIdOrderBySnapshotDateDescCreatedAtDesc(
+            UUID tenantId, UUID productId);
+        List<StockSnapshotBaseline> findByTenantIdAndSourceImportSessionId(
+            UUID tenantId, UUID sourceImportSessionId);
+    }
+
     public interface SmartStagedVoucherRepository extends JpaRepository<SmartStagedVoucher, UUID> {
         List<SmartStagedVoucher> findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(UUID tenantId, UUID importSessionId);
+        Optional<SmartStagedVoucher> findByTenantIdAndImportSessionIdAndId(UUID tenantId, UUID importSessionId, UUID id);
         void deleteByTenantIdAndImportSessionId(UUID tenantId, UUID importSessionId);
     }
 
     public interface SmartStagedVoucherItemRepository extends JpaRepository<SmartStagedVoucherItem, UUID> {
         List<SmartStagedVoucherItem> findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(UUID tenantId, UUID importSessionId);
+        Optional<SmartStagedVoucherItem> findByTenantIdAndImportSessionIdAndId(UUID tenantId, UUID importSessionId, UUID id);
+        @Lock(LockModeType.PESSIMISTIC_WRITE)
+        @Query("select row from SmartStagedVoucherItem row where row.tenantId = :tenantId and row.importSessionId = :sessionId and row.id = :id")
+        Optional<SmartStagedVoucherItem> findByTenantIdAndImportSessionIdAndIdForUpdate(
+            @Param("tenantId") UUID tenantId, @Param("sessionId") UUID sessionId, @Param("id") UUID id);
+        void deleteByTenantIdAndImportSessionId(UUID tenantId, UUID importSessionId);
+    }
+
+    public interface SmartStagedTransferCandidateRepository extends JpaRepository<SmartStagedTransferCandidate, UUID> {
+        List<SmartStagedTransferCandidate> findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(
+            UUID tenantId, UUID importSessionId);
+        List<SmartStagedTransferCandidate> findByTenantIdAndImportSessionIdAndResolutionStatusOrderByVoucherDateAscSourceRowNumberAsc(
+            UUID tenantId, UUID importSessionId, DomainEnums.TransferResolutionStatus resolutionStatus);
+        Optional<SmartStagedTransferCandidate> findByTenantIdAndImportSessionIdAndId(
+            UUID tenantId, UUID importSessionId, UUID id);
+
+        @Lock(LockModeType.PESSIMISTIC_WRITE)
+        @Query("""
+            select candidate from SmartStagedTransferCandidate candidate
+            where candidate.tenantId = :tenantId
+              and candidate.importSessionId = :sessionId
+              and candidate.id = :id
+            """)
+        Optional<SmartStagedTransferCandidate> findByTenantIdAndImportSessionIdAndIdForUpdate(
+            @Param("tenantId") UUID tenantId, @Param("sessionId") UUID sessionId, @Param("id") UUID id);
         void deleteByTenantIdAndImportSessionId(UUID tenantId, UUID importSessionId);
     }
 

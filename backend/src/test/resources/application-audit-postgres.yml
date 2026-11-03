@@ -1,0 +1,13 @@
+spring:
+  datasource:
+    url: ${STOCKPILOT_AUDIT_PG_URL}
+    username: audit
+    password: ""
+  flyway:
+    enabled: true
+    url: ${STOCKPILOT_AUDIT_PG_URL}
+    user: audit
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: validate

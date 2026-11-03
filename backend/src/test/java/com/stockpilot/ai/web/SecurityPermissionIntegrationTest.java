@@ -118,6 +118,12 @@ class SecurityPermissionIntegrationTest {
         assertThat(annotation.matchIfMissing()).isFalse();
     }
 
+    @Test
+    void livenessHealthEndpointIsPublic() throws Exception {
+        mvc.perform(get("/actuator/health/liveness"))
+            .andExpect(status().isOk());
+    }
+
     private UUID registerTenant(String email) throws Exception {
         return UUID.fromString(registerResponse(email).get("tenantId").asText());
     }

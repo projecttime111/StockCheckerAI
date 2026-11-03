@@ -45,7 +45,7 @@ Smart Import APIs require `imports.view`, `imports.upload`, or `imports.validate
 
 Phase 3 adds a transaction-safe dry run after canonical staging. `POST /api/import-sessions/{sessionId}/dry-run` replaces the previous dry-run rows for that tenant/session and persists only simulation metadata in `import_dry_runs` and `import_dry_run_items`. It never writes products, customers, suppliers, invoices, invoice items, warehouses, units, or stock movements. `GET /api/import-sessions/{sessionId}/dry-run` returns the latest summary; `GET /api/import-sessions/{sessionId}/dry-run/items` supports `itemType`, `action`, `issue`, and `sourceFileId` filters.
 
-The request may explicitly choose `SNAPSHOT_FIRST`, `TRANSACTION_HISTORY`, or `HYBRID_RECONCILIATION`. `UNKNOWN` is rejected because StockPilot must not silently choose stock behavior. Snapshot-first defaults to invoice-only voucher impact, transaction history defaults to invoice and stock movements, and hybrid defaults to applying stock movements only after the snapshot date.
+The request may explicitly choose `SNAPSHOT_FIRST`, `TRANSACTION_HISTORY`, or `HYBRID_RECONCILIATION`. `UNKNOWN` is rejected because StockPilot must not silently choose stock behavior. Snapshot-first and transaction-history default to invoice-only voucher impact; hybrid defaults to applying eligible movements only after the applicable snapshot. An unrestricted historical movement mode is not accepted in Phase 4B-2C.
 
 Snapshot reconciliation is date-aware:
 
@@ -104,6 +104,101 @@ Payment identity uses a tenant-scoped SHA-256 fingerprint of date, normalized pa
 The latest outstanding snapshot is treated as an operational baseline. Invoices, credit/debit financial adjustments, and payments after that snapshot date are applied dynamically. Without a snapshot, the calculation falls back to opening balance plus all known documents and payments. This projection supports collection and payable workflows but does not replace Tally's statutory ledger.
 
 Reconciliation includes debtor and creditor rows processed, snapshots created, customer and supplier payments created, invoice links, matched/unmatched/review-required cashbook rows, and duplicate payments skipped. Dedicated audit events record outstanding commits, matched payments, deferred review rows, and duplicates. Stock-ageing actions, unresolved cashbook posting, return stock, and other stock-affecting voucher movements remain deferred.
+
+## Smart Import Workspace Phase 4B-2C
+
+Phase 4B-2C retains `CREATE_INVOICES_ONLY` and adds `APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE`. Closing stock remains the inventory baseline. For each genuine sales/purchase item, a shared eligibility service finds a tenant-scoped warehouse snapshot first and otherwise the latest product-level snapshot. Sales and purchases strictly after that snapshot create `SALE` and `PURCHASE` movements. Same-date and earlier vouchers create invoices only. Missing/ambiguous snapshots and unresolved item godowns block post-snapshot commit; product-level fallback is warning-marked.
+
+The dry run shows voucher date, applicable snapshot, current stock, signed quantity, projected stock, movement type/action, eligibility reason, warehouse resolution, and negative-stock result. Its summary separates eligible sales/purchase rows, rows covered by the snapshot, same-date deferrals, missing snapshots, warehouse blocks, policy skips, and projected changes. Final reconciliation separates created sales/purchase movements, deferred rows, duplicate effects, negative-stock decisions, and product-level fallbacks.
+
+Movement commit uses the existing stock ledger and stock-key lock. It re-evaluates snapshot eligibility, verifies the dry-run item and expected current stock, and writes the invoice/item/movement/mapping/effect/audit records in one transaction. A tenant-scoped SHA-256 stock-effect fingerprint and PostgreSQL unique partial index prevent duplicate stock effects. Each movement retains source session/file/row, invoice-item reference, snapshot baseline, fingerprint, and decision reason.
+
+Negative sales follow the selected policy: `BLOCK` prevents commit, `SKIP_STOCK_MOVEMENT` permits the reviewed invoice but records no movement, and `IMPORT_AS_IS` requires `tenant.allowNegativeStock=true`. Physical credit/debit note stock effects are handled separately by Phase 4B-2D. Stock journals/transfers, manufacturing movements, and stock-ageing reconciliation remain deferred.
+
+Worked example:
+
+```text
+2026-03-31 closing stock: 100
+2026-03-30 sale 10: invoice only
+2026-03-31 purchase 5: invoice only
+2026-04-01 purchase 20: PURCHASE +20
+2026-04-02 sale 15: SALE -15
+Expected stock: 105
+```
+
+## Smart Import Workspace Phase 4B-2D
+
+Phase 4B-2D preserves financial adjustment posting and adds `FINANCIAL_ONLY` and `APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE` return modes. A credit/debit note is not assumed to move goods. Inventory evidence must include a resolved stock item, positive normalized physical quantity, and resolved tenant godown. Ledger-only tax, discount, freight, round-off, service, and zero-quantity lines stay financial-only.
+
+Confirmed customer returns create `RETURN_IN`; confirmed supplier returns create `RETURN_OUT`. Both reuse `SmartImportSnapshotEligibilityService`: only notes strictly after the latest applicable tenant/product/warehouse snapshot are eligible. Same-date and earlier notes are covered by the snapshot. Product-level fallback is warning-marked; missing/ambiguous snapshots and missing/ambiguous warehouses block stock effect.
+
+Conflicting billed/actual quantities and damaged, expired, rejected, scrap, or non-saleable evidence create review items. `GET /api/import-sessions/{sessionId}/return-review` lists unresolved lines. `POST /api/import-sessions/{sessionId}/return-review/{itemId}/resolve` accepts physical sales return, physical purchase return, financial-only, or keep-unresolved decisions. Physical decisions require a tenant-scoped product and warehouse, a positive normalized quantity, `RESTOCK_TO_AVAILABLE`, and the exact phrase `POST RETURN STOCK`. Both endpoints require `imports.validate`; final posting still requires `imports.commit`. `CUSTOMER_USER` has neither permission.
+
+Return commit uses the existing stock-key lock and negative-stock policy. `RETURN_OUT` is blocked, skipped, or allowed according to `BLOCK`, `SKIP_STOCK_MOVEMENT`, or `IMPORT_AS_IS`; import-as-is also requires the tenant negative-stock setting. A tenant-scoped stock-effect fingerprint prevents duplicate movements across retries and repeated sessions. A financial note already committed in financial-only mode may receive its eligible stock effect once in a later reviewed session.
+
+Reconciliation includes classifications, physical return detection, covered/same-date/missing-snapshot/warehouse decisions, `returnInMovementsCreated`, `returnOutMovementsCreated`, negative-stock results, duplicate return effects, manual resolutions, and deferred return rows. Audit events record mode selection, committed return directions, financial-only confirmation, snapshot coverage, duplicates, and allowed/blocked negative stock without logging raw financial payloads.
+
+```text
+2026-03-31 closing stock: 100
+2026-03-30 customer return 5: financial note only
+2026-03-31 supplier return 4: financial note only
+2026-04-01 confirmed customer return 10: RETURN_IN +10
+2026-04-02 confirmed supplier return 6: RETURN_OUT -6
+Expected stock: 104
+```
+
+Damaged/non-saleable returns, manufacturing vouchers, unilateral stock adjustments, and stock-ageing reconciliation remain deferred.
+
+## Phase 4B-2E Stock Journals And Warehouse Transfers
+
+Smart Import classifies Tally Stock Journal vouchers and preserves their evidence. The default
+`DEFER_STOCK_JOURNALS` mode creates no inventory effect. The optional
+`APPLY_CONFIRMED_WAREHOUSE_TRANSFERS_AFTER_SNAPSHOT_DATE` mode supports only balanced,
+same-product, compatible-unit, non-manufacturing warehouse transfers.
+
+A supported transfer creates exactly two linked movements in one transaction:
+
+- `TRANSFER_OUT` from the source warehouse.
+- `TRANSFER_IN` to the destination warehouse.
+- Both use the same tenant, product, base quantity, transfer group, voucher identity, and pair fingerprint.
+- Company-wide quantity change must be zero.
+
+Both source and destination need warehouse-specific closing-stock baselines. The transfer date
+must be strictly after both baselines; the later baseline is the effective boundary. Same-date
+and earlier transfers are reported as covered by closing stock. Product-level baseline fallback
+is deliberately disabled because it cannot establish warehouse distribution.
+
+The dry run reports source/destination stock, projected stock, both baseline dates, duplicate
+state, negative-stock decision, paired movement counts, and net company effect. Commit locks both
+warehouse stock keys deterministically and rechecks the same assumptions. `BLOCK` and
+`SKIP_STOCK_MOVEMENT` apply to the entire pair. `IMPORT_AS_IS` requires the tenant negative-stock
+setting and still creates both sides.
+
+Manual review allows an authorized user to select the tenant product, source warehouse,
+destination warehouse, and normalized quantity. Posting confirmation must exactly match
+`POST STOCK TRANSFER`. Manufacturing, unbalanced, ambiguous, and ignored journals remain
+visible but do not create stock movements. Duplicate pair fingerprints skip exact reimports;
+conflicting or one-sided historical effects require review.
+
+Worked example:
+
+```text
+2026-03-31 baselines:
+  Product A / East = 100
+  Product A / West = 40
+
+2026-04-02 transfer:
+  East -> West = 20
+
+Movements:
+  TRANSFER_OUT East = -20
+  TRANSFER_IN West = +20
+
+Result:
+  East = 80
+  West = 60
+  Company total = 140
+```
 
 ### Manual cashbook review resolution
 
@@ -199,14 +294,12 @@ Behavior:
 
 Closing Stock is a point-in-time stock snapshot; purchase, sales, credit-note, and debit-note rows are transactions. Importing historical transactions as movements after loading final closing stock would count the same inventory history twice.
 
-Transaction imports store one `voucherStockImpactMode`:
+Smart Import dry runs store one supported `voucherStockImpactMode`:
 
 - `CREATE_INVOICES_ONLY`: creates sales/purchase invoice headers and items, but no voucher stock movements. This is the safe default when the current tenant has a committed stock snapshot.
-- `CREATE_INVOICES_AND_STOCK_MOVEMENTS`: creates invoices/items and all purchase/sale/return movements. Historical rows on or before the snapshot date require explicit confirmation, and the override is audited as `VOUCHER_STOCK_IMPACT_OVERRIDE`.
-- `APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE`: creates invoices/items for every valid row, but stock movements only for vouchers dated after the latest snapshot date.
-- `BLOCK_IF_SNAPSHOT_EXISTS`: blocks commit until the user selects an intentional policy.
+- `APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE`: creates invoices/items for every valid row, but creates sales/purchase movements only when the voucher is strictly after its applicable snapshot.
 
-Snapshot lookup is tenant-scoped. The effective date is stored `snapshotDate` when available and otherwise falls back to the snapshot batch commit date. Preview shows the selected mode, latest snapshot date, and per-row movement action. Projected negative-stock validation only evaluates rows that will actually create movements.
+Unrestricted historical and return-stock modes are rejected in Phase 4B-2C. Snapshot lookup is tenant-scoped and prefers product+warehouse scope, with an explicit product-level fallback warning. Preview shows the selected mode, applicable snapshot, and per-row movement action. Projected negative-stock validation only evaluates rows that would actually create movements.
 
 ## Reconciliation
 
@@ -305,3 +398,15 @@ Import-focused tests cover:
 - Manual file-type override, durable warehouse review resolution, rebuild idempotency, and invalid Tally control-character sanitation.
 - Smart Import dry-run immutability, date-aware snapshot delta/no-change, before/after-snapshot voucher impact, duplicate voucher skipping, tenant isolation, portal denial, and dry-run replacement.
 - Smart Import Phase 4A preflight freshness, exact confirmation, master-data commit, party/warehouse matching, snapshot delta/no-change, negative-stock policies, deferred voucher counts, idempotent retry, transaction rollback, audit effects, tenant isolation, and customer-user denial.
+
+## Combined Tally Exports
+
+Smart Import recognizes combined exports instead of forcing the entire file into one business type:
+
+- `MIXED_TALLY_MASTERS` is used when the file contains both `STOCKITEM` and `LEDGER` masters.
+- `MIXED_TALLY_VOUCHERS` is used when the file contains more than one voucher `VCHTYPE`.
+- Stock items are routed to product staging. Only Sundry Debtor/Creditor ledgers are routed to party staging; bank, tax, sales, purchase, and expense ledgers are not converted into parties.
+- Sales, Purchase, Credit Note, Debit Note, Stock Journal, Receipt, and Payment rows are routed from each voucher's own `VCHTYPE`.
+- Contra and Journal vouchers are identified but deliberately kept outside sales/purchase staging because accounting remains in Tally.
+- Tally Sundry Debtor/Creditor reports using sibling `DSPACCNAME` and `DSPACCINFO` nodes are paired into outstanding party rows.
+- Classification and Tally parsing stream XML input. Large combined voucher exports are no longer copied into one in-memory XML string or one full-file DOM tree.

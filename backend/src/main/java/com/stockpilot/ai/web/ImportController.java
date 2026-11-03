@@ -132,9 +132,10 @@ public class ImportController {
     @PreAuthorize("@permissionService.has('stock.adjust') or @permissionService.has('purchases.create')")
     public Map<String, Object> invoiceUpload(@RequestPart("file") MultipartFile file) throws Exception {
         ImportService.validateUpload(file, Set.of("pdf", "png", "jpg", "jpeg", "webp", "csv", "xlsx", "xls", "xml"), 25L * 1024L * 1024L);
+        var extracted = extraction.extract(file);
         var key = TenantContext.tenantId() + "/invoice-uploads/" + System.currentTimeMillis() + "-" + (file.getOriginalFilename() == null ? "invoice" : file.getOriginalFilename().replaceAll("[^a-zA-Z0-9._-]", "_"));
         storage.store(key, file);
-        return Map.of("storageKey", key, "extraction", extraction.extract(file));
+        return Map.of("storageKey", key, "extraction", extracted);
     }
 
     private Map<String, Object> batch(ImportBatch batch) {

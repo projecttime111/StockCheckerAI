@@ -205,10 +205,7 @@ public class DashboardService {
     }
 
     private BigDecimal latestCost(java.util.UUID tenantId, java.util.UUID productId, BigDecimal fallback) {
-        return movements.findFirstByTenantIdAndProductIdAndMovementTypeOrderByMovementDateDesc(tenantId, productId, DomainEnums.MovementType.PURCHASE)
-            .map(movement -> movement.rate)
-            .filter(rate -> rate != null && rate.compareTo(BigDecimal.ZERO) > 0)
-            .orElse(fallback == null ? BigDecimal.ZERO : fallback);
+        return stockLedger.latestCost(tenantId, productId, fallback);
     }
 
     private BigDecimal grossMarginPercent(BigDecimal monthlySales, BigDecimal grossProfit) {

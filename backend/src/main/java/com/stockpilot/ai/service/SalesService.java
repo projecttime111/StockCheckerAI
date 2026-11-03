@@ -120,7 +120,8 @@ public class SalesService {
             subtotal = subtotal.add(lineSubtotal);
             tax = tax.add(lineTax);
             discount = discount.add(lineDiscount);
-            stockLedger.createMovement(tenantId, product.id, request.warehouseId(), DomainEnums.MovementType.SALE, line.quantity(), item.unitId, item.costRate, "SALES_INVOICE", invoice.id, request.invoiceDate().atStartOfDay().toInstant(ZoneOffset.UTC), "Sale " + request.invoiceNumber());
+            var sourceUnitCost = item.costRate.multiply(stockLedger.toBaseQuantity(tenantId, product, item.unitId, BigDecimal.ONE));
+            stockLedger.createMovement(tenantId, product.id, request.warehouseId(), DomainEnums.MovementType.SALE, line.quantity(), item.unitId, sourceUnitCost, "SALES_INVOICE", invoice.id, request.invoiceDate().atStartOfDay().toInstant(ZoneOffset.UTC), "Sale " + request.invoiceNumber());
         }
         invoice.subtotal = subtotal;
         invoice.taxAmount = tax;

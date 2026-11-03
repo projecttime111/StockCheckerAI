@@ -104,7 +104,7 @@ public class AuthService {
             issueVerificationEmail(user, Instant.now());
             return new ApiDtos.AuthMessageResponse("Registration successful. Please check your email to verify your account.", true);
         }
-        var token = jwtService.issue(user.id, tenant.id, user.email, membership.role);
+        var token = jwtService.issue(user.id, tenant.id, user.email, membership.role, user.authVersion);
         return new ApiDtos.AuthResponse(token, tenant.id, user.id, membership.role, user.email, user.fullName);
     }
 
@@ -128,11 +128,11 @@ public class AuthService {
         var membership = activeMembership(user.id);
         if (membership.isEmpty()) {
             auditService.log(null, user.id, "USER_LOGIN", "UserAccount", user.id, Map.of("workspaceRequired", true));
-            return new ApiDtos.AuthResponse(jwtService.issueAccountOnly(user.id, user.email), null, user.id, null, user.email, user.fullName);
+            return new ApiDtos.AuthResponse(jwtService.issueAccountOnly(user.id, user.email, user.authVersion), null, user.id, null, user.email, user.fullName);
         }
         var activeMembership = membership.orElseThrow();
         auditService.log(activeMembership.tenantId, user.id, "USER_LOGIN", "UserAccount", user.id, Map.of());
-        var token = jwtService.issue(user.id, activeMembership.tenantId, user.email, activeMembership.role);
+        var token = jwtService.issue(user.id, activeMembership.tenantId, user.email, activeMembership.role, user.authVersion);
         return new ApiDtos.AuthResponse(token, activeMembership.tenantId, user.id, activeMembership.role, user.email, user.fullName);
     }
 
@@ -166,11 +166,11 @@ public class AuthService {
         var membership = activeMembership(user.id);
         if (membership.isEmpty()) {
             auditService.log(null, user.id, "GOOGLE_LOGIN", "UserAccount", user.id, Map.of("workspaceRequired", true));
-            return new ApiDtos.AuthResponse(jwtService.issueAccountOnly(user.id, user.email), null, user.id, null, user.email, user.fullName);
+            return new ApiDtos.AuthResponse(jwtService.issueAccountOnly(user.id, user.email, user.authVersion), null, user.id, null, user.email, user.fullName);
         }
         var activeMembership = membership.orElseThrow();
         auditService.log(activeMembership.tenantId, user.id, "GOOGLE_LOGIN", "UserAccount", user.id, Map.of());
-        var token = jwtService.issue(user.id, activeMembership.tenantId, user.email, activeMembership.role);
+        var token = jwtService.issue(user.id, activeMembership.tenantId, user.email, activeMembership.role, user.authVersion);
         return new ApiDtos.AuthResponse(token, activeMembership.tenantId, user.id, activeMembership.role, user.email, user.fullName);
     }
 
@@ -181,10 +181,10 @@ public class AuthService {
         }
         var membership = activeMembership(user.id);
         if (membership.isEmpty()) {
-            return new ApiDtos.AuthResponse(jwtService.issueAccountOnly(user.id, user.email), null, user.id, null, user.email, user.fullName);
+            return new ApiDtos.AuthResponse(jwtService.issueAccountOnly(user.id, user.email, user.authVersion), null, user.id, null, user.email, user.fullName);
         }
         var activeMembership = membership.orElseThrow();
-        var token = jwtService.issue(user.id, activeMembership.tenantId, user.email, activeMembership.role);
+        var token = jwtService.issue(user.id, activeMembership.tenantId, user.email, activeMembership.role, user.authVersion);
         return new ApiDtos.AuthResponse(token, activeMembership.tenantId, user.id, activeMembership.role, user.email, user.fullName);
     }
 
@@ -246,6 +246,7 @@ public class AuthService {
             throw ApiErrors.badRequest("Password reset link is invalid or expired.");
         }
         user.passwordHash = passwordEncoder.encode(request.newPassword());
+        user.authVersion = Math.addExact(user.authVersion, 1);
         user.passwordResetTokenHash = null;
         user.passwordResetTokenExpiresAt = null;
         user.passwordResetUsedAt = now;

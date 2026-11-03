@@ -1,0 +1,26 @@
+<ENVELOPE>
+  <BODY>
+    <DATA>
+      <TALLYMESSAGE>
+        <VOUCHER VCHTYPE="Stock Journal" GUID="STOCK-JOURNAL-PRODUCTION-001">
+          <DATE>20260402</DATE>
+          <VOUCHERTYPENAME>Stock Journal</VOUCHERTYPENAME>
+          <VOUCHERNUMBER>SJ-PRODUCTION-001</VOUCHERNUMBER>
+          <NARRATION>Production consumption and finished goods</NARRATION>
+          <ALLINVENTORYENTRIES.LIST>
+            <STOCKITEMNAME>Raw Material</STOCKITEMNAME>
+            <ACTUALQTY>-10 Nos</ACTUALQTY>
+            <BILLEDQTY>-10 Nos</BILLEDQTY>
+            <GODOWNNAME>Warehouse East</GODOWNNAME>
+          </ALLINVENTORYENTRIES.LIST>
+          <ALLINVENTORYENTRIES.LIST>
+            <STOCKITEMNAME>Finished Product</STOCKITEMNAME>
+            <ACTUALQTY>5 Nos</ACTUALQTY>
+            <BILLEDQTY>5 Nos</BILLEDQTY>
+            <GODOWNNAME>Warehouse West</GODOWNNAME>
+          </ALLINVENTORYENTRIES.LIST>
+        </VOUCHER>
+      </TALLYMESSAGE>
+    </DATA>
+  </BODY>
+</ENVELOPE>

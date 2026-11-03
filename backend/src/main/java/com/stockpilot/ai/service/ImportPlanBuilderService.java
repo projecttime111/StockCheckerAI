@@ -23,7 +23,8 @@ public class ImportPlanBuilderService {
         DomainEnums.DetectedFileType.PURCHASE_VOUCHERS,
         DomainEnums.DetectedFileType.CREDIT_NOTES,
         DomainEnums.DetectedFileType.DEBIT_NOTES,
-        DomainEnums.DetectedFileType.STOCK_JOURNAL
+        DomainEnums.DetectedFileType.STOCK_JOURNAL,
+        DomainEnums.DetectedFileType.MIXED_TALLY_VOUCHERS
     );
 
     private final Repositories.ImportSessionRepository sessions;
@@ -60,7 +61,15 @@ public class ImportPlanBuilderService {
         var hasSnapshot = types.contains(DomainEnums.DetectedFileType.STOCK_SNAPSHOT);
         var transactionFileCount = types.stream().filter(TRANSACTION_TYPES::contains).count();
         var hasTransactions = transactionFileCount > 0;
-        var hasAccountingMaster = types.contains(DomainEnums.DetectedFileType.ACCOUNTING_MASTER);
+        var hasAccountingMaster = types.contains(DomainEnums.DetectedFileType.ACCOUNTING_MASTER)
+            || types.contains(DomainEnums.DetectedFileType.MIXED_TALLY_MASTERS);
+        var hasSales = types.contains(DomainEnums.DetectedFileType.SALES_VOUCHERS)
+            || contentCount(sessionFiles, "voucherSales") > 0;
+        var hasPurchases = types.contains(DomainEnums.DetectedFileType.PURCHASE_VOUCHERS)
+            || contentCount(sessionFiles, "voucherPurchase") > 0;
+        var hasCashbook = types.contains(DomainEnums.DetectedFileType.CASH_BOOK)
+            || contentCount(sessionFiles, "voucherReceipt") > 0
+            || contentCount(sessionFiles, "voucherPayment") > 0;
 
         var strategy = strategy(hasSnapshot, transactionFileCount);
         var explanation = explanation(strategy);
@@ -77,23 +86,31 @@ public class ImportPlanBuilderService {
                 "Transaction files and a stock snapshot were uploaded together.",
                 "Use hybrid reconciliation so historical vouchers do not double-count snapshot stock."));
         }
-        if (types.contains(DomainEnums.DetectedFileType.SALES_VOUCHERS) && !hasAccountingMaster) {
+        if (hasSales && !hasAccountingMaster) {
             generatedIssues.add(issue(session, null, DomainEnums.ImportPlanIssueSeverity.WARNING,
                 "SALES_WITHOUT_PARTY_MASTER",
                 "Sales files were detected without a separate customer/ledger master file.",
                 "Customers will need to be matched or created from voucher parties in a later phase."));
         }
-        if (types.contains(DomainEnums.DetectedFileType.PURCHASE_VOUCHERS) && !hasAccountingMaster) {
+        if (hasPurchases && !hasAccountingMaster) {
             generatedIssues.add(issue(session, null, DomainEnums.ImportPlanIssueSeverity.WARNING,
                 "PURCHASE_WITHOUT_SUPPLIER_MASTER",
                 "Purchase files were detected without a separate supplier/ledger master file.",
                 "Suppliers will need to be matched or created from voucher parties in a later phase."));
         }
-        if (types.contains(DomainEnums.DetectedFileType.CASH_BOOK)) {
+        if (hasCashbook) {
             generatedIssues.add(issue(session, null, DomainEnums.ImportPlanIssueSeverity.WARNING,
                 "CASHBOOK_MATCHING_LIMITED",
                 "Cashbook matching is limited until invoice and party references are reconciled.",
                 "Review unmatched receipts and payments before a future commit."));
+        }
+        var deferredAccountingVouchers = contentCount(sessionFiles, "voucherContra")
+            + contentCount(sessionFiles, "voucherJournal");
+        if (deferredAccountingVouchers > 0) {
+            generatedIssues.add(issue(session, null, DomainEnums.ImportPlanIssueSeverity.INFO,
+                "NON_INVENTORY_ACCOUNTING_VOUCHERS_DEFERRED",
+                deferredAccountingVouchers + " Contra/Journal vouchers were identified and kept outside sales and purchase staging.",
+                "Accounting remains in Tally; these voucher types are not posted as inventory invoices."));
         }
         if (types.contains(DomainEnums.DetectedFileType.STOCK_AGEING)) {
             generatedIssues.add(issue(session, null, DomainEnums.ImportPlanIssueSeverity.INFO,
@@ -119,6 +136,19 @@ public class ImportPlanBuilderService {
         session.status = needsReview ? DomainEnums.ImportSessionStatus.NEEDS_REVIEW : DomainEnums.ImportSessionStatus.PLAN_READY;
         sessions.save(session);
         return plan;
+    }
+
+    private int contentCount(List<ImportSessionFile> sessionFiles, String key) {
+        return sessionFiles.stream()
+            .filter(file -> file.status != DomainEnums.ImportSessionFileStatus.DUPLICATE)
+            .map(file -> file.metadataJson == null ? null : file.metadataJson.get("contentCounts"))
+            .filter(Map.class::isInstance)
+            .map(Map.class::cast)
+            .map(map -> map.get(key))
+            .filter(Number.class::isInstance)
+            .map(Number.class::cast)
+            .mapToInt(Number::intValue)
+            .sum();
     }
 
     @Transactional

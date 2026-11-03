@@ -242,7 +242,7 @@ Set `EXPO_PUBLIC_API_URL=http://localhost:8080`. Android emulators may need `htt
 
 ## Import Workflow
 
-### Smart Import Workspace (Phase 4B-2B)
+### Smart Import Workspace (Phase 4B-2D)
 
 Open `/imports/smart` to create a Smart Import Session and upload multiple XML, CSV, XLSX/XLS, or JSON exports in any order. StockPilot stores every file under the current tenant, computes a SHA-256 hash, detects likely file purpose from content, extracts company/date information where available, warns about duplicate files, and builds a draft dependency-aware import plan.
 
@@ -256,7 +256,7 @@ Stock snapshots are date-aware during dry run: `deltaAtSnapshotDate = importedSn
 
 Phase 4A enables a deliberately limited **Safe Foundation Commit** after a clean dry run. It transactionally creates or reuses units, warehouses/godowns, products, customers/suppliers, external mappings, and stock-snapshot delta adjustments. The request requires the exact confirmation `COMMIT IMPORT PLAN`, a fresh completed dry run, zero blocking errors, and zero unresolved review-required items. File, staging, stock-at-date, or review changes invalidate the dry run and require another simulation.
 
-Phase 4B-1 extends the same transaction with invoice-only sales and purchase posting. Reviewed vouchers create tenant-scoped invoice headers and items, but create no `SALE` or `PURCHASE` stock movements. This is the only Smart Import voucher mode currently exposed because a closing-stock snapshot already represents inventory and historical movements would count it twice.
+Phase 4B-1 extends the same transaction with invoice-only sales and purchase posting. Reviewed vouchers create tenant-scoped invoice headers and items but create no `SALE` or `PURCHASE` stock movements.
 
 Phase 4B-2A adds financial-only credit and debit note posting. Notes are stored as tenant-scoped financial adjustments with their product references and GST/tax, discount, freight, round-off, and other-charge components. They do not create return stock movements, so the closing-stock snapshot remains the inventory source of truth.
 
@@ -264,17 +264,27 @@ Phase 4B-2B adds debtor/creditor outstanding snapshots and confidence-based cash
 
 Unmatched and low-confidence cashbook rows can be resolved from the Smart Import **Review Queue** after staging or after the safe commit. An authorized import committer can select a ranked tenant-local customer, supplier, sales invoice, or purchase invoice candidate, inspect the confidence reason, and explicitly confirm `POST PAYMENT`. The selected payment is created immediately and linked to the invoice when applicable. Entries may instead be marked non-business/ignored or left unresolved. Manual resolutions update the existing commit reconciliation and emit dedicated audit events; `CUSTOMER_USER` cannot view or resolve this queue.
 
+Phase 4B-2C adds an explicit inventory-effect choice. `CREATE_INVOICES_ONLY` preserves the Phase 4B-1 behavior. `APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE` treats the latest applicable tenant/product/warehouse closing-stock snapshot as the inventory baseline: sales and purchases strictly after its date create `SALE` and `PURCHASE` movements; same-date and earlier vouchers remain invoice-only. If only a product-level snapshot exists, the dry run warns that warehouse precision is unavailable. A missing snapshot or unresolved stock-item warehouse blocks the post-snapshot mode instead of guessing.
+
+Phase 4B-2D adds a separate return inventory-effect choice. `FINANCIAL_ONLY` preserves stock-neutral credit/debit note posting. `APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE` creates `RETURN_IN` for confirmed customer returns and `RETURN_OUT` for confirmed supplier returns only when the note is strictly after the applicable closing-stock snapshot. Same-date and earlier notes remain financial-only. GST, discount, freight, round-off, ledger-only, service, and zero-quantity lines never create stock movements.
+
+Credit/debit note wording alone is not physical-return proof. StockPilot checks product, non-zero quantity, inventory allocation, and godown evidence. Conflicting billed/actual quantities, missing product/godown, or damaged, expired, rejected, scrap, and non-saleable evidence enter **Physical Return Review**. Authorized users may select a tenant product and warehouse, confirm the normalized quantity and `RESTOCK_TO_AVAILABLE`, and type the exact phrase `POST RETURN STOCK`; they may instead confirm financial-only or leave the line unresolved. `CUSTOMER_USER` cannot access this workflow.
+
+Return stock effects reuse snapshot eligibility, stock-key locking, negative-stock policy, transactional commit, and tenant-scoped stock-effect fingerprints. Re-importing the same note does not create a second return movement. A purchase return that would make stock negative is blocked, skipped, or imported as-is according to the selected policy; import-as-is still requires `tenant.allowNegativeStock=true`. Damaged/non-saleable goods are not automatically added to available stock.
+
+The post-snapshot dry run and commit share one eligibility service. They report the snapshot used, voucher date, current and projected stock, movement quantity/type, decision reason, warehouse, duplicate result, and negative-stock outcome. `BLOCK` prevents a projected negative sale, `SKIP_STOCK_MOVEMENT` may commit the invoice while skipping the movement, and `IMPORT_AS_IS` is available only when the tenant allows negative stock. Stock keys are locked and current stock is rechecked against the dry run before each write.
+
 Outstanding is an operational MVP projection, not a statutory accounting ledger. The latest imported snapshot is used as the baseline, then later invoices, financial adjustments, and payments are applied. When no snapshot exists, StockPilot falls back to opening balance plus known documents and payments. Tally remains the accounting system of record.
 
-The Phase 4B-2B commit is tenant-scoped, transactional, audited, and idempotent. A failed business write rolls back all foundation, invoice, financial-adjustment, outstanding-snapshot, and payment changes and records a safe FAILED result. Voucher identity uses a Tally external ID when available plus a tenant-scoped fingerprint of type, number, date, party, and amount. Exact repeats are skipped; conflicting reuse of a number or external identity is blocked for review. Retrying an already committed session returns its existing result without duplicating invoices, financial notes, payments, snapshots, items, products, parties, mappings, or movements. Snapshot rows still use `delta = imported quantity - stock at snapshot date`.
+The Phase 4B-2D commit is tenant-scoped, transactional, audited, and idempotent. A failed business write rolls back all foundation, invoice, stock-movement, financial-adjustment, outstanding-snapshot, and payment changes and records a safe FAILED result. Voucher identity uses a Tally external ID when available plus a tenant-scoped fingerprint of type, number, date, party, and amount. Eligible stock effects also have a tenant-scoped fingerprint and retain their invoice/note item, source file/row/session, selected snapshot baseline, and decision reason. Exact repeats are skipped; conflicting reuse of a number or external identity is blocked for review. Retrying an already committed session returns its existing result without duplicating invoices, financial notes, payments, snapshots, items, products, parties, mappings, or movements.
 
 Smart Import Session APIs are tenant-scoped and permission protected:
 
 - `imports.view`: list/read sessions, files, plans, staging previews, matching results, and review items.
 - `imports.upload`: create/cancel sessions and upload files.
-- `imports.validate`: classify files, stage/rebuild canonical records, override file types, and resolve supported review items.
+- `imports.validate`: classify files, stage/rebuild canonical records, override file types, and resolve supported review items, including ambiguous returns.
 - `imports.validate`: also run/read the latest dry run and filter its paginated items.
-- `imports.commit`: execute/read the Phase 4B-2B foundation, invoice-only, financial-adjustment, outstanding-snapshot, and matched-payment commit and reconciliation.
+- `imports.commit`: execute/read the Phase 4B-2D foundation, invoice, eligible post-snapshot sale/purchase/return movement, financial-adjustment, outstanding-snapshot, and matched-payment commit and reconciliation.
 - `CUSTOMER_USER` has no Smart Import access.
 
 Dry-run APIs:
@@ -283,10 +293,12 @@ Dry-run APIs:
 - `GET /api/import-sessions/{sessionId}/dry-run`
 - `GET /api/import-sessions/{sessionId}/dry-run/items?itemType=&action=&issue=&sourceFileId=`
 
-Phase 4B-2B commit APIs:
+Phase 4B-2D commit and return-review APIs:
 
 - `POST /api/import-sessions/{sessionId}/commit`
 - `GET /api/import-sessions/{sessionId}/commit-result`
+- `GET /api/import-sessions/{sessionId}/return-review`
+- `POST /api/import-sessions/{sessionId}/return-review/{itemId}/resolve`
 
 The existing `/imports` route remains the operational single-file workflow:
 
@@ -311,7 +323,15 @@ Tally stock report XML can contain negative stock rows in `DSPACCNAME` / `DSPSTK
 
 Closing stock / stock report XML is a snapshot. StockPilot AI treats `DSPACCNAME` / `DSPSTKINFO` / `DSPCLQTY` exports as `STOCK_SNAPSHOT` imports and calculates `delta = imported closing stock - current stock`. Re-importing the same closing stock file creates no stock movement and does not double stock. If an older test import overcounted stock, re-importing the latest closing stock snapshot corrects current stock by delta.
 
-Voucher stock impact is selected per transaction import. If a committed closing-stock snapshot already exists, StockPilot defaults purchase/sales voucher imports to `CREATE_INVOICES_ONLY`: invoice headers and items are created for analytics, but historical vouchers do not change current stock. `CREATE_INVOICES_AND_STOCK_MOVEMENTS` is transaction-history mode and requires explicit confirmation when historical vouchers overlap a snapshot. `APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE` creates movements only for voucher dates after the latest snapshot date. To build inventory entirely from history, import opening stock followed by purchases and sales instead of importing closing stock first. Do not mix a final closing-stock snapshot with historical stock movements without choosing the intended mode.
+Voucher, return, and stock-journal inventory effects are selected independently per Smart Import dry run. `CREATE_INVOICES_ONLY` creates invoice headers/items without changing stock. `APPLY_STOCK_MOVEMENTS_AFTER_SNAPSHOT_DATE` creates movements only for valid sales/purchase items strictly after their applicable snapshot. `APPLY_PHYSICAL_RETURNS_AFTER_SNAPSHOT_DATE` does the same for confirmed physical returns. `DEFER_STOCK_JOURNALS` is the default for stock journals. `APPLY_CONFIRMED_WAREHOUSE_TRANSFERS_AFTER_SNAPSHOT_DATE` posts only balanced, confirmed non-manufacturing transfers strictly after both warehouse-specific baselines. Same-date transactions are conservatively covered by the snapshot. Unrestricted historical posting is not exposed. Manufacturing, unilateral stock adjustments, damaged/quarantine stock, and stock-ageing reconciliation remain deferred.
+
+Worked example: closing stock on `2026-03-31` is Product A `100`. A `2026-03-30` sale of `10` and a `2026-03-31` purchase of `5` are invoice-only. A `2026-04-01` purchase of `20` creates `PURCHASE +20`; a `2026-04-02` sale of `15` creates `SALE -15`. Final supported stock is `105`.
+
+Return example: closing stock on `2026-03-31` is Product A `100`. A `2026-03-30` customer return of `5` and a `2026-03-31` supplier return of `4` are financial-only because the snapshot covers them. A confirmed `2026-04-01` customer return creates `RETURN_IN +10`; a confirmed `2026-04-02` supplier return creates `RETURN_OUT -6`. Final supported stock is `104`.
+
+Warehouse transfer example: closing-stock baselines on `2026-03-31` show Product A `100` in Warehouse East and `40` in Warehouse West. A confirmed `2026-04-02` transfer of `20` creates `TRANSFER_OUT -20` in East and `TRANSFER_IN +20` in West under one transfer group. Final stock is East `80`, West `60`, and company total remains `140`. A transfer on `2026-03-31` is treated as covered by the snapshots. A product-level snapshot without warehouse allocation is not sufficient.
+
+Transfer review is tenant-scoped and requires `imports.validate`; final posting requires `imports.commit`. Exact manual confirmation is `POST STOCK TRANSFER`. Duplicate fingerprints protect same-session retries and repeated uploads. The pair is locked and committed atomically, and negative-stock policy is applied to both sides together.
 
 Undo/replace support:
 - `SAFE_REVERSAL` is the default undo strategy. It creates reversing stock adjustments for import-created stock movements and deletes only import-created products/parties/catalog rows that are unused.
@@ -337,7 +357,7 @@ The Tally XML adapter tolerates missing optional fields and extracts common `STO
 
 For Tally purchase vouchers, StockPilot reads unit-formatted rates such as `30.00/Nos`, derives a missing rate from `abs(amount) / abs(quantity)` when both values are usable, and normalizes a negative rate sign with a warning. A purchase inventory line with positive quantity and no rate or amount is treated as a zero-cost free/scheme item: it creates a purchase invoice item and stock movement at zero line value without replacing an existing positive product cost. Tally tax, discount, freight, and round-off ledger allocations are not staged as products or stock movements. Raw rate, amount, and quantity remain in import metadata for review.
 
-Large Tally sales/purchase XML exports can be much bigger than master/stock reports. The local backend default accepts import files up to `150MB` (`IMPORT_MAX_UPLOAD_SIZE` / `UPLOAD_MAX_FILE_SIZE`) and requests up to `160MB` (`UPLOAD_MAX_REQUEST_SIZE`). Increase those values or split the export if your file is larger.
+Large Tally sales/purchase XML exports can be much bigger than master/stock reports. The local backend default accepts import files up to `500MB` (`IMPORT_MAX_UPLOAD_SIZE` / `UPLOAD_MAX_FILE_SIZE`) and requests up to `525MB` (`UPLOAD_MAX_REQUEST_SIZE`). Split exports larger than this by financial year or quarter instead of removing the upload cap.
 
 Open `/integrations/tally` after login to review the companion import dashboard: last successful import, products/customers/suppliers imported, sales and purchase voucher counts, errors, unmapped fields, duplicate items, missing GST/HSN/unit/category warnings, and generated insights.
 

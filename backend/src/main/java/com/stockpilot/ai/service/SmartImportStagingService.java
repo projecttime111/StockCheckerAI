@@ -16,6 +16,7 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.*;
+import java.util.stream.Collectors;
 
 @Service
 public class SmartImportStagingService {
@@ -39,6 +40,7 @@ public class SmartImportStagingService {
     private final Repositories.SmartStagedStockSnapshotRepository stagedSnapshots;
     private final Repositories.SmartStagedVoucherRepository stagedVouchers;
     private final Repositories.SmartStagedVoucherItemRepository stagedVoucherItems;
+    private final Repositories.SmartStagedTransferCandidateRepository stagedTransfers;
     private final Repositories.SmartStagedCashbookEntryRepository stagedCashbook;
     private final Repositories.SmartStagedStockAgeingRepository stagedAgeing;
     private final Repositories.SmartImportResolutionRepository resolutions;
@@ -56,8 +58,12 @@ public class SmartImportStagingService {
     private final SmartImportCanonicalParserService parser;
     private final ImportPlanBuilderService planBuilder;
     private final StockLedgerService stockLedger;
+    private final SmartImportReturnService returnService;
+    private final SmartImportTransferService transferService;
     private final ObjectStorageService storage;
     private final AuditService audit;
+    private final RetailCounterSaleService retailSales;
+    private final SmartImportCashbookMatchingService cashbookMatching;
 
     public SmartImportStagingService(
         Repositories.ImportSessionRepository sessions,
@@ -71,6 +77,7 @@ public class SmartImportStagingService {
         Repositories.SmartStagedStockSnapshotRepository stagedSnapshots,
         Repositories.SmartStagedVoucherRepository stagedVouchers,
         Repositories.SmartStagedVoucherItemRepository stagedVoucherItems,
+        Repositories.SmartStagedTransferCandidateRepository stagedTransfers,
         Repositories.SmartStagedCashbookEntryRepository stagedCashbook,
         Repositories.SmartStagedStockAgeingRepository stagedAgeing,
         Repositories.SmartImportResolutionRepository resolutions,
@@ -88,8 +95,12 @@ public class SmartImportStagingService {
         SmartImportCanonicalParserService parser,
         ImportPlanBuilderService planBuilder,
         StockLedgerService stockLedger,
+        SmartImportReturnService returnService,
+        SmartImportTransferService transferService,
         ObjectStorageService storage,
-        AuditService audit
+        AuditService audit,
+        RetailCounterSaleService retailSales,
+        SmartImportCashbookMatchingService cashbookMatching
     ) {
         this.sessions = sessions;
         this.files = files;
@@ -102,6 +113,7 @@ public class SmartImportStagingService {
         this.stagedSnapshots = stagedSnapshots;
         this.stagedVouchers = stagedVouchers;
         this.stagedVoucherItems = stagedVoucherItems;
+        this.stagedTransfers = stagedTransfers;
         this.stagedCashbook = stagedCashbook;
         this.stagedAgeing = stagedAgeing;
         this.resolutions = resolutions;
@@ -119,8 +131,12 @@ public class SmartImportStagingService {
         this.parser = parser;
         this.planBuilder = planBuilder;
         this.stockLedger = stockLedger;
+        this.returnService = returnService;
+        this.transferService = transferService;
         this.storage = storage;
         this.audit = audit;
+        this.retailSales = retailSales;
+        this.cashbookMatching = cashbookMatching;
     }
 
     @Transactional
@@ -130,6 +146,7 @@ public class SmartImportStagingService {
 
     @Transactional
     public Map<String, Object> rebuild(UUID sessionId) {
+        retailSales.lockCashbook(TenantContext.tenantId());
         var session = session(sessionId);
         ensureMutable(session);
         var sessionFiles = files.findByTenantIdAndImportSessionIdOrderByCreatedAtAsc(session.tenantId, session.id);
@@ -147,6 +164,8 @@ public class SmartImportStagingService {
         var warehouseIndex = new LinkedHashMap<String, SmartStagedWarehouse>();
         var unitIndex = new LinkedHashMap<String, SmartStagedUnit>();
         var voucherIndex = new LinkedHashMap<String, SmartStagedVoucher>();
+        var resolutionMap = resolutions.findByTenantIdAndImportSessionId(session.tenantId, session.id).stream()
+            .collect(java.util.stream.Collectors.toMap(row -> row.resolutionKey, row -> row, (left, right) -> right));
 
         for (var file : sessionFiles) {
             if (file.status == DomainEnums.ImportSessionFileStatus.DUPLICATE || effectiveType(file) == DomainEnums.DetectedFileType.UNKNOWN) {
@@ -154,7 +173,8 @@ public class SmartImportStagingService {
             }
             try {
                 var rows = parser.parse(session.tenantId, session.id, file);
-                stageRows(session, file, rows, productIndex, partyIndex, warehouseIndex, unitIndex, voucherIndex);
+                stageRows(session, file, rows, productIndex, partyIndex, warehouseIndex, unitIndex, voucherIndex,
+                    resolutionMap);
             } catch (Exception ex) {
                 parseFailures.add(new ParseFailure(file, safeMessage(ex)));
             }
@@ -235,6 +255,9 @@ public class SmartImportStagingService {
         ensureMutable(session);
         var item = issues.findByTenantIdAndImportSessionIdAndId(session.tenantId, session.id, itemId)
             .orElseThrow(() -> ApiErrors.notFound("Review item not found"));
+        if ("INVALID_RATE".equals(item.code) || "ZERO_RATE_ITEM".equals(item.code)) {
+            throw ApiErrors.badRequest("Use the voucher rate review endpoint for this item");
+        }
         var normalizedAction = action == null ? "" : action.trim().toUpperCase(Locale.ROOT);
         var allowed = item.availableChoices.stream().map(choice -> String.valueOf(choice.get("action"))).toList();
         if (!allowed.contains(normalizedAction)) {
@@ -273,6 +296,175 @@ public class SmartImportStagingService {
         return rebuild(session.id);
     }
 
+    @Transactional
+    public void lockRateReview(UUID sessionId) {
+        retailSales.lockCashbook(TenantContext.tenantId());
+        ensureMutable(session(sessionId));
+    }
+
+    @Transactional
+    public Map<String, Object> applyVoucherExclusions(UUID sessionId, List<ImportPlanIssue> selected, String reason) {
+        lockRateReview(sessionId);
+        var session = session(sessionId);
+        var vouchers = stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(session.tenantId, session.id);
+        var selectedIds = selected.stream().map(issue -> UUID.fromString(
+            Objects.toString(issue.contextJson.get("voucherId")))).collect(Collectors.toSet());
+        var excluded = vouchers.stream().filter(row -> selectedIds.contains(row.id)).toList();
+        if (excluded.size() != selectedIds.size()) throw ApiErrors.conflict("Staged vouchers changed. Refresh the review queue.");
+        for (var voucher : excluded) {
+            voucher.rawMetadataJson.put("excludedFromCommit", true);
+            voucher.rawMetadataJson.put("exclusionReason", reason == null ? "" : reason.trim());
+            voucher.rawMetadataJson.put("voucherResolutionKey", voucherResolutionKey(voucher));
+            voucher.reviewStatus = DomainEnums.SmartReviewStatus.IGNORED;
+        }
+        stagedVouchers.saveAll(excluded);
+
+        var items = stagedVoucherItems.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id);
+        var removedItems = items.stream().filter(row -> selectedIds.contains(row.stagedVoucherId)).toList();
+        var retainedItems = items.stream().filter(row -> !selectedIds.contains(row.stagedVoucherId)).toList();
+        var removedIds = new HashSet<UUID>(selectedIds);
+        removedItems.forEach(row -> removedIds.add(row.id));
+        var excludedSources = new HashSet<String>();
+        removedItems.forEach(row -> excludedSources.add(row.sessionFileId + ":" + row.sourceRowNumber));
+        excluded.forEach(row -> excludedSources.add(row.sessionFileId + ":" + row.sourceRowNumber));
+
+        // A previous dry run must never be committed after changing voucher eligibility.
+        dryRunItems.deleteByTenantIdAndImportSessionId(session.tenantId, session.id);
+        dryRuns.deleteByTenantIdAndImportSessionId(session.tenantId, session.id);
+        stagedVoucherItems.deleteAll(removedItems);
+        pruneExcludedCandidates(session, vouchers, retainedItems, excludedSources, removedIds);
+        var obsoleteIssues = issues.findByTenantIdAndImportSessionIdOrderByCreatedAtAsc(session.tenantId, session.id).stream()
+            .filter(issue -> removedIds.stream().anyMatch(id -> id.toString().equals(
+                Objects.toString(issue.contextJson.get("stagingId"), ""))
+                || id.toString().equals(Objects.toString(issue.contextJson.get("voucherId"), ""))))
+            .toList();
+        issues.deleteAll(obsoleteIssues);
+        applySessionReviewState(session);
+        return workspace(session.id);
+    }
+
+    @Transactional
+    public Map<String, Object> applyVoucherRates(UUID sessionId, List<ImportPlanIssue> selected) {
+        lockRateReview(sessionId);
+        var session = session(sessionId);
+        var vouchers = stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(session.tenantId, session.id);
+        var byId = vouchers.stream().collect(Collectors.toMap(row -> row.id, row -> row));
+        var affectedFingerprints = new HashSet<String>();
+        for (var issue : selected) {
+            var itemId = UUID.fromString(Objects.toString(issue.contextJson.get("stagingId")));
+            var item = stagedVoucherItems.findByTenantIdAndImportSessionIdAndId(session.tenantId, session.id, itemId)
+                .orElseThrow(() -> ApiErrors.conflict("Staged item changed. Refresh the review queue."));
+            var voucher = byId.get(item.stagedVoucherId);
+            if (voucher == null || excludedVoucher(voucher)) throw ApiErrors.conflict("This voucher is no longer available for rate review.");
+            var resolution = resolutions.findByTenantIdAndImportSessionIdAndResolutionKey(session.tenantId, session.id,
+                rateResolutionKey(item.sessionFileId, item.sourceRowNumber)).orElseThrow();
+            var before = stagedLineValue(item);
+            affectedFingerprints.add(voucher.fingerprint);
+            applyRateResolution(item, resolution);
+            if (item.rate == null || item.rate.signum() < 0 || "INVALID".equalsIgnoreCase(item.rateSource)) {
+                throw ApiErrors.badRequest("The saved resolution cannot be applied to this staged line.");
+            }
+            var delta = stagedLineValue(item).subtract(before);
+            voucher.totalAmount = nvl(voucher.totalAmount).add(delta);
+            voucher.rawMetadataJson.put("inventoryLineAmountTotal",
+                metadataDecimal(voucher.rawMetadataJson, "inventoryLineAmountTotal").add(delta).toPlainString());
+            voucher.fingerprint = fingerprint(session.tenantId, voucher);
+            affectedFingerprints.add(voucher.fingerprint);
+            stagedVoucherItems.save(item);
+        }
+        // Recheck both old and new duplicate groups without reparsing files or replacing staging IDs.
+        var parties = stagedParties.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id);
+        var seen = new HashSet<String>();
+        var changed = new ArrayList<SmartStagedVoucher>();
+        for (var voucher : vouchers) {
+            if (excludedVoucher(voucher)) continue;
+            var repeated = voucher.fingerprint != null && !seen.add(voucher.fingerprint);
+            if (!affectedFingerprints.contains(voucher.fingerprint)) continue;
+            var party = parties.stream().filter(row -> Objects.equals(row.normalizedName, voucher.normalizedPartyName)).findFirst().orElse(null);
+            updateVoucherMatch(session.tenantId, voucher, party, repeated);
+            changed.add(voucher);
+        }
+        stagedVouchers.saveAll(changed);
+        var changedIds = changed.stream().map(row -> row.id.toString()).collect(Collectors.toSet());
+        var obsolete = issues.findByTenantIdAndImportSessionIdOrderByCreatedAtAsc(session.tenantId, session.id).stream()
+            .filter(issue -> "VOUCHER".equals(issue.contextJson.get("entityType"))
+                && changedIds.contains(Objects.toString(issue.contextJson.get("stagingId"), ""))).toList();
+        issues.deleteAll(obsolete);
+        issues.deleteAll(selected);
+        for (var voucher : changed) {
+            if (voucher.reviewStatus != DomainEnums.SmartReviewStatus.PENDING) continue;
+            var conflict = voucher.matchStatus == DomainEnums.SmartMatchStatus.AMBIGUOUS_REVIEW;
+            issues.save(reviewIssue(session, voucher.sessionFileId, voucher.sourceRowNumber,
+                conflict ? DomainEnums.ImportPlanIssueSeverity.REVIEW_REQUIRED : DomainEnums.ImportPlanIssueSeverity.ERROR,
+                conflict ? "DUPLICATE_VOUCHER_CONFLICT" : "MISSING_REQUIRED_IDENTITY",
+                conflict ? "Voucher identity or amount requires review: " + nullSafe(voucher.voucherNumber)
+                    : "Voucher is missing number, date, or party identity.",
+                "Review the voucher identity before commit.", List.of(),
+                Map.of("entityType", "VOUCHER", "stagingId", voucher.id.toString())));
+        }
+        dryRunItems.deleteByTenantIdAndImportSessionId(session.tenantId, session.id);
+        dryRuns.deleteByTenantIdAndImportSessionId(session.tenantId, session.id);
+        applySessionReviewState(session);
+        return workspace(session.id);
+    }
+
+    private BigDecimal stagedLineValue(SmartStagedVoucherItem item) {
+        return item.amount != null ? item.amount.abs()
+            : item.quantity != null && item.rate != null ? item.quantity.multiply(item.rate).abs() : ZERO;
+    }
+
+    private void pruneExcludedCandidates(
+        ImportSession session, List<SmartStagedVoucher> vouchers, List<SmartStagedVoucherItem> retainedItems,
+        Set<String> excludedSources, Set<UUID> removedIds
+    ) {
+        var snapshots = stagedSnapshots.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id);
+        var ageing = stagedAgeing.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id);
+        var usedProducts = new HashSet<String>();
+        retainedItems.forEach(row -> usedProducts.add(productKey(row.normalizedProductName, row.unitCode)));
+        snapshots.forEach(row -> usedProducts.add(productKey(row.normalizedProductName, row.unitCode)));
+        ageing.forEach(row -> usedProducts.add(productKey(row.normalizedProductName, row.unitCode)));
+        var sourceFiles = files.findByTenantIdAndImportSessionIdOrderByCreatedAtAsc(session.tenantId, session.id);
+        // Master declarations can share a candidate first encountered in a voucher file.
+        var hasInventoryMaster = sourceFiles.stream().anyMatch(file -> effectiveType(file) == DomainEnums.DetectedFileType.INVENTORY_MASTER
+            || effectiveType(file) == DomainEnums.DetectedFileType.MIXED_TALLY_MASTERS);
+        var hasPartyMaster = sourceFiles.stream().anyMatch(file -> effectiveType(file) == DomainEnums.DetectedFileType.ACCOUNTING_MASTER
+            || effectiveType(file) == DomainEnums.DetectedFileType.MIXED_TALLY_MASTERS);
+        var productRows = stagedProducts.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id);
+        var orphanProducts = productRows.stream().filter(row -> !hasInventoryMaster
+            && excludedSources.contains(row.sessionFileId + ":" + row.sourceRowNumber)
+            && !usedProducts.contains(productKey(row.normalizedName, row.unitCode))).toList();
+        orphanProducts.forEach(row -> removedIds.add(row.id));
+        stagedProducts.deleteAll(orphanProducts);
+
+        var usedParties = new HashSet<String>();
+        vouchers.stream().filter(row -> !excludedVoucher(row)).forEach(row -> usedParties.add(row.normalizedPartyName));
+        stagedCashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(session.tenantId, session.id)
+            .forEach(row -> usedParties.add(normalizeName(row.partyName)));
+        var orphanParties = stagedParties.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id).stream()
+            .filter(row -> !hasPartyMaster && row.sourceType != DomainEnums.DetectedFileType.DEBTOR_CREDITOR_ANALYSIS
+                && excludedSources.contains(row.sessionFileId + ":" + row.sourceRowNumber)
+                && !usedParties.contains(row.normalizedName)).toList();
+        orphanParties.forEach(row -> removedIds.add(row.id));
+        stagedParties.deleteAll(orphanParties);
+
+        var usedUnits = new HashSet<String>();
+        var usedWarehouses = new HashSet<String>();
+        retainedItems.forEach(row -> { usedUnits.add(row.unitCode); usedWarehouses.add(normalizeName(row.warehouseName)); });
+        snapshots.forEach(row -> { usedUnits.add(row.unitCode); usedWarehouses.add(normalizeName(row.warehouseName)); });
+        ageing.forEach(row -> usedUnits.add(row.unitCode));
+        productRows.stream().filter(row -> !removedIds.contains(row.id)).forEach(row -> usedUnits.add(row.unitCode));
+        var orphanUnits = stagedUnits.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id).stream()
+            .filter(row -> !hasInventoryMaster && excludedSources.contains(row.sessionFileId + ":" + row.sourceRowNumber)
+                && !usedUnits.contains(row.normalizedCode)).toList();
+        orphanUnits.forEach(row -> removedIds.add(row.id));
+        stagedUnits.deleteAll(orphanUnits);
+        var orphanWarehouses = stagedWarehouses.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id).stream()
+            .filter(row -> !hasInventoryMaster && excludedSources.contains(row.sessionFileId + ":" + row.sourceRowNumber)
+                && !usedWarehouses.contains(row.normalizedName)).toList();
+        orphanWarehouses.forEach(row -> removedIds.add(row.id));
+        stagedWarehouses.deleteAll(orphanWarehouses);
+    }
+
     public List<Map<String, Object>> reviewItems(UUID sessionId) {
         var session = session(sessionId);
         var names = files.findByTenantIdAndImportSessionIdOrderByCreatedAtAsc(session.tenantId, session.id).stream()
@@ -296,6 +488,8 @@ public class SmartImportStagingService {
         response.put("snapshots", stagedSnapshots.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id).stream().limit(PREVIEW_LIMIT).map(this::snapshotRow).toList());
         response.put("vouchers", stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(session.tenantId, session.id).stream().limit(PREVIEW_LIMIT).map(this::voucherRow).toList());
         response.put("voucherItems", stagedVoucherItems.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id).stream().limit(PREVIEW_LIMIT).map(this::voucherItemRow).toList());
+        response.put("transferCandidates", stagedTransfers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(
+            session.tenantId, session.id).stream().limit(PREVIEW_LIMIT).map(this::transferRow).toList());
         response.put("cashbookEntries", stagedCashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(session.tenantId, session.id).stream().limit(PREVIEW_LIMIT).map(this::cashbookRow).toList());
         response.put("stockAgeing", stagedAgeing.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id).stream().limit(PREVIEW_LIMIT).map(this::ageingRow).toList());
         response.put("reviewItems", reviewItems(session.id));
@@ -311,7 +505,8 @@ public class SmartImportStagingService {
         Map<String, SmartStagedParty> partyIndex,
         Map<String, SmartStagedWarehouse> warehouseIndex,
         Map<String, SmartStagedUnit> unitIndex,
-        Map<String, SmartStagedVoucher> voucherIndex
+        Map<String, SmartStagedVoucher> voucherIndex,
+        Map<String, SmartImportResolution> resolutionMap
     ) {
         var type = effectiveType(file);
         for (int index = 0; index < rows.size(); index++) {
@@ -320,15 +515,95 @@ public class SmartImportStagingService {
             switch (type) {
                 case INVENTORY_MASTER -> stageInventoryRow(session, file, type, rowNumber, row, productIndex, warehouseIndex, unitIndex);
                 case ACCOUNTING_MASTER -> stagePartyCandidate(session, file, type, rowNumber, row, partyType(type, row), partyIndex);
+                case MIXED_TALLY_MASTERS -> stageMixedMasterRow(
+                    session, file, rowNumber, row, productIndex, partyIndex, warehouseIndex, unitIndex);
                 case STOCK_SNAPSHOT -> stageSnapshotRow(session, file, type, rowNumber, row, productIndex, warehouseIndex, unitIndex);
                 case SALES_VOUCHERS, PURCHASE_VOUCHERS, CREDIT_NOTES, DEBIT_NOTES, STOCK_JOURNAL ->
-                    stageVoucherRow(session, file, type, rowNumber, row, productIndex, partyIndex, warehouseIndex, unitIndex, voucherIndex);
+                    stageVoucherRow(session, file, type, rowNumber, row, productIndex, partyIndex, warehouseIndex,
+                        unitIndex, voucherIndex, resolutionMap);
+                case MIXED_TALLY_VOUCHERS -> stageMixedVoucherRow(
+                    session, file, rowNumber, row, productIndex, partyIndex, warehouseIndex, unitIndex, voucherIndex,
+                    resolutionMap);
                 case CASH_BOOK -> stageCashbookRow(session, file, rowNumber, row);
                 case DEBTOR_CREDITOR_ANALYSIS -> stagePartyCandidate(session, file, type, rowNumber, row, partyType(type, row), partyIndex);
                 case STOCK_AGEING -> stageAgeingRow(session, file, type, rowNumber, row, productIndex, unitIndex);
                 case UNKNOWN -> { }
             }
         }
+    }
+
+    private void stageMixedMasterRow(
+        ImportSession session, ImportSessionFile file, int rowNumber, Map<String, String> row,
+        Map<String, SmartStagedProduct> productIndex, Map<String, SmartStagedParty> partyIndex,
+        Map<String, SmartStagedWarehouse> warehouseIndex, Map<String, SmartStagedUnit> unitIndex
+    ) {
+        var entity = normalize(lookup(row, "Source Entity"));
+        if (entity.equals("STOCKITEM")) {
+            stageInventoryRow(session, file, DomainEnums.DetectedFileType.INVENTORY_MASTER, rowNumber, row,
+                productIndex, warehouseIndex, unitIndex);
+        } else if (entity.equals("LEDGER")) {
+            var resolvedPartyType = partyType(DomainEnums.DetectedFileType.ACCOUNTING_MASTER, row);
+            if (resolvedPartyType != DomainEnums.SmartPartyType.UNKNOWN) {
+                stagePartyCandidate(session, file, DomainEnums.DetectedFileType.ACCOUNTING_MASTER, rowNumber, row,
+                    resolvedPartyType, partyIndex);
+            }
+        }
+    }
+
+    private void stageMixedVoucherRow(
+        ImportSession session, ImportSessionFile file, int rowNumber, Map<String, String> row,
+        Map<String, SmartStagedProduct> productIndex, Map<String, SmartStagedParty> partyIndex,
+        Map<String, SmartStagedWarehouse> warehouseIndex, Map<String, SmartStagedUnit> unitIndex,
+        Map<String, SmartStagedVoucher> voucherIndex, Map<String, SmartImportResolution> resolutionMap
+    ) {
+        var entity = normalize(lookup(row, "Source Entity"));
+        if (entity.equals("STOCKITEM")) {
+            stageInventoryRow(session, file, DomainEnums.DetectedFileType.INVENTORY_MASTER, rowNumber, row,
+                productIndex, warehouseIndex, unitIndex);
+            return;
+        }
+        if (entity.equals("LEDGER")) {
+            var resolvedPartyType = partyType(DomainEnums.DetectedFileType.ACCOUNTING_MASTER, row);
+            if (resolvedPartyType != DomainEnums.SmartPartyType.UNKNOWN) {
+                stagePartyCandidate(session, file, DomainEnums.DetectedFileType.ACCOUNTING_MASTER, rowNumber, row,
+                    resolvedPartyType, partyIndex);
+            }
+            return;
+        }
+
+        var rowType = voucherFileType(lookup(row, "Voucher Type", "Type"));
+        switch (rowType) {
+            case SALES_VOUCHERS, PURCHASE_VOUCHERS, CREDIT_NOTES, DEBIT_NOTES, STOCK_JOURNAL ->
+                stageVoucherRow(session, file, rowType, rowNumber, row, productIndex, partyIndex,
+                    warehouseIndex, unitIndex, voucherIndex, resolutionMap);
+            case CASH_BOOK -> stageCashbookRow(session, file, rowNumber, row);
+            default -> {
+                // Contra, journal, and unknown voucher types remain classified but are not posted as sales or purchases.
+            }
+        }
+    }
+
+    private DomainEnums.DetectedFileType voucherFileType(String rawVoucherType) {
+        var voucherType = normalize(rawVoucherType);
+        if (voucherType.contains("CREDIT NOTE") || voucherType.contains("CREDITNOTE")) {
+            return DomainEnums.DetectedFileType.CREDIT_NOTES;
+        }
+        if (voucherType.contains("DEBIT NOTE") || voucherType.contains("DEBITNOTE")) {
+            return DomainEnums.DetectedFileType.DEBIT_NOTES;
+        }
+        if (voucherType.contains("STOCK JOURNAL") || voucherType.contains("STOCKJOURNAL")) {
+            return DomainEnums.DetectedFileType.STOCK_JOURNAL;
+        }
+        if (voucherType.contains("SALES") || voucherType.equals("SALE")) {
+            return DomainEnums.DetectedFileType.SALES_VOUCHERS;
+        }
+        if (voucherType.contains("PURCHASE")) {
+            return DomainEnums.DetectedFileType.PURCHASE_VOUCHERS;
+        }
+        if (voucherType.contains("RECEIPT") || voucherType.contains("PAYMENT")) {
+            return DomainEnums.DetectedFileType.CASH_BOOK;
+        }
+        return DomainEnums.DetectedFileType.UNKNOWN;
     }
 
     private void stageInventoryRow(
@@ -367,7 +642,7 @@ public class SmartImportStagingService {
         ImportSession session, ImportSessionFile file, DomainEnums.DetectedFileType type, int rowNumber, Map<String, String> row,
         Map<String, SmartStagedProduct> productIndex, Map<String, SmartStagedParty> partyIndex,
         Map<String, SmartStagedWarehouse> warehouseIndex, Map<String, SmartStagedUnit> unitIndex,
-        Map<String, SmartStagedVoucher> voucherIndex
+        Map<String, SmartStagedVoucher> voucherIndex, Map<String, SmartImportResolution> resolutionMap
     ) {
         var voucherType = firstNonBlank(lookup(row, "Voucher Type", "Type"), defaultVoucherType(type));
         var voucherNumber = lookup(row, "Voucher Number", "Voucher No", "Invoice Number", "Invoice No");
@@ -377,6 +652,9 @@ public class SmartImportStagingService {
         if (voucherNumber == null || voucherNumber.isBlank()) {
             voucherKey += "|ROW:" + rowNumber;
         }
+        var stableVoucherKey = voucherResolutionKey(file.id, voucherType, voucherNumber, voucherDate, partyName, rowNumber);
+        var voucherResolution = resolutionMap.get(stableVoucherKey);
+        var rateResolution = resolutionMap.get(rateResolutionKey(file.id, rowNumber));
         var voucher = voucherIndex.get(voucherKey);
         if (voucher == null) {
             voucher = new SmartStagedVoucher();
@@ -393,12 +671,39 @@ public class SmartImportStagingService {
             stagedVouchers.save(voucher);
             voucherIndex.put(voucherKey, voucher);
         }
+        if (voucherResolution != null && "EXCLUDE_VOUCHER".equals(voucherResolution.action)) {
+            voucher.rawMetadataJson.put("excludedFromCommit", true);
+            voucher.rawMetadataJson.put("exclusionReason", detail(voucherResolution, "reason"));
+            voucher.rawMetadataJson.put("voucherResolutionKey", stableVoucherKey);
+            voucher.reviewStatus = DomainEnums.SmartReviewStatus.IGNORED;
+            voucher.fingerprint = fingerprint(session.tenantId, voucher);
+            stagedVouchers.save(voucher);
+            return;
+        }
         var lineAmount = decimal(lookup(row, "Amount", "Line Amount", "Total Amount"));
         mergeVoucherFinancials(session.tenantId, voucher, row);
         stagePartyCandidate(session, file, type, rowNumber, row, partyType(type, row), partyIndex);
 
         var productName = lookup(row, "Item Name", "Product Name", "Stock Item", "STOCKITEMNAME");
         if (productName == null || productName.isBlank()) {
+            voucher.fingerprint = fingerprint(session.tenantId, voucher);
+            stagedVouchers.save(voucher);
+            return;
+        }
+        if (rateResolution != null && "TREAT_AS_FINANCIAL_ADJUSTMENT".equals(rateResolution.action)) {
+            var amount = lineAmount == null ? ZERO : lineAmount.abs();
+            var resolvedAmount = decimal(Objects.toString(
+                voucher.rawMetadataJson.get("resolvedFinancialAdjustmentAmount"), ""));
+            resolvedAmount = nvl(resolvedAmount).add(amount);
+            voucher.rawMetadataJson.put("resolvedFinancialAdjustmentAmount", resolvedAmount.toPlainString());
+            voucher.rawMetadataJson.put("resolvedFinancialAdjustment", true);
+            voucher.rawMetadataJson.put("financialAdjustmentReason", detail(rateResolution, "reason"));
+            @SuppressWarnings("unchecked")
+            var lines = voucher.rawMetadataJson.get("resolvedFinancialAdjustmentLines") instanceof List<?> existing
+                ? new ArrayList<>((List<Map<String, Object>>) existing) : new ArrayList<Map<String, Object>>();
+            lines.add(linked("sourceRow", rowNumber, "description", productName, "amount", amount));
+            voucher.rawMetadataJson.put("resolvedFinancialAdjustmentLines", lines);
+            voucher.totalAmount = resolvedAmount.add(metadataDecimal(voucher.rawMetadataJson, "inventoryLineAmountTotal"));
             voucher.fingerprint = fingerprint(session.tenantId, voucher);
             stagedVouchers.save(voucher);
             return;
@@ -414,16 +719,26 @@ public class SmartImportStagingService {
         item.productName = productName;
         item.normalizedProductName = normalizeName(productName);
         item.unitCode = normalizeUnit(unitCode);
-        item.quantity = abs(decimal(lookup(row, "Qty", "Quantity", "Billed Quantity", "Actual Quantity")));
+        item.rawQuantity = decimal(lookup(row, "Raw Quantity", "Qty", "Quantity"));
+        item.billedQuantity = decimal(lookup(row, "Billed Quantity"));
+        item.actualQuantity = decimal(lookup(row, "Actual Quantity"));
+        item.quantity = abs(item.billedQuantity != null ? item.billedQuantity
+            : item.actualQuantity != null ? item.actualQuantity : item.rawQuantity);
         item.rate = decimal(lookup(row, "Rate", "Parsed Rate", "Unit Price", "Price"));
         item.amount = lineAmount;
         item.warehouseName = blankToNull(warehouseName);
         item.rateSource = firstNonBlank(lookup(row, "Rate Source"), item.rate == null ? "INVALID" : item.rate.signum() == 0 ? "ZERO_COST_ITEM" : "RATE_FIELD");
         item.rawMetadataJson = metadata(row);
+        applyRateResolution(item, rateResolution);
         stagedVoucherItems.save(item);
         var calculatedAmount = lineAmount == null && item.quantity != null && item.rate != null
             ? item.quantity.multiply(item.rate) : lineAmount;
-        voucher.totalAmount = nvl(voucher.totalAmount).add(nvl(calculatedAmount).abs());
+        var inventoryTotal = metadataDecimal(voucher.rawMetadataJson, "inventoryLineAmountTotal")
+            .add(nvl(calculatedAmount).abs());
+        voucher.rawMetadataJson.put("inventoryLineAmountTotal", inventoryTotal.toPlainString());
+        var resolvedAmount = metadataDecimal(voucher.rawMetadataJson, "resolvedFinancialAdjustmentAmount");
+        voucher.totalAmount = resolvedAmount.signum() > 0
+            ? inventoryTotal.add(resolvedAmount) : nvl(voucher.totalAmount).add(nvl(calculatedAmount).abs());
         voucher.fingerprint = fingerprint(session.tenantId, voucher);
         stagedVouchers.save(voucher);
     }
@@ -452,6 +767,154 @@ public class SmartImportStagingService {
         voucher.rawMetadataJson.put("ledgerAdjustmentDetails", lookup(row, "Ledger Adjustment Details"));
         voucher.rawMetadataJson.put("financialComponentsCaptured", true);
         voucher.fingerprint = fingerprint(tenantId, voucher);
+    }
+
+    private void applyRateResolution(SmartStagedVoucherItem item, SmartImportResolution resolution) {
+        if (resolution == null) return;
+        switch (resolution.action) {
+            case "CONFIRM_ZERO_VALUE" -> {
+                if (item.quantity != null && item.quantity.signum() != 0
+                    && (item.amount == null || item.amount.signum() == 0)) {
+                    item.rate = ZERO;
+                    item.rateSource = "USER_CONFIRMED_ZERO_VALUE";
+                }
+            }
+            case "DERIVE_RATE" -> {
+                if (item.quantity != null && item.quantity.signum() != 0
+                    && item.amount != null && item.amount.signum() != 0) {
+                    item.rate = item.amount.abs().divide(item.quantity.abs(), 6, java.math.RoundingMode.HALF_UP);
+                    item.rateSource = "USER_DERIVED_FROM_AMOUNT";
+                }
+            }
+            case "ENTER_VERIFIED_RATE" -> {
+                var verified = decimal(detail(resolution, "verifiedRate"));
+                if (verified != null && verified.signum() > 0) {
+                    item.rate = verified;
+                    item.rateSource = "USER_VERIFIED_RATE";
+                }
+            }
+            default -> { }
+        }
+        if (!"INVALID".equalsIgnoreCase(item.rateSource)) {
+            item.rawMetadataJson.put("rateResolutionAction", resolution.action);
+            item.rawMetadataJson.put("rateResolutionReason", detail(resolution, "reason"));
+            item.rawMetadataJson.put("originalRateSource", lookupMetadata(item.rawMetadataJson, "Rate Source"));
+        }
+    }
+
+    private String rateResolutionKey(UUID fileId, int sourceRowNumber) {
+        return "VOUCHER_ITEM_RATE:" + fileId + ":" + sourceRowNumber;
+    }
+
+    private String voucherResolutionKey(
+        UUID fileId,
+        String voucherType,
+        String voucherNumber,
+        LocalDate voucherDate,
+        String partyName,
+        int sourceRowNumber
+    ) {
+        var identity = normalize(voucherType) + "|" + normalize(voucherNumber) + "|" + voucherDate + "|"
+            + normalizeName(partyName);
+        if (voucherNumber == null || voucherNumber.isBlank()) identity += "|ROW:" + sourceRowNumber;
+        return "VOUCHER_EXCLUSION:" + fileId + ":" + identity;
+    }
+
+    private String voucherResolutionKey(SmartStagedVoucher voucher) {
+        return voucherResolutionKey(voucher.sessionFileId, voucher.voucherType, voucher.voucherNumber,
+            voucher.voucherDate, voucher.partyName, voucher.sourceRowNumber);
+    }
+
+    private String detail(SmartImportResolution resolution, String key) {
+        return resolution == null || resolution.detailsJson == null
+            ? "" : Objects.toString(resolution.detailsJson.get(key), "");
+    }
+
+    private BigDecimal metadataDecimal(Map<String, Object> metadata, String key) {
+        return nvl(decimal(Objects.toString(metadata == null ? null : metadata.get(key), "")));
+    }
+
+    private String lookupMetadata(Map<String, Object> metadata, String key) {
+        return Objects.toString(metadata == null ? null : metadata.get(key), "");
+    }
+
+    private boolean excludedVoucher(SmartStagedVoucher voucher) {
+        return voucher != null && voucher.rawMetadataJson != null
+            && Boolean.parseBoolean(Objects.toString(voucher.rawMetadataJson.get("excludedFromCommit"), "false"));
+    }
+
+    private List<String> rateEligibleActions(SmartStagedVoucherItem item, SmartStagedVoucher voucher) {
+        var actions = new ArrayList<String>();
+        var hasQuantity = item.quantity != null && item.quantity.signum() != 0;
+        var hasAmount = item.amount != null && item.amount.signum() != 0;
+        if (hasQuantity && !hasAmount && (item.rate == null || item.rate.signum() == 0)) {
+            actions.add("CONFIRM_ZERO_VALUE");
+        }
+        if (hasQuantity && hasAmount) actions.add("DERIVE_RATE");
+        var noteType = normalize(voucher.voucherType);
+        if (!hasQuantity && hasAmount && (noteType.contains("DEBIT") || noteType.contains("CREDIT"))) {
+            actions.add("TREAT_AS_FINANCIAL_ADJUSTMENT");
+        }
+        if (hasQuantity) actions.add("ENTER_VERIFIED_RATE");
+        actions.add("EXCLUDE_VOUCHER");
+        actions.add("KEEP_UNRESOLVED");
+        return actions;
+    }
+
+    private List<Map<String, Object>> rateChoices(List<String> eligibleActions) {
+        var choices = new ArrayList<Map<String, Object>>();
+        if (eligibleActions.contains("CONFIRM_ZERO_VALUE")) {
+            choices.add(choice("CONFIRM_ZERO_VALUE", "Confirm zero-valued / free item", null));
+        }
+        if (eligibleActions.contains("DERIVE_RATE")) {
+            choices.add(choice("DERIVE_RATE", "Derive rate from amount and quantity", null));
+        }
+        if (eligibleActions.contains("TREAT_AS_FINANCIAL_ADJUSTMENT")) {
+            choices.add(choice("TREAT_AS_FINANCIAL_ADJUSTMENT", "Treat as financial adjustment", null));
+        }
+        if (eligibleActions.contains("ENTER_VERIFIED_RATE")) {
+            choices.add(choice("ENTER_VERIFIED_RATE", "Enter verified source rate", null));
+        }
+        choices.add(choice("EXCLUDE_VOUCHER", "Exclude entire voucher from this commit", null));
+        choices.add(choice("KEEP_UNRESOLVED", "Keep unresolved", null));
+        return choices;
+    }
+
+    private Map<String, Object> rateReviewContext(
+        SmartStagedVoucherItem item,
+        SmartStagedVoucher voucher,
+        String resolutionKey,
+        List<String> eligibleActions
+    ) {
+        var derivedRate = item.amount != null && item.amount.signum() != 0
+            && item.quantity != null && item.quantity.signum() != 0
+            ? item.amount.abs().divide(item.quantity.abs(), 6, java.math.RoundingMode.HALF_UP) : null;
+        return linked(
+            "resolutionKey", resolutionKey,
+            "voucherResolutionKey", voucherResolutionKey(voucher),
+            "rateMatchKey", rateMatchKey(item, voucher),
+            "entityType", "VOUCHER_ITEM",
+            "stagingId", item.id,
+            "voucherId", voucher.id,
+            "voucherType", voucher.voucherType,
+            "voucherNumber", voucher.voucherNumber,
+            "voucherDate", voucher.voucherDate,
+            "partyName", voucher.partyName,
+            "productName", item.productName,
+            "quantity", item.quantity,
+            "amount", item.amount,
+            "rate", item.rate,
+            "rateSource", item.rateSource,
+            "derivedRate", derivedRate,
+            "eligibleActions", eligibleActions
+        );
+    }
+
+    private String rateMatchKey(SmartStagedVoucherItem item, SmartStagedVoucher voucher) {
+        var shape = item.quantity != null && item.quantity.signum() != 0
+            ? item.amount != null && item.amount.signum() != 0 ? "QUANTITY_AND_AMOUNT" : "QUANTITY_ONLY"
+            : item.amount != null && item.amount.signum() != 0 ? "AMOUNT_ONLY" : "VALUES_MISSING";
+        return normalize(voucher.voucherType) + "|" + normalizeName(item.productName) + "|" + shape;
     }
 
     private void stageCashbookRow(ImportSession session, ImportSessionFile file, int rowNumber, Map<String, String> row) {
@@ -520,7 +983,7 @@ public class SmartImportStagingService {
         product.hsn = blankToNull(lookup(row, "HSN", "HSN Code", "HSNCODE"));
         product.gstPercent = decimal(lookup(row, "GST %", "GST Percentage", "Tax Rate"));
         product.purchasePrice = decimal(lookup(row, "Purchase Price", "Opening Rate", "Rate"));
-        product.externalId = blankToNull(lookup(row, "Tally GUID", "GUID", "MASTERID", "Master ID", "Tally Master ID"));
+        product.externalId = SmartImportProductIdentity.fromSource(type, row);
         product.rawMetadataJson = metadata(row);
         stagedProducts.save(product);
         index.put(key, product);
@@ -536,17 +999,26 @@ public class SmartImportStagingService {
             return null;
         }
         var gstin = blankToNull(lookup(row, "GSTIN", "GST No", "GST Number", "PARTYGSTIN"));
-        var key = partyType + "|" + normalizeName(rawName) + "|" + normalize(gstin);
+        var baseKey = partyType + "|" + normalizeName(rawName);
+        var key = baseKey;
         var existing = index.get(key);
+        if (existing != null && gstin != null && existing.gstin != null
+            && !normalize(gstin).equals(normalize(existing.gstin))) {
+            key = baseKey + "|GSTIN:" + normalize(gstin);
+            existing = index.get(key);
+        }
         if (existing != null) {
+            if (existing.gstin == null && gstin != null) existing.gstin = gstin;
+            if (existing.phone == null) existing.phone = blankToNull(lookup(row, "Phone", "Mobile", "Phone Number"));
+            if (existing.email == null) existing.email = blankToNull(lookup(row, "Email", "Email Address"));
             if (sourceType == DomainEnums.DetectedFileType.DEBTOR_CREDITOR_ANALYSIS) {
                 existing.sourceType = sourceType;
                 existing.openingBalance = decimal(lookup(row, "Opening Balance", "Outstanding", "Balance"));
                 var parsedSnapshotDate = date(lookup(row, "Snapshot Date", "As On Date", "Date"));
                 existing.snapshotDate = parsedSnapshotDate == null ? file.dateRangeEnd : parsedSnapshotDate;
-                existing.rawMetadataJson.putAll(metadata(row));
-                stagedParties.save(existing);
             }
+            existing.rawMetadataJson.putAll(metadata(row));
+            stagedParties.save(existing);
             return existing;
         }
         var party = new SmartStagedParty();
@@ -564,6 +1036,7 @@ public class SmartImportStagingService {
         party.rawMetadataJson = metadata(row);
         stagedParties.save(party);
         index.put(key, party);
+        if (!key.equals(baseKey) && !index.containsKey(baseKey)) index.put(baseKey, party);
         return party;
     }
 
@@ -647,6 +1120,8 @@ public class SmartImportStagingService {
 
         matchSnapshots(session, productIndex, warehouseIndex);
         matchVouchers(session, productIndex, partiesForSession, warehouseIndex);
+        returnService.classifySession(session.tenantId, session.id);
+        transferService.classifySession(session.tenantId, session.id);
         matchCashbook(session, partiesForSession);
         matchAgeing(session, productIndex);
     }
@@ -676,7 +1151,7 @@ public class SmartImportStagingService {
             return;
         }
 
-        var external = findByExternalId(existingProducts, row.externalId);
+        var external = findByExternalId(existingProducts, SmartImportProductIdentity.externalId(row));
         if (external != null) {
             productMatched(row, external, DomainEnums.SmartReviewStatus.AUTO_RESOLVED);
             return;
@@ -843,6 +1318,12 @@ public class SmartImportStagingService {
         var seenFingerprints = new HashSet<String>();
         var vouchers = stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(session.tenantId, session.id);
         for (var row : vouchers) {
+            if (excludedVoucher(row)) {
+                row.matchedPartyId = null;
+                row.matchStatus = DomainEnums.SmartMatchStatus.CREATE_NEW;
+                row.reviewStatus = DomainEnums.SmartReviewStatus.IGNORED;
+                continue;
+            }
             var party = partiesForSession.stream().filter(candidate -> Objects.equals(candidate.normalizedName, row.normalizedPartyName)).findFirst().orElse(null);
             row.matchedPartyId = party == null ? null : firstNonNull(party.matchedCustomerId, party.matchedSupplierId);
             row.stockImpactModeSuggestion = !hasSnapshot
@@ -851,27 +1332,13 @@ public class SmartImportStagingService {
                     ? DomainEnums.SmartVoucherStockImpactSuggestion.APPLY_AFTER_SNAPSHOT_DATE
                     : DomainEnums.SmartVoucherStockImpactSuggestion.CREATE_INVOICES_ONLY;
             var repeatedInSession = row.fingerprint != null && !seenFingerprints.add(row.fingerprint);
-            var existingStatus = existingVoucherStatus(session.tenantId, row);
-            if (repeatedInSession || existingStatus == ExistingVoucherStatus.EXACT_DUPLICATE) {
-                row.matchStatus = DomainEnums.SmartMatchStatus.SKIP_DUPLICATE;
-                row.reviewStatus = DomainEnums.SmartReviewStatus.AUTO_RESOLVED;
-            } else if (existingStatus == ExistingVoucherStatus.AMBIGUOUS_CONFLICT) {
-                row.matchStatus = DomainEnums.SmartMatchStatus.AMBIGUOUS_REVIEW;
-                row.reviewStatus = DomainEnums.SmartReviewStatus.PENDING;
-            } else if (row.voucherNumber == null || row.voucherDate == null || row.partyName == null) {
-                row.matchStatus = DomainEnums.SmartMatchStatus.UNKNOWN;
-                row.reviewStatus = DomainEnums.SmartReviewStatus.PENDING;
-            } else if (party != null && party.reviewStatus == DomainEnums.SmartReviewStatus.PENDING) {
-                row.matchStatus = DomainEnums.SmartMatchStatus.AMBIGUOUS_REVIEW;
-                row.reviewStatus = DomainEnums.SmartReviewStatus.PENDING;
-            } else {
-                row.matchStatus = DomainEnums.SmartMatchStatus.CREATE_NEW;
-                row.reviewStatus = DomainEnums.SmartReviewStatus.AUTO_RESOLVED;
-            }
+            updateVoucherMatch(session.tenantId, row, party, repeatedInSession);
         }
         stagedVouchers.saveAll(vouchers);
 
         var items = stagedVoucherItems.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id);
+        var transfers = stagedTransfers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(
+            session.tenantId, session.id);
         for (var row : items) {
             var product = productIndex.get(productKey(row.normalizedProductName, row.unitCode));
             var warehouse = row.warehouseName == null ? null : warehouseIndex.get(normalizeName(row.warehouseName));
@@ -885,194 +1352,28 @@ public class SmartImportStagingService {
         stagedVoucherItems.saveAll(items);
     }
 
+    private void updateVoucherMatch(UUID tenantId, SmartStagedVoucher row, SmartStagedParty party, boolean repeatedInSession) {
+        var existingStatus = existingVoucherStatus(tenantId, row);
+        if (repeatedInSession || existingStatus == ExistingVoucherStatus.EXACT_DUPLICATE) {
+            row.matchStatus = DomainEnums.SmartMatchStatus.SKIP_DUPLICATE;
+            row.reviewStatus = DomainEnums.SmartReviewStatus.AUTO_RESOLVED;
+        } else if (existingStatus == ExistingVoucherStatus.AMBIGUOUS_CONFLICT) {
+            row.matchStatus = DomainEnums.SmartMatchStatus.AMBIGUOUS_REVIEW;
+            row.reviewStatus = DomainEnums.SmartReviewStatus.PENDING;
+        } else if (row.voucherNumber == null || row.voucherDate == null || row.partyName == null) {
+            row.matchStatus = DomainEnums.SmartMatchStatus.UNKNOWN;
+            row.reviewStatus = DomainEnums.SmartReviewStatus.PENDING;
+        } else if (party != null && party.reviewStatus == DomainEnums.SmartReviewStatus.PENDING) {
+            row.matchStatus = DomainEnums.SmartMatchStatus.AMBIGUOUS_REVIEW;
+            row.reviewStatus = DomainEnums.SmartReviewStatus.PENDING;
+        } else {
+            row.matchStatus = DomainEnums.SmartMatchStatus.CREATE_NEW;
+            row.reviewStatus = DomainEnums.SmartReviewStatus.AUTO_RESOLVED;
+        }
+    }
+
     private void matchCashbook(ImportSession session, List<SmartStagedParty> partiesForSession) {
-        var rows = stagedCashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(session.tenantId, session.id);
-        var sessionVouchers = stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(session.tenantId, session.id);
-        for (var row : rows) {
-            resetCashbookMatch(row);
-            if (row.entryDate == null || row.amount == null || row.amount.signum() <= 0
-                || row.direction == DomainEnums.SmartCashbookDirection.UNKNOWN) {
-                cashbookReview(row, DomainEnums.CashbookMatchStatus.UNMATCHED_REVIEW,
-                    "A payment date, positive amount, and receipt/payment direction are required.");
-                continue;
-            }
-
-            var invoiceMatch = matchInvoiceByReference(session.tenantId, row, sessionVouchers);
-            if (invoiceMatch != null) {
-                applyInvoiceMatch(row, invoiceMatch, "Invoice reference matched exactly.", new BigDecimal("1.00"));
-                continue;
-            }
-
-            var partyMatches = cashbookPartyMatches(session.tenantId, row, partiesForSession);
-            if (partyMatches.size() > 1) {
-                cashbookReview(row, DomainEnums.CashbookMatchStatus.LOW_CONFIDENCE_REVIEW,
-                    "More than one party matches this cashbook row.");
-                continue;
-            }
-            if (partyMatches.isEmpty()) {
-                cashbookReview(row, DomainEnums.CashbookMatchStatus.UNMATCHED_REVIEW,
-                    "No exact tenant party match was found.");
-                continue;
-            }
-
-            var party = partyMatches.getFirst();
-            row.matchedPartyId = party.id;
-            row.matchedPartyType = party.type;
-            var amountMatches = matchInvoicesByPartyAmountAndDate(session.tenantId, row, party, sessionVouchers);
-            if (amountMatches.size() == 1) {
-                applyInvoiceMatch(row, amountMatches.getFirst(),
-                    "One invoice matched the exact party and amount within seven days.", new BigDecimal("0.90"));
-            } else if (amountMatches.size() > 1) {
-                cashbookReview(row, DomainEnums.CashbookMatchStatus.LOW_CONFIDENCE_REVIEW,
-                    "Multiple invoices match the party, amount, and date window.");
-            } else {
-                row.cashbookMatchStatus = party.type == DomainEnums.SmartPartyType.CUSTOMER
-                    ? DomainEnums.CashbookMatchStatus.MATCHED_CUSTOMER_PAYMENT
-                    : DomainEnums.CashbookMatchStatus.MATCHED_SUPPLIER_PAYMENT;
-                row.matchStatus = DomainEnums.SmartMatchStatus.MATCH_EXISTING;
-                row.reviewStatus = DomainEnums.SmartReviewStatus.AUTO_RESOLVED;
-                row.matchConfidence = new BigDecimal("0.80");
-                row.matchReason = "Exact tenant party matched; no invoice was linked.";
-            }
-        }
-        stagedCashbook.saveAll(rows);
-    }
-
-    private void resetCashbookMatch(SmartStagedCashbookEntry row) {
-        row.matchedPartyId = null;
-        row.matchedInvoiceId = null;
-        row.matchedPartyType = DomainEnums.SmartPartyType.UNKNOWN;
-        row.cashbookMatchStatus = DomainEnums.CashbookMatchStatus.UNMATCHED_REVIEW;
-        row.matchStatus = DomainEnums.SmartMatchStatus.UNKNOWN;
-        row.reviewStatus = DomainEnums.SmartReviewStatus.PENDING;
-        row.matchConfidence = ZERO;
-        row.matchReason = null;
-    }
-
-    private void cashbookReview(
-        SmartStagedCashbookEntry row, DomainEnums.CashbookMatchStatus status, String reason
-    ) {
-        row.cashbookMatchStatus = status;
-        row.matchStatus = status == DomainEnums.CashbookMatchStatus.LOW_CONFIDENCE_REVIEW
-            ? DomainEnums.SmartMatchStatus.AMBIGUOUS_REVIEW : DomainEnums.SmartMatchStatus.UNKNOWN;
-        row.reviewStatus = DomainEnums.SmartReviewStatus.PENDING;
-        row.matchConfidence = status == DomainEnums.CashbookMatchStatus.LOW_CONFIDENCE_REVIEW
-            ? new BigDecimal("0.50") : ZERO;
-        row.matchReason = reason;
-    }
-
-    private List<CashbookPartyMatch> cashbookPartyMatches(
-        UUID tenantId, SmartStagedCashbookEntry row, List<SmartStagedParty> staged
-    ) {
-        var expectedType = row.direction == DomainEnums.SmartCashbookDirection.RECEIPT
-            ? DomainEnums.SmartPartyType.CUSTOMER : DomainEnums.SmartPartyType.SUPPLIER;
-        var matches = new LinkedHashMap<String, CashbookPartyMatch>();
-        for (var candidate : staged) {
-            if (candidate.partyType != expectedType || candidate.reviewStatus == DomainEnums.SmartReviewStatus.PENDING) continue;
-            var gstinMatch = row.gstin != null && candidate.gstin != null && normalize(row.gstin).equals(normalize(candidate.gstin));
-            var nameMatch = !cashOrBankLedger(row.partyName) && Objects.equals(candidate.normalizedName, normalizeName(row.partyName));
-            if (gstinMatch || nameMatch) {
-                var id = expectedType == DomainEnums.SmartPartyType.CUSTOMER ? candidate.matchedCustomerId : candidate.matchedSupplierId;
-                matches.put(expectedType + "|" + firstNonBlank(id == null ? null : id.toString(), candidate.normalizedName),
-                    new CashbookPartyMatch(expectedType, id, candidate.normalizedName));
-            }
-        }
-        if (expectedType == DomainEnums.SmartPartyType.CUSTOMER) {
-            if (row.gstin != null) customers.findByTenantIdAndGstinIgnoreCase(tenantId, row.gstin)
-                .ifPresent(value -> matches.put("CUSTOMER|" + value.id, new CashbookPartyMatch(expectedType, value.id, normalizeName(value.name))));
-            if (!cashOrBankLedger(row.partyName)) customers.findByTenantIdAndNameIgnoreCase(tenantId, normalizeName(row.partyName))
-                .ifPresent(value -> matches.put("CUSTOMER|" + value.id, new CashbookPartyMatch(expectedType, value.id, normalizeName(value.name))));
-        } else {
-            if (row.gstin != null) suppliers.findByTenantIdAndGstinIgnoreCase(tenantId, row.gstin)
-                .ifPresent(value -> matches.put("SUPPLIER|" + value.id, new CashbookPartyMatch(expectedType, value.id, normalizeName(value.name))));
-            if (!cashOrBankLedger(row.partyName)) suppliers.findByTenantIdAndNameIgnoreCase(tenantId, normalizeName(row.partyName))
-                .ifPresent(value -> matches.put("SUPPLIER|" + value.id, new CashbookPartyMatch(expectedType, value.id, normalizeName(value.name))));
-        }
-        return new ArrayList<>(matches.values());
-    }
-
-    private CashbookInvoiceMatch matchInvoiceByReference(
-        UUID tenantId, SmartStagedCashbookEntry row, List<SmartStagedVoucher> staged
-    ) {
-        if (row.referenceNumber == null || row.referenceNumber.isBlank()) return null;
-        if (row.direction == DomainEnums.SmartCashbookDirection.RECEIPT) {
-            var existing = salesInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, row.referenceNumber).orElse(null);
-            if (existing != null) return new CashbookInvoiceMatch(DomainEnums.SmartPartyType.CUSTOMER, existing.customerId,
-                existing.id, existing.invoiceNumber, existing.invoiceDate, existing.totalAmount);
-        } else {
-            var existing = purchaseInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, row.referenceNumber).orElse(null);
-            if (existing != null) return new CashbookInvoiceMatch(DomainEnums.SmartPartyType.SUPPLIER, existing.supplierId,
-                existing.id, existing.invoiceNumber, existing.invoiceDate, existing.totalAmount);
-        }
-        return staged.stream().filter(voucher -> row.referenceNumber.equalsIgnoreCase(nullSafe(voucher.voucherNumber)))
-            .filter(voucher -> row.direction == DomainEnums.SmartCashbookDirection.RECEIPT
-                ? voucherKindForCashbook(voucher.voucherType) == DomainEnums.SmartPartyType.CUSTOMER
-                : voucherKindForCashbook(voucher.voucherType) == DomainEnums.SmartPartyType.SUPPLIER)
-            .findFirst().map(voucher -> new CashbookInvoiceMatch(voucherKindForCashbook(voucher.voucherType),
-                voucher.matchedPartyId, null, voucher.voucherNumber, voucher.voucherDate, voucher.totalAmount)).orElse(null);
-    }
-
-    private List<CashbookInvoiceMatch> matchInvoicesByPartyAmountAndDate(
-        UUID tenantId, SmartStagedCashbookEntry row, CashbookPartyMatch party, List<SmartStagedVoucher> staged
-    ) {
-        var matches = new LinkedHashMap<String, CashbookInvoiceMatch>();
-        if (party.id != null && party.type == DomainEnums.SmartPartyType.CUSTOMER) {
-            for (var invoice : salesInvoices.findByTenantIdAndCustomerId(tenantId, party.id)) {
-                if (sameCashbookAmountAndDate(row, invoice.totalAmount, invoice.invoiceDate)) {
-                    matches.put("SALES|" + invoice.id, new CashbookInvoiceMatch(party.type, party.id, invoice.id,
-                        invoice.invoiceNumber, invoice.invoiceDate, invoice.totalAmount));
-                }
-            }
-        } else if (party.id != null) {
-            for (var invoice : purchaseInvoices.findByTenantIdAndSupplierId(tenantId, party.id)) {
-                if (sameCashbookAmountAndDate(row, invoice.totalAmount, invoice.invoiceDate)) {
-                    matches.put("PURCHASE|" + invoice.id, new CashbookInvoiceMatch(party.type, party.id, invoice.id,
-                        invoice.invoiceNumber, invoice.invoiceDate, invoice.totalAmount));
-                }
-            }
-        }
-        for (var voucher : staged) {
-            if (voucherKindForCashbook(voucher.voucherType) != party.type
-                || !Objects.equals(normalizeName(voucher.partyName), party.normalizedName)
-                || !sameCashbookAmountAndDate(row, voucher.totalAmount, voucher.voucherDate)) continue;
-            matches.put("STAGED|" + voucher.id, new CashbookInvoiceMatch(party.type, party.id, null,
-                voucher.voucherNumber, voucher.voucherDate, voucher.totalAmount));
-        }
-        return new ArrayList<>(matches.values());
-    }
-
-    private boolean sameCashbookAmountAndDate(SmartStagedCashbookEntry row, BigDecimal amount, LocalDate invoiceDate) {
-        return row.entryDate != null && invoiceDate != null && nvl(row.amount).compareTo(nvl(amount).abs()) == 0
-            && Math.abs(java.time.temporal.ChronoUnit.DAYS.between(invoiceDate, row.entryDate)) <= 7;
-    }
-
-    private void applyInvoiceMatch(
-        SmartStagedCashbookEntry row, CashbookInvoiceMatch match, String reason, BigDecimal confidence
-    ) {
-        row.matchedPartyId = match.partyId;
-        row.matchedInvoiceId = match.invoiceId;
-        row.matchedPartyType = match.partyType;
-        row.cashbookMatchStatus = match.partyType == DomainEnums.SmartPartyType.CUSTOMER
-            ? DomainEnums.CashbookMatchStatus.MATCHED_SALES_INVOICE
-            : DomainEnums.CashbookMatchStatus.MATCHED_PURCHASE_INVOICE;
-        row.matchStatus = DomainEnums.SmartMatchStatus.MATCH_EXISTING;
-        row.reviewStatus = DomainEnums.SmartReviewStatus.AUTO_RESOLVED;
-        row.matchConfidence = confidence;
-        row.matchReason = reason;
-        if (row.referenceNumber == null) row.referenceNumber = match.invoiceNumber;
-    }
-
-    private DomainEnums.SmartPartyType voucherKindForCashbook(String voucherType) {
-        var normalized = normalize(voucherType);
-        if (normalized.contains("SALE")) return DomainEnums.SmartPartyType.CUSTOMER;
-        if (normalized.contains("PURCHASE")) return DomainEnums.SmartPartyType.SUPPLIER;
-        return DomainEnums.SmartPartyType.UNKNOWN;
-    }
-
-    private boolean cashOrBankLedger(String name) {
-        var normalized = normalizeName(name);
-        return normalized.equals("CASH") || normalized.equals("BANK") || normalized.contains("CASH IN HAND")
-            || normalized.contains("BANK ACCOUNT");
+        cashbookMatching.refresh(session.tenantId, session.id);
     }
 
     private void matchAgeing(ImportSession session, Map<String, SmartStagedProduct> productIndex) {
@@ -1161,7 +1462,20 @@ public class SmartImportStagingService {
             }
         }
 
-        for (var row : stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(session.tenantId, session.id)) {
+        var stagedVoucherRows = stagedVouchers
+            .findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(session.tenantId, session.id);
+        var stockJournalVoucherIds = stagedVoucherRows.stream()
+            .filter(row -> normalize(row.voucherType).contains("STOCK JOURNAL")
+                || normalize(row.voucherType).contains("STOCKJOURNAL"))
+            .map(row -> row.id)
+            .collect(Collectors.toSet());
+        var voucherById = stagedVoucherRows.stream().collect(Collectors.toMap(row -> row.id, row -> row));
+        for (var row : stagedVoucherRows) {
+            if (excludedVoucher(row)) continue;
+            if (stockJournalVoucherIds.contains(row.id)) {
+                // Stock journals are inventory documents; party identity is not part of transfer validation.
+                continue;
+            }
             if (row.matchStatus == DomainEnums.SmartMatchStatus.AMBIGUOUS_REVIEW) {
                 var key = "VOUCHER_DUPLICATE:" + row.fingerprint;
                 if (!ignored(resolutionMap, key)) {
@@ -1179,25 +1493,39 @@ public class SmartImportStagingService {
         }
 
         for (var row : stagedVoucherItems.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id)) {
+            if (stockJournalVoucherIds.contains(row.stagedVoucherId)) {
+                // A warehouse transfer can be quantity-only and does not require an invoice/cost rate.
+                continue;
+            }
+            var voucher = voucherById.get(row.stagedVoucherId);
+            if (voucher == null || excludedVoucher(voucher)) continue;
+            var key = rateResolutionKey(row.sessionFileId, row.sourceRowNumber);
+            var persisted = resolutionMap.get(key);
+            var userResolved = persisted != null && ("CONFIRM_ZERO_VALUE".equals(persisted.action)
+                || "DERIVE_RATE".equals(persisted.action) || "ENTER_VERIFIED_RATE".equals(persisted.action));
+            if (userResolved && row.rate != null && row.rate.signum() >= 0
+                && !"INVALID".equalsIgnoreCase(row.rateSource)) continue;
+            var eligibleActions = rateEligibleActions(row, voucher);
+            var choices = rateChoices(eligibleActions);
+            var context = rateReviewContext(row, voucher, key, eligibleActions);
             if ("ZERO_COST_ITEM".equalsIgnoreCase(row.rateSource) || (row.rate != null && row.rate.signum() == 0)) {
-                var key = "ZERO_RATE:" + row.id;
-                if (!ignored(resolutionMap, key)) {
-                    generated.add(reviewIssue(session, row.sessionFileId, row.sourceRowNumber, DomainEnums.ImportPlanIssueSeverity.WARNING,
-                        "ZERO_RATE_ITEM", "Voucher item has a zero rate: " + nullSafe(row.productName),
-                        "Confirm whether this is a free, scheme, or sample item.", List.of(choice("IGNORE_WARNING", "Confirm zero-rate item", null)),
-                        Map.of("resolutionKey", key, "entityType", "VOUCHER_ITEM", "stagingId", row.id.toString())));
-                }
+                generated.add(reviewIssue(session, row.sessionFileId, row.sourceRowNumber,
+                    DomainEnums.ImportPlanIssueSeverity.REVIEW_REQUIRED,
+                    "ZERO_RATE_ITEM", "Voucher item has a zero rate: " + nullSafe(row.productName),
+                    "Confirm a genuine free, scheme, or sample item, or choose another supported resolution.",
+                    choices, context));
             } else if (row.rate == null || row.rate.signum() < 0 || "INVALID".equalsIgnoreCase(row.rateSource)) {
                 generated.add(reviewIssue(session, row.sessionFileId, row.sourceRowNumber, DomainEnums.ImportPlanIssueSeverity.ERROR,
                     "INVALID_RATE", "Voucher item has an invalid rate: " + nullSafe(row.productName),
-                    "Correct the source rate or provide enough amount/quantity information for derivation.", List.of(),
-                    Map.of("resolutionKey", "INVALID_RATE:" + row.id, "entityType", "VOUCHER_ITEM", "stagingId", row.id.toString())));
+                    "Resolve this as a derived, verified, zero-valued, financial-only, or excluded voucher row.",
+                    choices, context));
             }
         }
 
         for (var row : stagedCashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(session.tenantId, session.id)) {
             if (row.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.UNMATCHED_REVIEW
                 || row.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.LOW_CONFIDENCE_REVIEW) {
+                if (row.resolutionStatus == DomainEnums.CashbookResolutionStatus.RETAIL_SALE_RECORDED) continue;
                 var key = "CASHBOOK:" + row.id;
                 if (!ignored(resolutionMap, key)) {
                     generated.add(reviewIssue(session, row.sessionFileId, row.sourceRowNumber, DomainEnums.ImportPlanIssueSeverity.WARNING,
@@ -1248,13 +1576,24 @@ public class SmartImportStagingService {
         var snapshots = stagedSnapshots.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id);
         var vouchers = stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(session.tenantId, session.id);
         var items = stagedVoucherItems.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id);
+        var transfers = stagedTransfers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(
+            session.tenantId, session.id);
         var cashbook = stagedCashbook.findByTenantIdAndImportSessionIdOrderByEntryDateAscSourceRowNumberAsc(session.tenantId, session.id);
         var ageing = stagedAgeing.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id);
         return Map.ofEntries(
             Map.entry("productsStaged", products.size()), Map.entry("partiesStaged", parties.size()),
             Map.entry("warehousesStaged", warehouses.size()), Map.entry("unitsStaged", units.size()),
             Map.entry("stockSnapshotsStaged", snapshots.size()), Map.entry("vouchersStaged", vouchers.size()),
+            Map.entry("undatedStockSnapshots", snapshots.stream().filter(row -> row.snapshotDate == null).count()),
+            Map.entry("undatedOutstandingSnapshots", parties.stream()
+                .filter(row -> row.sourceType == DomainEnums.DetectedFileType.DEBTOR_CREDITOR_ANALYSIS)
+                .filter(row -> row.snapshotDate == null).count()),
             Map.entry("voucherItemsStaged", items.size()),
+            Map.entry("stockJournalsDetected", transfers.stream().map(row -> row.stagedVoucherId).distinct().count()),
+            Map.entry("warehouseTransfersDetected", transfers.stream()
+                .filter(row -> row.classification == DomainEnums.StockJournalClassification.WAREHOUSE_TRANSFER).count()),
+            Map.entry("warehouseTransfersReviewRequired", transfers.stream()
+                .filter(row -> row.resolutionStatus == DomainEnums.TransferResolutionStatus.REVIEW_REQUIRED).count()),
             Map.entry("creditNotesStaged", vouchers.stream().filter(row -> normalize(row.voucherType).contains("CREDIT")).count()),
             Map.entry("debitNotesStaged", vouchers.stream().filter(row -> normalize(row.voucherType).contains("DEBIT")).count()),
             Map.entry("ledgerAdjustmentLinesStaged", vouchers.stream().mapToInt(row -> row.taxLineCount + row.discountLineCount
@@ -1284,8 +1623,9 @@ public class SmartImportStagingService {
             Map.entry("warehousesMatchedExisting", count(warehouses, DomainEnums.SmartMatchStatus.MATCH_EXISTING)),
             Map.entry("vouchersLikelyDuplicates", count(vouchers, DomainEnums.SmartMatchStatus.SKIP_DUPLICATE)),
             Map.entry("cashbookRowsMatched", cashbook.stream().filter(this::cashbookReady).count()),
-            Map.entry("cashbookRowsUnmatched", cashbook.stream().filter(row -> row.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.UNMATCHED_REVIEW).count()),
-            Map.entry("cashbookRowsReviewRequired", cashbook.stream().filter(row -> row.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.LOW_CONFIDENCE_REVIEW).count()),
+            Map.entry("cashbookRowsUnmatched", cashbook.stream().filter(row -> row.resolutionStatus == DomainEnums.CashbookResolutionStatus.UNRESOLVED && row.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.UNMATCHED_REVIEW).count()),
+            Map.entry("cashbookRowsReviewRequired", cashbook.stream().filter(row -> row.resolutionStatus == DomainEnums.CashbookResolutionStatus.UNRESOLVED && row.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.LOW_CONFIDENCE_REVIEW).count()),
+            Map.entry("retailCounterSaleRowsResolved", cashbook.stream().filter(row -> row.resolutionStatus == DomainEnums.CashbookResolutionStatus.RETAIL_SALE_RECORDED).count()),
             Map.entry("paymentsToCreate", cashbook.stream().filter(this::cashbookReady).count())
         );
     }
@@ -1305,6 +1645,7 @@ public class SmartImportStagingService {
     private void clearStaging(UUID tenantId, UUID sessionId) {
         dryRunItems.deleteByTenantIdAndImportSessionId(tenantId, sessionId);
         dryRuns.deleteByTenantIdAndImportSessionId(tenantId, sessionId);
+        stagedTransfers.deleteByTenantIdAndImportSessionId(tenantId, sessionId);
         stagedVoucherItems.deleteByTenantIdAndImportSessionId(tenantId, sessionId);
         stagedSnapshots.deleteByTenantIdAndImportSessionId(tenantId, sessionId);
         stagedCashbook.deleteByTenantIdAndImportSessionId(tenantId, sessionId);
@@ -1403,7 +1744,7 @@ public class SmartImportStagingService {
         if (externalId == null) return null;
         for (var product : existingProducts) {
             if (product.rawMetadata == null) continue;
-            var candidate = raw(product.rawMetadata, "Tally GUID", "GUID", "MASTERID", "Master ID", "Tally Master ID");
+            var candidate = SmartImportProductIdentity.fromProductMetadata(product.rawMetadata);
             if (candidate != null && externalId.equalsIgnoreCase(candidate.trim())) return product;
         }
         return null;
@@ -1461,17 +1802,6 @@ public class SmartImportStagingService {
     }
 
     private enum ExistingVoucherStatus { NONE, EXACT_DUPLICATE, AMBIGUOUS_CONFLICT }
-
-    private record CashbookPartyMatch(DomainEnums.SmartPartyType type, UUID id, String normalizedName) { }
-
-    private record CashbookInvoiceMatch(
-        DomainEnums.SmartPartyType partyType,
-        UUID partyId,
-        UUID invoiceId,
-        String invoiceNumber,
-        LocalDate invoiceDate,
-        BigDecimal amount
-    ) { }
 
     private String fingerprint(UUID tenantId, SmartStagedVoucher voucher) {
         var raw = tenantId + "|" + normalize(voucher.voucherType) + "|" + normalize(voucher.voucherNumber) + "|"
@@ -1596,7 +1926,9 @@ public class SmartImportStagingService {
             "roundOffAmount", row.roundOffAmount, "otherChargesAmount", row.otherChargesAmount,
             "taxLineCount", row.taxLineCount, "discountLineCount", row.discountLineCount,
             "freightLineCount", row.freightLineCount, "roundOffLineCount", row.roundOffLineCount,
-            "otherChargeLineCount", row.otherChargeLineCount);
+            "otherChargeLineCount", row.otherChargeLineCount, "returnClassification", row.returnClassification,
+            "returnResolutionStatus", row.returnResolutionStatus, "returnConfidence", row.returnConfidence,
+            "returnDetectionReason", row.returnDetectionReason);
     }
 
     private Map<String, Object> voucherItemRow(SmartStagedVoucherItem row) {
@@ -1604,7 +1936,25 @@ public class SmartImportStagingService {
             "productName", row.productName, "unitCode", row.unitCode, "quantity", row.quantity, "rate", row.rate,
             "amount", row.amount, "warehouseName", row.warehouseName, "rateSource", row.rateSource,
             "matchedProductId", row.matchedProductId, "matchedWarehouseId", row.matchedWarehouseId,
-            "matchStatus", row.matchStatus, "reviewStatus", row.reviewStatus);
+            "matchStatus", row.matchStatus, "reviewStatus", row.reviewStatus,
+            "rawQuantity", row.rawQuantity, "billedQuantity", row.billedQuantity,
+            "actualQuantity", row.actualQuantity, "returnDirection", row.returnDirection,
+            "returnDisposition", row.returnDisposition, "returnResolutionStatus", row.returnResolutionStatus,
+            "returnConfidence", row.returnConfidence, "returnDetectionReason", row.returnDetectionReason);
+    }
+
+    private Map<String, Object> transferRow(SmartStagedTransferCandidate row) {
+        return linked("id", row.id, "voucherId", row.stagedVoucherId, "fileId", row.sessionFileId,
+            "row", row.sourceRowNumber, "voucherNumber", row.voucherNumber, "voucherDate", row.voucherDate,
+            "productName", row.productName, "productId", row.matchedProductId, "unitCode", row.unitCode,
+            "sourceWarehouseName", row.sourceWarehouseName, "sourceWarehouseId", row.sourceWarehouseId,
+            "destinationWarehouseName", row.destinationWarehouseName,
+            "destinationWarehouseId", row.destinationWarehouseId,
+            "rawOutwardQuantity", row.rawOutwardQuantity, "rawInwardQuantity", row.rawInwardQuantity,
+            "normalizedQuantity", row.normalizedQuantity, "classification", row.classification,
+            "classificationConfidence", row.classificationConfidence, "decisionReasons", row.decisionReasons,
+            "resolutionStatus", row.resolutionStatus, "sourceSnapshotDate", row.sourceSnapshotDate,
+            "destinationSnapshotDate", row.destinationSnapshotDate);
     }
 
     private Map<String, Object> cashbookRow(SmartStagedCashbookEntry row) {
@@ -1621,10 +1971,7 @@ public class SmartImportStagingService {
     }
 
     private boolean cashbookReady(SmartStagedCashbookEntry row) {
-        return row.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.MATCHED_CUSTOMER_PAYMENT
-            || row.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.MATCHED_SUPPLIER_PAYMENT
-            || row.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.MATCHED_SALES_INVOICE
-            || row.cashbookMatchStatus == DomainEnums.CashbookMatchStatus.MATCHED_PURCHASE_INVOICE;
+        return SmartImportCashbookMatchingService.ready(row);
     }
 
     private Map<String, Object> ageingRow(SmartStagedStockAgeing row) {
