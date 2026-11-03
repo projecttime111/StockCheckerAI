@@ -44,6 +44,20 @@ server:
   error:
     include-stacktrace: never
 
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.stockpilot.ai: ${LOG_LEVEL_APP:INFO}
+    org.hibernate.SQL: ${LOG_LEVEL_HIBERNATE_SQL:WARN}
+
+sentry:
+  enabled: ${SENTRY_ENABLED:false}
+  dsn: ${SENTRY_DSN:}
+  environment: ${SENTRY_ENVIRONMENT:local}
+  release: ${SENTRY_RELEASE:}
+  traces-sample-rate: ${SENTRY_TRACES_SAMPLE_RATE:0.0}
+  send-default-pii: false
+
 management:
   endpoints:
     web:
@@ -75,7 +89,6 @@ app:
     email-cooldown-seconds: ${APP_AUTH_EMAIL_COOLDOWN_SECONDS:60}
     google-client-id: ${GOOGLE_CLIENT_ID:}
   public-url: ${APP_PUBLIC_URL:http://localhost:3000}
-  backend-public-url: ${BACKEND_PUBLIC_URL:http://localhost:8080}
   email:
     provider: ${EMAIL_PROVIDER:local}
     from: ${EMAIL_FROM:StockPilot AI <noreply@example.com>}
@@ -83,12 +96,8 @@ app:
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000,http://127.0.0.1:3000}
   storage:
-    mode: ${STORAGE_MODE:local}
     local-root: ${LOCAL_STORAGE_ROOT:uploads}
-    minio-endpoint: ${MINIO_ENDPOINT:http://localhost:9000}
-    minio-bucket: ${MINIO_BUCKET:stockpilot-imports}
   ai:
-    provider: ${AI_PROVIDER:local}
     llm-endpoint: ${LLM_ENDPOINT:}
     llm-api-key: ${LLM_API_KEY:}
   demo:

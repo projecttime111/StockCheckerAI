@@ -23,11 +23,10 @@ app:
   auth:
     require-email-verification: ${APP_AUTH_REQUIRE_EMAIL_VERIFICATION:true}
   public-url: ${APP_PUBLIC_URL}
-  backend-public-url: ${BACKEND_PUBLIC_URL}
   email:
     provider: ${EMAIL_PROVIDER:resend}
-    from: ${EMAIL_FROM}
-    resend-api-key: ${RESEND_API_KEY}
+    from: ${EMAIL_FROM:}
+    resend-api-key: ${RESEND_API_KEY:}
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS}
   storage:

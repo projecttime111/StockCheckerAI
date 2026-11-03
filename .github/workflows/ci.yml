@@ -28,12 +28,15 @@ jobs:
           node-version: "22"
       - name: Install web dependencies
         working-directory: web
-        run: npm install
+        run: npm ci
       - name: Test web
         working-directory: web
         run: npm test
       - name: Build web
         working-directory: web
+        env:
+          NEXT_PUBLIC_API_URL: https://api.example.invalid
+          NEXT_PUBLIC_DEMO_MODE: "false"
         run: npm run build
 
   mobile:
@@ -45,7 +48,7 @@ jobs:
           node-version: "22"
       - name: Install mobile dependencies
         working-directory: mobile
-        run: npm install
+        run: npm ci
       - name: Typecheck mobile
         working-directory: mobile
         run: npm run typecheck

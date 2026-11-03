@@ -1,9 +1,12 @@
 package com.stockpilot.ai.exception;
 
+import com.stockpilot.ai.observability.RequestCorrelationFilter;
+import io.sentry.Sentry;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.AccessDeniedException;
@@ -67,8 +70,37 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(Exception.class)
     ResponseEntity<ApiErrorResponse> generic(Exception ex, HttpServletRequest request) {
-        log.error("Unhandled request failure: {} {}", request.getMethod(), request.getRequestURI(), ex);
+        var requestId = currentRequestId(request);
+        log.error(
+            "Unhandled exception requestId={} method={} path={}",
+            requestId,
+            request.getMethod(),
+            request.getRequestURI(),
+            ex
+        );
+        reportToSentry(ex, request, requestId);
         return build(HttpStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Something went wrong", Map.of(), request);
+    }
+
+    private void reportToSentry(Exception ex, HttpServletRequest request, String requestId) {
+        try {
+            Sentry.withScope(scope -> {
+                scope.setTag("request_id", requestId);
+                scope.setTag("http.method", request.getMethod());
+                Sentry.captureException(ex);
+            });
+        } catch (RuntimeException reportingFailure) {
+            log.warn("Sentry reporting failed for requestId={}", requestId, reportingFailure);
+        }
+    }
+
+    private String currentRequestId(HttpServletRequest request) {
+        var requestId = MDC.get(RequestCorrelationFilter.REQUEST_ID_MDC_KEY);
+        if (requestId != null) {
+            return requestId;
+        }
+        var requestAttribute = request.getAttribute(RequestCorrelationFilter.REQUEST_ID_ATTRIBUTE);
+        return requestAttribute == null ? "unavailable" : requestAttribute.toString();
     }
 
     private ResponseEntity<ApiErrorResponse> build(HttpStatus status, String error, String message, Map<String, String> fields, HttpServletRequest request) {

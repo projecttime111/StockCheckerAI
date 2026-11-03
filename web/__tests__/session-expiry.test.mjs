@@ -3,7 +3,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import ts from "typescript";
 
-function client() {
+function client(env = {}) {
   const values = new Map([["stockpilot.token", "old-token"], ["stockpilot.role", "OWNER"], ["stockpilot.permissions", '["reports.export"]']]);
   const redirects = [];
   const events = [];
@@ -18,10 +18,31 @@ function client() {
   const module = { exports: {} };
   new Function("require", "module", "exports", "window", "fetch", "process", output)(
     () => ({ demoApi: () => { throw new Error("Demo should not be called"); } }), module, module.exports,
-    window, (...args) => respond(...args), { env: { NEXT_PUBLIC_DEMO_MODE: "false" } }
+    window, (...args) => respond(...args), { env: { NEXT_PUBLIC_DEMO_MODE: "false", ...env } }
   );
   return { ...module.exports, values, redirects, events, window, respond: (callback) => { respond = callback; } };
 }
+
+test("production API configuration and session-expiry handling coexist", async () => {
+  const api = client({ NODE_ENV: "production", VERCEL: "1", NEXT_PUBLIC_API_URL: " https://api.example.test/// " });
+  assert.equal(api.API_URL, "https://api.example.test");
+  let requestedUrl;
+  api.respond(async (url) => {
+    requestedUrl = url;
+    return new Response(JSON.stringify({ message: "Expired", error: "INVALID_TOKEN" }), { status: 401 });
+  });
+  await assert.rejects(api.api("/api/products"), { status: 401 });
+  assert.equal(requestedUrl, "https://api.example.test/api/products");
+  assert.equal(api.values.size, 0);
+  assert.deepEqual(api.events, ["stockpilot:session-cleared"]);
+  assert.deepEqual(api.redirects, ["/login?expired=1&next=%2Fimports%2Fsmart%3Fsession%3Dabc"]);
+});
+
+test("production API validation rejects missing configuration and insecure Vercel URLs", () => {
+  assert.throws(() => client({ NODE_ENV: "production" }), /NEXT_PUBLIC_API_URL is required/);
+  assert.throws(() => client({ NODE_ENV: "production", NEXT_PUBLIC_API_URL: "   " }), /NEXT_PUBLIC_API_URL is required/);
+  assert.throws(() => client({ NODE_ENV: "production", VERCEL: "1", NEXT_PUBLIC_API_URL: "http://api.example.test" }), /must use HTTPS/);
+});
 
 test("F10 authenticated 401 clears credentials, emits cache-clear event, and redirects with destination", async () => {
   const api = client();

@@ -320,38 +320,11 @@ npm run typecheck
 
 ## 10. Environment Variables Required
 
-Backend:
+The canonical local backend example is [`.env.example`](../.env.example).
+The production Render/Neon checklist is [`.env.neon.example`](../.env.neon.example).
+Browser-safe variables are in [`web/.env.example`](../web/.env.example), and Expo
+variables are in [`mobile/.env.example`](../mobile/.env.example).
 
-- `DATABASE_URL`
-- `DATABASE_USERNAME`
-- `DATABASE_PASSWORD`
-- `JWT_SECRET`
-- `JWT_ACCESS_TOKEN_MINUTES`
-- `CORS_ALLOWED_ORIGINS`
-- `CACHE_TYPE`
-- `REDIS_HOST`
-- `REDIS_PORT`
-- `RABBITMQ_HOST`
-- `RABBITMQ_USERNAME`
-- `RABBITMQ_PASSWORD`
-- `STORAGE_MODE`
-- `LOCAL_STORAGE_ROOT`
-- `UPLOAD_MAX_FILE_SIZE`
-- `UPLOAD_MAX_REQUEST_SIZE`
-- `MINIO_ENDPOINT`
-- `MINIO_BUCKET`
-- `AI_PROVIDER`
-- `LLM_ENDPOINT`
-- `LLM_API_KEY`
-
-Frontend:
-
-- `NEXT_PUBLIC_API_URL`
-- `NEXT_PUBLIC_DEMO_MODE`
-
-Mobile:
-
-- `EXPO_PUBLIC_API_URL`
-- `EXPO_PUBLIC_DEMO_MODE`
-
-Only `.env.example` is included in the review bundle.
+Do not add backend database, JWT, or email secrets to Vercel. The exact required,
+fixed, and optional production variables are documented in
+[`docs/NEON_DEPLOYMENT.md`](NEON_DEPLOYMENT.md).
