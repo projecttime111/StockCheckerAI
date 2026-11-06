@@ -1,4 +1,13 @@
 type Init = RequestInit;
+type DemoMovement = { id: string; productId: string; warehouseId: string; quantityDelta: number; rate: number; movementType: string; movementDate: string };
+type DemoLine = { productId: string; quantity: number; rate: number; costRate: number; lineTotal: number; taxAmount: number };
+type DemoInvoice = { id: string; invoiceNumber: string; invoiceDate: string; subtotal: number; taxAmount: number; totalAmount: number; warehouseId?: string; customerId?: string; supplierId?: string; items?: DemoLine[] };
+type DemoOrder = { orderId: string; orderNumber: string; status: string; totalAmount: number; customerId: string; items: { productId: string; quantity: number; price: number }[] };
+let portalOrders: DemoOrder[] = [];
+let draftPurchaseOrders: { purchaseOrderId: string; orderNumber: string; totalAmount: number; itemCount: number }[] = [];
+let adjustmentResults: Record<string, DemoMovement> = {};
+let paymentResults: Record<string, { id: string; customerId: string; amount: number; paymentDate: string; notes: string }> = {};
+
 
 let products = seedProducts();
 function seedProducts() {
@@ -25,6 +34,8 @@ function seedWarehouses() {
   { id: "w2", name: "Retail Counter", code: "RETAIL", address: "Front shop" }
   ];
 }
+
+let stockMovements: DemoMovement[] = seedStockMovements(products, warehouses);
 
 let demoTenant = seedTenant();
 function seedTenant() {
@@ -61,9 +72,9 @@ function seedPaymentReminders() {
 let suppliers = seedSuppliers();
 function seedSuppliers() {
   return [
-  { id: "s1", name: "ABC FMCG Supplier", phone: "9000000001", email: "abc@example.com", gstin: "27ABCF1234F1Z5", creditDays: 14 },
-  { id: "s2", name: "National Distributors", phone: "9000000002", email: "national@example.com", gstin: "27NATD1234F1Z5", creditDays: 21 },
-  { id: "s3", name: "Metro Wholesale", phone: "9000000003", email: "metro@example.com", gstin: "27METR1234F1Z5", creditDays: 7 }
+  { id: "s1", name: "ABC FMCG Supplier", phone: "9000000001", email: "abc@example.com", gstin: "27ABCF1234F1Z5", creditDays: 14, payable: 0 },
+  { id: "s2", name: "National Distributors", phone: "9000000002", email: "national@example.com", gstin: "27NATD1234F1Z5", creditDays: 21, payable: 0 },
+  { id: "s3", name: "Metro Wholesale", phone: "9000000003", email: "metro@example.com", gstin: "27METR1234F1Z5", creditDays: 7, payable: 0 }
   ];
 }
 
@@ -385,6 +396,11 @@ type DemoState = {
   purchaseInvoices: typeof purchaseInvoices;
   importRows: typeof importRows;
   importErrors: typeof importErrors;
+  stockMovements?: DemoMovement[];
+  portalOrders?: DemoOrder[];
+  draftPurchaseOrders?: typeof draftPurchaseOrders;
+  adjustmentResults?: typeof adjustmentResults;
+  paymentResults?: typeof paymentResults;
 };
 
 const DEMO_WORKSPACE_KEY = "stockpilot.demo.workspace";
@@ -402,7 +418,9 @@ function seedDemoState(): DemoState {
     salesInvoices: seedSalesInvoices(),
     purchaseInvoices: seedPurchaseInvoices(),
     importRows: seedImportRows(),
-    importErrors: seedImportErrors()
+    importErrors: seedImportErrors(),
+    stockMovements: seedStockMovements(seedProducts(), seedWarehouses()),
+    portalOrders: [], paymentResults: {}, draftPurchaseOrders: [], adjustmentResults: {}
   };
 }
 
@@ -422,7 +440,7 @@ function blankWorkspaceState(workspaceId: string, businessName?: string, busines
     salesInvoices: [],
     purchaseInvoices: [],
     importRows: [],
-    importErrors: []
+    importErrors: [], stockMovements: [], portalOrders: [], paymentResults: {}, draftPurchaseOrders: [], adjustmentResults: {}
   };
 }
 
@@ -437,6 +455,12 @@ function applyDemoState(state: DemoState) {
   purchaseInvoices = clone(state.purchaseInvoices);
   importRows = clone(state.importRows);
   importErrors = clone(state.importErrors);
+  stockMovements = clone(state.stockMovements ?? seedStockMovements(products, warehouses));
+  portalOrders = clone(state.portalOrders ?? []);
+  draftPurchaseOrders = clone(state.draftPurchaseOrders ?? []);
+  adjustmentResults = clone(state.adjustmentResults ?? {});
+  paymentResults = clone(state.paymentResults ?? {});
+  syncProductStocks();
 }
 
 function currentDemoState(): DemoState {
@@ -450,7 +474,7 @@ function currentDemoState(): DemoState {
     salesInvoices,
     purchaseInvoices,
     importRows,
-    importErrors
+    importErrors, stockMovements, portalOrders, paymentResults, draftPurchaseOrders, adjustmentResults
   };
 }
 
@@ -514,6 +538,25 @@ function clone<T>(value: T): T {
 }
 
 export async function demoApi<T>(path: string, init: Init = {}): Promise<T> {
+  const response = await demoResponse<unknown>(path, init);
+  if (typeof response === "string" || response == null || path.startsWith("/api/auth/")) return response as T;
+  const result = clone(response);
+  const permissions = rolePermissions(currentDemoUser().role);
+  const cost = permissions.includes("stock.view_cost") || permissions.includes("purchases.view_cost");
+  const profit = permissions.includes("insights.profit.view") || permissions.includes("sales.view_margin");
+  const redact = (value: unknown): void => {
+    if (Array.isArray(value)) { value.forEach(redact); return; }
+    if (!value || typeof value !== "object") return;
+    for (const [key, item] of Object.entries(value)) {
+      if ((!cost && ["defaultPurchasePrice", "stockValue", "totalStockValue", "deadStockValue", "blockedCapital", "costRate"].includes(key)) || (!profit && ["grossProfit", "grossMarginPercent", "profitChange", "marginChangePercent"].includes(key))) (value as Record<string, unknown>)[key] = null;
+      else redact(item);
+    }
+  };
+  redact(result);
+  return result as T;
+}
+
+async function demoResponse<T>(path: string, init: Init = {}): Promise<T> {
   if (process.env.NEXT_PUBLIC_DEMO_MODE !== "true") {
     if (process.env.NODE_ENV !== "production") {
       console.warn("StockPilot demoApi was called while NEXT_PUBLIC_DEMO_MODE is not true.", { path });
@@ -561,24 +604,25 @@ export async function demoApi<T>(path: string, init: Init = {}): Promise<T> {
   if (path.startsWith("/api/products")) {
     if (method === "POST") {
       const body = parseBody(init);
-      const row = product(`p${products.length + 1}`, body.sku || `SKU${products.length + 1}`, body.name, body.categoryName, body.brandName, body.unitCode || "PCS", body.barcode, Number(body.defaultPurchasePrice || 0), Number(body.defaultSalesPrice || 0), Number(body.reorderPoint || 0), 0);
+      const row = product(demoId("product"), body.sku || `SKU${products.length + 1}`, body.name, body.categoryName, body.brandName, body.unitCode || "PCS", body.barcode, Number(body.defaultPurchasePrice || 0), Number(body.defaultSalesPrice || 0), Number(body.reorderPoint || 0), 0);
       products.unshift(row);
       persistDemoState();
       return row as T;
     }
-    return page(filterByQuery(products, path)) as T;
+    return page(filterByQuery(products, path), path) as T;
   }
 
   if (path === "/api/warehouses") {
     if (method === "POST") {
       const body = parseBody(init);
-      const row = { id: `w${warehouses.length + 1}`, name: body.name, code: body.code, address: body.address };
+      const row = { id: demoId("warehouse"), name: body.name, code: body.code, address: body.address };
       warehouses.push(row);
       persistDemoState();
       return row as T;
     }
     return warehouses as T;
   }
+  if (path === "/api/customers/summary") return { outstandingReceivables: outstandingTotal() } as T;
   if (path === "/api/customers/payment-reminders") return paymentReminders.map(reminderResponse) as T;
   const reminderMatch = path.match(/^\/api\/customers\/([^/]+)\/payment-reminders$/);
   if (reminderMatch && method === "POST") {
@@ -603,33 +647,38 @@ export async function demoApi<T>(path: string, init: Init = {}): Promise<T> {
     const customer = customers.find((row) => row.id === paymentMatch[1]);
     if (!customer) throw new Error("Customer not found");
     const body = parseBody(init);
-    const amount = Math.max(0, Number(body.amount || 0));
-    customer.outstanding = Math.max(0, Number(customer.outstanding || 0) - amount);
+    const amount = roundMoney(Number(body.amount));
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error("Enter a positive payment amount");
+    const requestKey = new Headers(init.headers).get("Idempotency-Key");
+    if (requestKey && paymentResults[requestKey]) return paymentResults[requestKey] as T;
+    customer.outstanding = roundMoney(Number(customer.outstanding || 0) - amount);
     if (body.reminderId) {
       const reminder = paymentReminders.find((row) => row.id === body.reminderId && row.customerId === customer.id);
-      if (reminder) reminder.status = "PAID";
+      if (reminder) { reminder.amountDue = roundMoney(Math.max(0, reminder.amountDue - amount)); if (reminder.amountDue === 0) reminder.status = "PAID"; }
     }
+    const result = { id: demoId("pay"), customerId: customer.id, amount, paymentDate: body.paymentDate || today(), notes: [body.mode, body.referenceNumber, body.notes].filter(Boolean).join(" - ") };
+    if (requestKey) paymentResults[requestKey] = result;
     persistDemoState();
-    return { id: `pay-${Date.now()}`, customerId: customer.id, amount, paymentDate: body.paymentDate || today(), notes: [body.mode, body.referenceNumber, body.notes].filter(Boolean).join(" - ") } as T;
+    return result as T;
   }
-  if (path === "/api/customers?size=100" || path.startsWith("/api/customers?")) return page(customers) as T;
-  if (path === "/api/suppliers?size=100" || path.startsWith("/api/suppliers?")) return page(suppliers) as T;
+  if (path === "/api/customers?size=100" || path.startsWith("/api/customers?")) return page(filterByQuery(customers, path), path) as T;
+  if (path === "/api/suppliers?size=100" || path.startsWith("/api/suppliers?")) return page(filterByQuery(suppliers, path), path) as T;
   if (path === "/api/customers" && method === "POST") {
-    const row = { id: `c${customers.length + 1}`, ...parseBody(init), outstanding: 0 };
+    const row = { id: demoId("customer"), ...parseBody(init), outstanding: 0 };
     customers.unshift(row);
     persistDemoState();
     return row as T;
   }
   if (path === "/api/suppliers" && method === "POST") {
-    const row = { id: `s${suppliers.length + 1}`, ...parseBody(init) };
+    const row = { id: demoId("supplier"), payable: 0, ...parseBody(init) };
     suppliers.unshift(row);
     persistDemoState();
     return row as T;
   }
 
-  if (path === "/api/dashboard/summary") return { totalStockValue: 238640, monthlySales: 184250, grossProfit: 42680, lowStockCount: 4, deadStockValue: 42600, outstandingReceivables: outstandingTotal(), grossMarginPercent: 23.16, totalProducts: products.length, totalCustomers: customers.length, totalSuppliers: suppliers.length, importDataQualityScore: 72 } as T;
-  if (path === "/api/dashboard/sales-trend") return trend(30, 4200, 900) as T;
-  if (path === "/api/dashboard/profit-loss") return trend(30, 900, 260) as T;
+  if (path === "/api/dashboard/summary") return dashboardSummary() as T;
+  if (path === "/api/dashboard/sales-trend") return invoiceTrend(false) as T;
+  if (path === "/api/dashboard/profit-loss") return invoiceTrend(true) as T;
   if (path === "/api/dashboard/low-stock") return lowStock() as T;
   if (path === "/api/alerts/low-stock") return lowStock() as T;
   if (path === "/api/dashboard/dead-stock") return deadStockSimple() as T;
@@ -638,36 +687,62 @@ export async function demoApi<T>(path: string, init: Init = {}): Promise<T> {
   if (path === "/api/dashboard/slow-moving-products") return slowMovingProducts() as T;
   if (path.startsWith("/api/insights/profit-drop")) return profitDrop() as T;
 
-  if (path === "/api/stock/current") return stockRows() as T;
-  if (path === "/api/stock/adjustment" && method === "POST") return { id: "movement-demo", movementType: "ADJUSTMENT", ...parseBody(init), movementDate: new Date().toISOString() } as T;
-
-  if (path.startsWith("/api/purchases")) {
-    if (method === "POST") {
-      const row = invoice(`pur${purchaseInvoices.length + 1}`, parseBody(init).invoiceNumber || "PUR-DEMO-NEW", 12000);
-      purchaseInvoices.unshift(row);
-      persistDemoState();
-      return row as T;
-    }
-    return page(purchaseInvoices) as T;
+  if (path.startsWith("/api/stock/current")) {
+    const params = new URL(`http://demo${path}`).searchParams;
+    return stockRows().filter(row => (!params.get("productId") || row.productId === params.get("productId")) && (!params.get("warehouseId") || row.warehouseId === params.get("warehouseId"))) as T;
   }
+  if (path === "/api/stock/adjustment" && method === "POST") {
+    const body = parseBody(init);
+    const requestKey = new Headers(init.headers).get("Idempotency-Key");
+    if (requestKey && adjustmentResults[requestKey]) return adjustmentResults[requestKey] as T;
+    const product = products.find(row => row.id === body.productId);
+    if (!product || !warehouses.some(row => row.id === body.warehouseId)) throw new Error("Select a valid product and warehouse");
+    const delta = Number(body.quantityDelta);
+    const rate = Number(body.rate || 0);
+    if (!Number.isFinite(delta) || delta === 0 || !Number.isFinite(rate) || rate < 0) throw new Error("Enter a non-zero quantity and non-negative rate");
+    if (!demoTenant.allowNegativeStock && stockAt(product.id, body.warehouseId) + delta < 0) throw new Error("Insufficient stock in selected warehouse");
+    const movement = { id: demoId("movement"), productId: product.id, warehouseId: body.warehouseId, quantityDelta: delta, rate, movementType: "ADJUSTMENT", movementDate: new Date().toISOString() };
+    stockMovements.push(movement);
+    if (requestKey) adjustmentResults[requestKey] = movement;
+    syncProductStocks(); persistDemoState();
+    return movement as T;
+  }
+  if (path.startsWith("/api/purchases")) {
+    if (method === "POST") return createDemoInvoice(parseBody(init), false) as T;
+    return page(purchaseInvoices, path) as T;
+  }
+  if (path.startsWith("/api/sales/retail-counter")) return page([], path) as T;
   if (path.startsWith("/api/sales")) {
-    if (method === "POST") {
-      const row = invoice(`sale${salesInvoices.length + 1}`, parseBody(init).invoiceNumber || "SAL-DEMO-NEW", 3500);
-      salesInvoices.unshift(row);
-      persistDemoState();
-      return row as T;
-    }
-    return page(salesInvoices) as T;
+    if (method === "POST") return createDemoInvoice(parseBody(init), true) as T;
+    return page(salesInvoices, path) as T;
   }
 
   if (path === "/api/integrations/tally/status") return tallyStatus() as T;
-  if (path === "/api/data-quality/summary") return { totalProducts: products.length, duplicateGroups: 1, productsWithMissingFields: 4, productsWithoutRecentSales: 3, productsWithoutPurchaseCost: 4, qualityScore: 72 } as T;
+  if (path === "/api/data-quality/summary") return { totalProducts: products.length, duplicateGroups: duplicateGroups().length, productsWithMissingFields: missingFields().length, productsWithoutRecentSales: deadStockSimple().length, productsWithoutPurchaseCost: products.filter(row => row.defaultPurchasePrice <= 0).length, qualityScore: dashboardSummary().importDataQualityScore } as T;
   if (path === "/api/data-quality/products/duplicates") return duplicateGroups() as T;
   if (path === "/api/data-quality/products/missing-fields") return missingFields() as T;
-  if (path.includes("/api/data-quality/products/") && path.endsWith("/apply-suggestion")) return products.find((row) => path.includes(row.id)) as T;
+  if (path.includes("/api/data-quality/products/") && path.endsWith("/apply-suggestion")) {
+    const product = products.find(row => path.split("/").includes(row.id));
+    if (!product) throw new Error("Product not found");
+    const body = parseBody(init);
+    product.name = body.normalizedName || product.name;
+    product.normalizedName = product.name.toUpperCase();
+    product.brandName = body.brand || product.brandName;
+    product.categoryName = body.category || product.categoryName;
+    persistDemoState(); return product as T;
+  }
   if (path === "/api/data-quality/products/merge") {
     if (parseBody(init).confirmation !== "MERGE PRODUCTS") throw new Error("Type MERGE PRODUCTS to confirm duplicate product merge");
-    return { targetProductId: "p1", mergedProducts: 2 } as T;
+    const body = parseBody(init);
+    const target = products.find(row => row.id === body.targetProductId);
+    if (!target) throw new Error("Target product not found");
+    const sources = products.filter(row => row.id !== target.id && body.sourceProductIds?.includes(row.id));
+    const sourceIds = new Set(sources.map(row => row.id));
+    stockMovements.forEach(row => { if (sourceIds.has(row.productId)) row.productId = target.id; });
+    [...salesInvoices, ...purchaseInvoices].forEach(invoice => invoice.items?.forEach(row => { if (sourceIds.has(row.productId)) row.productId = target.id; }));
+    products = products.filter(row => !sourceIds.has(row.id));
+    syncProductStocks(); persistDemoState();
+    return { targetProductId: target.id, mergedProducts: sources.length } as T;
   }
 
   if (path === "/api/dead-stock") return deadStockActionRows() as T;
@@ -675,9 +750,15 @@ export async function demoApi<T>(path: string, init: Init = {}): Promise<T> {
 
   if (path === "/api/forecast/results" || path === "/api/forecast/run") return forecasts() as T;
   if (path === "/api/reorder/suggestions") return reorderSuggestions() as T;
-  if (path === "/api/reorder/generate-purchase-order") return { purchaseOrderId: "po-demo", orderNumber: "DRAFT-PO-DEMO", totalAmount: 42850, itemCount: 4 } as T;
+  if (path === "/api/reorder/generate-purchase-order") {
+    const ids: string[] = parseBody(init).productIds ?? [];
+    const rows = reorderSuggestions().filter(row => !ids.length || ids.includes(row.productId));
+    if (!rows.length) throw new Error("No reorder suggestions are available");
+    const order = { purchaseOrderId: demoId("po"), orderNumber: demoId("DRAFT-PO"), totalAmount: roundMoney(rows.reduce((sum, row) => sum + row.recommendedQuantity * (products.find(product => product.id === row.productId)?.defaultPurchasePrice ?? 0), 0)), itemCount: rows.length };
+    draftPurchaseOrders.push(order); persistDemoState(); return order as T;
+  }
 
-  if (path === "/api/import-sessions?size=20") return page([smartImportSession]) as T;
+  if (path.startsWith("/api/import-sessions?")) return page([smartImportSession], path) as T;
   if (path === "/api/import-sessions" && method === "POST") {
     const body = parseBody(init);
     smartImportSession = { ...seedSmartImportSession(), name: body.name || "New smart import session", status: "CREATED", files: [], issues: [], plan: {} };
@@ -763,7 +844,7 @@ export async function demoApi<T>(path: string, init: Init = {}): Promise<T> {
   }
 
   if (path.startsWith("/api/imports/upload")) return { batchId: importBatchId, status: "PARSED", rowCount: importRows.length } as T;
-  if (path === "/api/imports?size=20") return page([{ id: importBatchId, sourceType: "TALLY_XML", status: "PARSED", originalFileName: "demo-tally-vouchers.xml", rowCount: 3, validCount: 2, errorCount: importErrors.filter((row) => row.severity !== "WARNING").length, negativeStockPolicy: "BLOCK", importPurpose: "STOCK_SNAPSHOT", rollbackStatus: "NOT_ROLLED_BACK" }]) as T;
+  if (path.startsWith("/api/imports?")) return page([{ id: importBatchId, sourceType: "TALLY_XML", status: "PARSED", originalFileName: "demo-tally-vouchers.xml", rowCount: 3, validCount: 2, errorCount: importErrors.filter((row) => row.severity !== "WARNING").length, negativeStockPolicy: "BLOCK", importPurpose: "STOCK_SNAPSHOT", rollbackStatus: "NOT_ROLLED_BACK" }], path) as T;
   if (path === `/api/imports/${importBatchId}/preview`) return importRows as T;
   if (path === `/api/imports/${importBatchId}/errors`) return importErrors as T;
   if (path === `/api/imports/${importBatchId}/reconciliation`) return {
@@ -850,14 +931,24 @@ export async function demoApi<T>(path: string, init: Init = {}): Promise<T> {
 
   if (path === "/api/ai/assistant/chat") return assistant(parseBody(init).message) as T;
 
-  if (path.startsWith("/api/audit-logs")) return page(auditLogs()) as T;
+  if (path.startsWith("/api/audit-logs")) return page(auditLogs(), path) as T;
   if (path.startsWith("/api/reports/export/")) return reportCsv(path) as T;
 
-  if (path === "/api/portal/products" || path === "/api/portal/price-list") return products.slice(0, 8).map((row) => ({ productId: row.id, productName: row.name, price: row.defaultSalesPrice, availableStock: row.currentStock })) as T;
-  if (path === "/api/portal/orders" && method === "POST") return { orderId: "portal-order-demo", orderNumber: "PORTAL-SO-DEMO", status: "OPEN", totalAmount: 1250 } as T;
-  if (path === "/api/portal/orders") return [{ orderId: "portal-order-1", orderNumber: "PORTAL-SO-001", status: "OPEN", totalAmount: 4820 }] as T;
-  if (path === "/api/portal/outstanding") return { customerName: "Ravi Traders", outstanding: customers.find((row) => row.id === "c1")?.outstanding ?? 0 } as T;
-  if (path === "/api/portal/invoices") return salesInvoices.map((row) => ({ invoiceId: row.id, invoiceNumber: row.invoiceNumber, invoiceDate: row.invoiceDate, totalAmount: row.totalAmount })) as T;
+  if (path === "/api/portal/products" || path === "/api/portal/price-list") return products.filter(row => row.active).map(row => ({ productId: row.id, productName: row.name, price: row.defaultSalesPrice, availableStock: row.currentStock })) as T;
+  if (path === "/api/portal/orders" && method === "POST") {
+    const body = parseBody(init);
+    if (!Array.isArray(body.items) || !body.items.length) throw new Error("Add at least one item");
+    const items = body.items.map((item: {productId: string; quantity: number}) => {
+      const product = products.find(row => row.id === item.productId && row.active);
+      if (!product || !Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error("Invalid order item");
+      return { productId: product.id, quantity: item.quantity, price: product.defaultSalesPrice };
+    });
+    const order: DemoOrder = { orderId: demoId("order"), orderNumber: demoId("PORTAL-SO"), status: "OPEN", totalAmount: roundMoney(items.reduce((sum: number, item: {quantity: number; price: number}) => sum + item.quantity * item.price, 0)), customerId: currentDemoUser().customerId ?? "c1", items };
+    portalOrders.unshift(order); persistDemoState(); return order as T;
+  }
+  if (path === "/api/portal/orders") return portalOrders.filter(row => row.customerId === (currentDemoUser().customerId ?? "c1")) as T;
+  if (path === "/api/portal/outstanding") return { customerName: customers.find(row => row.id === (currentDemoUser().customerId ?? "c1"))?.name ?? "Customer", outstanding: customers.find(row => row.id === (currentDemoUser().customerId ?? "c1"))?.outstanding ?? 0 } as T;
+  if (path === "/api/portal/invoices") return salesInvoices.filter(row => row.customerId === (currentDemoUser().customerId ?? "c1")).map(row => ({ invoiceId: row.id, invoiceNumber: row.invoiceNumber, invoiceDate: row.invoiceDate, totalAmount: row.totalAmount })) as T;
 
   if (path === "/api/tenants/current/delete-impact") return {
     products: products.length,
@@ -874,7 +965,11 @@ export async function demoApi<T>(path: string, init: Init = {}): Promise<T> {
     auditLogs: auditLogs().length,
     uploadedFiles: 1
   } as T;
-  if (path === "/api/tenants/current/reset-business-data" && method === "POST") return { tenantId: demoTenant.id, deleted: {}, uploadedFilesScheduledForDeletion: 1 } as T;
+  if (path === "/api/tenants/current/reset-business-data" && method === "POST") {
+    if (parseBody(init).confirmation !== "RESET WORKSPACE DATA") throw new Error("Type RESET WORKSPACE DATA to confirm");
+    const tenant = clone(demoTenant); applyDemoState(blankWorkspaceState(tenant.id, tenant.name, tenant.businessMode)); demoTenant = tenant; persistDemoState();
+    return { tenantId: demoTenant.id, deleted: {}, uploadedFilesScheduledForDeletion: 0 } as T;
+  }
   if (path === "/api/tenants/current" && method === "DELETE") return { status: "DELETED", deletedTenantId: demoTenant.id, nextTenantId: null, onboardingRequired: true, accessToken: "demo-account-token", role: null } as T;
   if (path === "/api/tenants" && method === "POST") return { accessToken: "demo-token", tenantId: "demo-clean", userId: "demo-user", role: "OWNER", email: "owner@demo.com", fullName: "Demo Owner" } as T;
   if (path === "/api/account" && method === "DELETE") throw new Error("Delete or transfer owned workspaces before deleting your account.");
@@ -907,12 +1002,86 @@ function product(id: string, sku: string, name: string, categoryName: string | u
   return { id, sku, name, normalizedName: name.toUpperCase(), categoryName, brandName, unitCode, barcode, hsnCode: categoryName ? "1905" : undefined, gstPercentage: categoryName ? 5 : 0, defaultPurchasePrice, defaultSalesPrice, reorderPoint, currentStock, active: true };
 }
 
-function invoice(id: string, invoiceNumber: string, totalAmount: number) {
+function demoId(prefix: string) { return `${prefix}-${crypto.randomUUID()}`; }
+function roundMoney(value: number) { return Math.round((value + Number.EPSILON) * 100) / 100; }
+
+function seedStockMovements(items: typeof products, locations: typeof warehouses): DemoMovement[] {
+  if (!locations.length) return [];
+  return items.flatMap(product => {
+    const primary = locations.length > 1 ? Math.round(product.currentStock * 0.75) : product.currentStock;
+    return [primary, product.currentStock - primary].map((quantityDelta, index) => ({ id: `opening-${product.id}-${index}`, productId: product.id, warehouseId: locations[index]?.id ?? locations[0].id, quantityDelta, rate: product.defaultPurchasePrice, movementType: "OPENING", movementDate: new Date().toISOString() })).filter(row => row.quantityDelta !== 0);
+  });
+}
+
+function stockAt(productId: string, warehouseId?: string) {
+  return Math.round(stockMovements.filter(row => row.productId === productId && (!warehouseId || row.warehouseId === warehouseId)).reduce((sum, row) => sum + row.quantityDelta, 0) * 1000) / 1000;
+}
+
+function syncProductStocks() { products.forEach(product => { product.currentStock = stockAt(product.id); }); }
+
+function createDemoInvoice(body: { invoiceNumber: string; invoiceDate: string; warehouseId: string; customerId?: string; supplierId?: string; items: { productId: string; quantity: number; rate: number }[] }, sale: boolean): DemoInvoice {
+  const invoices = sale ? salesInvoices : purchaseInvoices;
+  if (!body.invoiceNumber?.trim() || !body.invoiceDate) throw new Error("Invoice number and date are required");
+  if (invoices.some(row => row.invoiceNumber.toLowerCase() === body.invoiceNumber.trim().toLowerCase())) throw new Error("Invoice number already exists");
+  if (!warehouses.some(row => row.id === body.warehouseId)) throw new Error("Select a valid warehouse");
+  const customer = body.customerId ? customers.find(row => row.id === body.customerId) : undefined;
+  const supplier = body.supplierId ? suppliers.find(row => row.id === body.supplierId) : undefined;
+  if ((body.customerId && !customer) || (body.supplierId && !supplier)) throw new Error("Party not found");
+  if (!Array.isArray(body.items) || !body.items.length) throw new Error("Add at least one invoice item");
+  const quantities = new Map<string, number>();
+  const items = body.items.map(line => {
+    const product = products.find(row => row.id === line.productId);
+    if (!product || !Number.isFinite(line.quantity) || line.quantity <= 0 || !Number.isFinite(line.rate) || line.rate < 0) throw new Error("Invalid product, quantity, or rate");
+    quantities.set(product.id, (quantities.get(product.id) ?? 0) + line.quantity);
+    const subtotal = roundMoney(line.quantity * line.rate);
+    const taxAmount = demoTenant.gstEnabled ? roundMoney(subtotal * product.gstPercentage / 100) : 0;
+    return { productId: product.id, quantity: line.quantity, rate: line.rate, costRate: product.defaultPurchasePrice, taxAmount, lineTotal: roundMoney(subtotal + taxAmount) };
+  });
+  if (sale && !demoTenant.allowNegativeStock) for (const [productId, quantity] of quantities) {
+    if (quantity > stockAt(productId, body.warehouseId)) throw new Error("Insufficient stock in selected warehouse");
+  }
+  const totalAmount = roundMoney(items.reduce((sum, line) => sum + line.lineTotal, 0));
+  const taxAmount = roundMoney(items.reduce((sum, line) => sum + line.taxAmount, 0));
+  const invoice: DemoInvoice = { id: demoId(sale ? "sale" : "purchase"), invoiceNumber: body.invoiceNumber.trim(), invoiceDate: body.invoiceDate, warehouseId: body.warehouseId, customerId: body.customerId, supplierId: body.supplierId, subtotal: roundMoney(totalAmount - taxAmount), taxAmount, totalAmount, items };
+  items.forEach(line => {
+    stockMovements.push({ id: demoId("movement"), productId: line.productId, warehouseId: body.warehouseId, quantityDelta: line.quantity * (sale ? -1 : 1), rate: line.rate, movementType: sale ? "SALE" : "PURCHASE", movementDate: `${body.invoiceDate}T12:00:00.000Z` });
+    if (!sale) { const product = products.find(row => row.id === line.productId)!; product.defaultPurchasePrice = line.rate; }
+  });
+  invoices.unshift(invoice);
+  if (sale && customer) customer.outstanding = roundMoney(customer.outstanding + totalAmount);
+  if (!sale && supplier) supplier.payable = roundMoney((supplier.payable ?? 0) + totalAmount);
+  syncProductStocks(); persistDemoState(); return invoice;
+}
+
+function invoiceProfit(invoice: DemoInvoice) {
+  return roundMoney((invoice.items ?? []).reduce((sum, line) => sum + line.lineTotal - line.taxAmount - line.quantity * line.costRate, 0));
+}
+
+function dashboardSummary() {
+  const month = today().slice(0, 7);
+  const current = salesInvoices.filter(row => row.invoiceDate.startsWith(month));
+  const monthlySales = roundMoney(current.reduce((sum, row) => sum + row.totalAmount, 0));
+  const grossProfit = roundMoney(current.reduce((sum, row) => sum + invoiceProfit(row), 0));
+  return { totalStockValue: roundMoney(stockRows().reduce((sum, row) => sum + row.stockValue, 0)), monthlySales, grossProfit, lowStockCount: lowStock().length, deadStockValue: roundMoney(deadStockSimple().reduce((sum, row) => sum + row.stockValue, 0)), outstandingReceivables: roundMoney(outstandingTotal()), grossMarginPercent: monthlySales ? roundMoney(grossProfit / monthlySales * 100) : 0, totalProducts: products.length, totalCustomers: customers.length, totalSuppliers: suppliers.length, importDataQualityScore: products.length ? Math.round((products.length - missingFields().length) / products.length * 100) : 0 };
+}
+
+function invoiceTrend(profit: boolean) {
+  return Array.from({ length: 30 }, (_, index) => {
+    const date = today(index - 29);
+    const rows = salesInvoices.filter(row => row.invoiceDate === date);
+    return { date, value: roundMoney(rows.reduce((sum, row) => sum + (profit ? invoiceProfit(row) : row.totalAmount), 0)) };
+  });
+}
+
+function invoice(id: string, invoiceNumber: string, totalAmount: number): DemoInvoice {
   return { id, invoiceNumber, invoiceDate: today(-Math.floor(Math.random() * 20)), subtotal: Math.round(totalAmount / 1.05), taxAmount: Math.round(totalAmount - totalAmount / 1.05), totalAmount };
 }
 
-function page<T>(content: T[]) {
-  return { content, totalElements: content.length, totalPages: 1, number: 0 };
+function page<T>(content: T[], path?: string) {
+  const params = new URL(`http://demo${path ?? "/"}`).searchParams;
+  const size = Math.max(1, Math.min(200, Number(params.get("size") || content.length || 25)));
+  const number = Math.max(0, Number(params.get("page") || 0));
+  return { content: content.slice(number * size, (number + 1) * size), totalElements: content.length, totalPages: Math.ceil(content.length / size), number };
 }
 
 function parseBody(init: Init) {
@@ -927,31 +1096,26 @@ function filterByQuery<T extends { name: string }>(rows: T[], path: string) {
 function today(offset = 0) {
   const date = new Date();
   date.setDate(date.getDate() + offset);
-  return date.toISOString().slice(0, 10);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
-function trend(days: number, base: number, wave: number) {
-  return Array.from({ length: days }, (_, index) => ({ date: today(index - days + 1), value: Math.round(base + Math.sin(index / 3) * wave + index * 45) }));
-}
 
 function lowStock() {
   return products.filter((row) => row.currentStock <= row.reorderPoint).map((row) => ({ productId: row.id, productName: row.name, currentStock: row.currentStock, reorderPoint: row.reorderPoint }));
 }
 
 function stockRows() {
-  return products.slice(0, 9).flatMap((row) => warehouses.map((warehouse, wIndex) => ({ productId: row.id, productName: row.name, warehouseId: warehouse.id, warehouseName: warehouse.name, currentStock: Math.max(0, Math.round(row.currentStock * (wIndex ? 0.25 : 0.75))), stockValue: Math.round(row.currentStock * row.defaultPurchasePrice * (wIndex ? 0.25 : 0.75)) }))).filter((row) => row.currentStock > 0);
+  return products.flatMap(product => warehouses.map(warehouse => {
+    const currentStock = stockAt(product.id, warehouse.id);
+    return { productId: product.id, productName: product.name, warehouseId: warehouse.id, warehouseName: warehouse.name, currentStock, stockValue: roundMoney(currentStock * product.defaultPurchasePrice) };
+  })).filter(row => row.currentStock !== 0);
 }
 
 function topProducts() {
-  return products.slice(0, 8).map((row, index) => ({
-    productId: row.id,
-    productName: row.name,
-    quantity: Math.max(12, 140 - index * 13),
-    revenue: Math.max(1200, Math.round((140 - index * 13) * row.defaultSalesPrice)),
-    stockQuantity: row.currentStock,
-    stockValue: Math.round(row.currentStock * row.defaultPurchasePrice),
-    lastSoldDate: today(-index)
-  }));
+  return products.map(row => {
+    const entries = salesInvoices.flatMap(invoice => (invoice.items ?? []).filter(item => item.productId === row.id).map(item => ({ ...item, date: invoice.invoiceDate })));
+    return { productId: row.id, productName: row.name, quantity: entries.reduce((sum, line) => sum + line.quantity, 0), revenue: roundMoney(entries.reduce((sum, line) => sum + line.lineTotal - line.taxAmount, 0)), stockQuantity: row.currentStock, stockValue: roundMoney(row.currentStock * row.defaultPurchasePrice), lastSoldDate: entries.map(row => row.date).sort().at(-1) };
+  }).filter(row => row.quantity > 0).sort((a, b) => b.revenue - a.revenue);
 }
 
 function slowMovingProducts() {
@@ -967,36 +1131,20 @@ function slowMovingProducts() {
 }
 
 function deadStockSimple() {
-  return [
-    { productId: "p9", productName: "MAGGI 70GM", stockQuantity: 24, stockValue: 2040, lastSoldDate: undefined, suggestedAction: "Bundle with fast-moving noodles", explanation: "No sales in the recent window." },
-    { productId: "p10", productName: "MAGGI MASLA 70", stockQuantity: 24, stockValue: 2040, lastSoldDate: undefined, suggestedAction: "Merge duplicate item and stop reordering", explanation: "Duplicate messy import item." }
-  ];
+  return products.filter(product => product.currentStock > 0 && !salesInvoices.some(invoice => invoice.invoiceDate >= today(-90) && invoice.items?.some(item => item.productId === product.id))).map(product => ({ productId: product.id, productName: product.name, stockQuantity: product.currentStock, stockValue: roundMoney(product.currentStock * product.defaultPurchasePrice), lastSoldDate: undefined as string | undefined, suggestedAction: "Review stock without recent sales", explanation: "No sales in the recent window." }));
 }
 
 function actions() {
-  const due = paymentReminders.map(reminderResponse).filter((row) => row.status === "OPEN" && (row.dueStatus === "OVERDUE" || row.dueStatus === "DUE_TODAY"));
-  const dueAmount = due.reduce((sum, row) => sum + Number(row.amountDue || 0), 0);
-  return [
-    { title: "Collect due payments", reason: `${due.length} customer payment follow-ups are due or overdue`, estimatedImpact: dueAmount, href: "/customers", cta: "Open follow-ups" },
-    { title: "Reorder urgent products", reason: "4 products may hit reorder thresholds soon", estimatedImpact: 42850, href: "/forecasts", cta: "View reorder" },
-    { title: "Follow up overdue customers", reason: "Receivables need owner attention", estimatedImpact: outstandingTotal(), href: "/customers", cta: "Open customers" },
-    { title: "Clear dead stock", reason: "₹42,600 blocked in slow-moving stock", estimatedImpact: 42600, href: "/dead-stock", cta: "View dead stock" },
-    { title: "Update missing product fields", reason: "4 products need HSN, GST, unit, cost, or category cleanup", estimatedImpact: 0, href: "/data-quality", cta: "Clean products" }
-  ];
+  const rows = [];
+  if (outstandingTotal() > 0) rows.push({ title: "Collect customer balances", reason: "Recorded customer receivables need attention", estimatedImpact: outstandingTotal(), href: "/customers", cta: "Open customers" });
+  if (lowStock().length) rows.push({ title: "Review reorder points", reason: `${lowStock().length} products are at or below their reorder point`, estimatedImpact: 0, href: "/forecasts", cta: "View reorder" });
+  if (deadStockSimple().length) rows.push({ title: "Review stock without sales", reason: "Review recorded stock without recent sales before clearing it", estimatedImpact: deadStockSimple().reduce((sum, row) => sum + row.stockValue, 0), href: "/dead-stock", cta: "View dead stock" });
+  return rows;
 }
 
 function profitDrop() {
-  return {
-    summary: "Profit dropped mainly because purchase cost increased for fast-moving items and discounts increased for Ravi Traders.",
-    profitChange: -12500,
-    marginChangePercent: -4.2,
-    topReasons: [
-      { reason: "Purchase cost increased for fast-moving items", impactAmount: 8200, evidence: "Surf Excel 1kg cost increased from ₹112 to ₹124." },
-      { reason: "Discounts increased for Ravi Traders", impactAmount: 4300, evidence: "Discount increased from 3% to 7% on recent invoices." }
-    ],
-    recommendedActions: ["Review selling price for Surf Excel 1kg", "Reduce discount for low-margin customers", "Bundle slow-moving stock with fast-moving products"],
-    evidence: { currentMonthRevenue: 184250, previousMonthRevenue: 196800, currentMonthGrossProfit: 42680, previousMonthGrossProfit: 55180 }
-  };
+  const current = dashboardSummary();
+  return { summary: "Demo profit reflects recorded sales lines and their captured purchase costs. Imported historical invoice headers without item costs are excluded from profit.", profitChange: current.grossProfit, marginChangePercent: current.grossMarginPercent, topReasons: [], recommendedActions: [], evidence: { currentMonthRevenue: current.monthlySales, currentMonthGrossProfit: current.grossProfit } };
 }
 
 function tallyStatus() {
@@ -1008,11 +1156,16 @@ function suggestion(id: string, productName: string, normalizedName = "Maggi Mas
 }
 
 function duplicateGroups() {
-  return [{ matchKey: "maggi-70g", similarityScore: 82, products: [suggestion("p9", "MAGGI 70GM"), suggestion("p10", "MAGGI MASLA 70"), suggestion("p11", "MAGGI NOODLES 70GM")], suggestedCanonical: suggestion("p1", "Maggi Masala Noodles 70g") }];
+  const candidates = products.filter(row => ["p9", "p10", "p11"].includes(row.id));
+  const canonical = products.find(row => row.id === "p1");
+  return canonical && candidates.length > 1 ? [{ matchKey: "maggi-70g", similarityScore: 82, products: candidates.map(row => suggestion(row.id, row.name)), suggestedCanonical: suggestion(canonical.id, canonical.name) }] : [];
 }
 
 function missingFields() {
-  return [suggestion("p9", "MAGGI 70GM"), suggestion("p10", "MAGGI MASLA 70"), suggestion("p11", "MAGGI NOODLES 70GM"), { ...suggestion("p12", "Imported Promo Pack 100g", "Imported Promo Pack 100g"), brand: "", category: "Imported Uncategorized", unitSize: "100g", issues: ["Missing HSN", "Missing GST", "Missing purchase cost"] }].map((row) => ({ productId: row.productId, productName: row.productName, missingFields: row.issues.map((issue) => issue.replace("Missing ", "").toLowerCase()), suggestion: row }));
+  return products.flatMap(product => {
+    const missing = [!product.categoryName && "category", !product.unitCode && "unit", !product.hsnCode && "HSN", product.defaultPurchasePrice <= 0 && "purchase cost"].filter((value): value is string => Boolean(value));
+    return missing.length ? [{ productId: product.id, productName: product.name, missingFields: missing, suggestion: { productId: product.id, productName: product.name, normalizedName: product.name.trim().replace(/\s+/g, " "), brand: product.brandName ?? "", category: product.categoryName ?? "Uncategorized", unitSize: product.unitCode, issues: missing } }] : [];
+  });
 }
 
 function deadStockActionRows() {
@@ -1020,20 +1173,23 @@ function deadStockActionRows() {
 }
 
 function forecasts() {
-  return reorderSuggestions().map((row) => ({ productId: row.productId, productName: row.productName, currentStock: row.currentStock, averageDailyDemand: row.averageDailyDemand, next7DaysDemand: row.last7DaysDemand, next30DaysDemand: row.last30DaysDemand, stockoutDate: row.expectedStockoutDate }));
+  return reorderSuggestions().map((row) => ({ productId: row.productId, productName: row.productName, currentStock: row.currentStock, averageDailyDemand: row.averageDailyDemand, next7DaysDemand: row.last7DaysDemand, next30DaysDemand: row.last30DaysDemand, stockoutDate: row.expectedStockoutDate, salesHistoryAvailable: row.salesHistoryAvailable }));
 }
 
 function reorderSuggestions() {
-  return [
-    { productId: "p2", productName: "Parle-G 250g", warehouseId: "w1", warehouseName: "Main Godown", currentStock: 18, averageDailyDemand: 3, last7DaysDemand: 25, last30DaysDemand: 92, expectedStockoutDate: today(6), supplierLeadTimeDays: 5, safetyStock: 25, minimumOrderQuantity: 24, pendingPurchaseQuantity: 0, pendingSalesQuantity: 12, recommendedQuantity: 45, reason: "Sales increased 22% in the last 4 weeks" },
-    { productId: "p4", productName: "Surf Excel 1kg", warehouseId: "w1", warehouseName: "Main Godown", currentStock: 21, averageDailyDemand: 2.5, last7DaysDemand: 20, last30DaysDemand: 78, expectedStockoutDate: today(8), supplierLeadTimeDays: 5, safetyStock: 10, minimumOrderQuantity: 24, pendingPurchaseQuantity: 0, pendingSalesQuantity: 8, recommendedQuantity: 34, reason: "Current stock plus pending orders is near reorder point" }
-  ];
+  return products.flatMap(product => warehouses.map(warehouse => {
+    const sold = stockMovements.filter(row => row.productId === product.id && row.warehouseId === warehouse.id && row.movementType === "SALE" && row.movementDate.slice(0, 10) >= today(-30));
+    const quantity = -sold.reduce((sum, row) => sum + row.quantityDelta, 0);
+    const averageDailyDemand = quantity / 30;
+    const currentStock = stockAt(product.id, warehouse.id);
+    return { productId: product.id, productName: product.name, warehouseId: warehouse.id, warehouseName: warehouse.name, currentStock, averageDailyDemand, last7DaysDemand: averageDailyDemand * 7, last30DaysDemand: quantity, expectedStockoutDate: currentStock <= 0 ? today() : averageDailyDemand > 0 ? today(Math.floor(currentStock / averageDailyDemand)) : undefined, salesHistoryAvailable: sold.length > 0, supplierLeadTimeDays: 7, safetyStock: 5, minimumOrderQuantity: 1, pendingPurchaseQuantity: 0, pendingSalesQuantity: 0, recommendedQuantity: Math.max(0, Math.ceil(Math.max(product.reorderPoint, averageDailyDemand * 14) - currentStock)), reason: sold.length ? "Based on recorded warehouse sales and current stock" : "No sales history; recommendation uses the configured reorder point" };
+  })).filter(row => row.recommendedQuantity > 0);
 }
 
 function assistant(message = "") {
   const lower = message.toLowerCase();
-  let response = "I can answer using demo tenant data. Monthly sales are ₹1,84,250, gross profit is ₹42,680, and 4 products need attention.";
-  let evidence: Record<string, unknown> = { summary: { monthlySales: 184250, grossProfit: 42680 } };
+  let response = `Based on recorded demo transactions: monthly sales ${dashboardSummary().monthlySales}, gross profit ${dashboardSummary().grossProfit} (${demoTenant.currency}).`;
+  let evidence: Record<string, unknown> = { summary: dashboardSummary() };
   if (lower.includes("profit")) {
     const analysis = profitDrop();
     response = `${analysis.summary} Profit change: ₹${analysis.profitChange}.`;
@@ -1112,7 +1268,8 @@ function reportRows(report: string) {
 }
 
 function csvCell(value: unknown) {
-  const text = String(value ?? "");
+  const raw = String(value ?? "");
+  const text = /^[=+@\-\t\r]/.test(raw) ? `'${raw}` : raw;
   return /[",\n\r]/.test(text) ? `"${text.replaceAll("\"", "\"\"")}"` : text;
 }
 
@@ -1187,7 +1344,7 @@ function rolePermissions(role: string) {
   if (role === "CUSTOMER_USER") return ["portal.customer.view", "portal.customer.order_create", "portal.customer.invoice_view", "portal.customer.outstanding_view"];
   if (role === "WAREHOUSE_STAFF" || role === "STAFF") return ["dashboard.view", "products.view", "stock.view", "stock.adjust", "stock.transfer"];
   if (role === "SALES_STAFF") return ["dashboard.view", "products.view", "stock.view", "sales.view", "sales.create", "customers.view", "customers.create", "customers.view_outstanding"];
-  if (role === "PURCHASE_MANAGER") return ["dashboard.view", "products.view", "stock.view", "suppliers.view", "suppliers.create", "suppliers.update", "purchases.view", "purchases.create", "purchases.update", "forecast.view", "reorder.view", "reorder.create_purchase_order", "reports.view"];
+  if (role === "PURCHASE_MANAGER") return ["dashboard.view", "products.view", "stock.view", "suppliers.view", "suppliers.create", "suppliers.update", "purchases.view", "purchases.create", "purchases.update", "purchases.view_cost", "forecast.view", "reorder.view", "reorder.create_purchase_order", "reports.view"];
   if (role === "ACCOUNTANT") return ["dashboard.view", "sales.view", "purchases.view", "customers.view", "customers.view_outstanding", "reports.view", "reports.export", "insights.profit.view", "audit.view"];
   if (role === "AUDITOR") return ["dashboard.view", "products.view", "stock.view", "sales.view", "purchases.view", "customers.view", "suppliers.view", "imports.view", "integrations.tally.view", "forecast.view", "reorder.view", "dead_stock.view", "data_quality.view", "insights.profit.view", "reports.view", "reports.export", "audit.view"];
   if (role === "SUPPLIER_USER") return ["portal.supplier.view", "portal.supplier.po_view", "portal.supplier.invoice_upload", "portal.supplier.delivery_update"];

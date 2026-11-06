@@ -90,6 +90,7 @@ public class SmartImportDryRunService {
     private final Repositories.StockMovementRepository stockMovements;
     private final StockLedgerService stockLedger;
     private final AuditService audit;
+    private final SmartImportDestinationValidator destinationValidator;
     private final SmartImportFingerprintService fingerprints;
     private final SmartImportSnapshotDateService snapshotDates;
     private final SmartImportSnapshotEligibilityService snapshotEligibility;
@@ -127,6 +128,7 @@ public class SmartImportDryRunService {
         Repositories.StockMovementRepository stockMovements,
         StockLedgerService stockLedger,
         AuditService audit,
+        SmartImportDestinationValidator destinationValidator,
         SmartImportFingerprintService fingerprints,
         SmartImportSnapshotDateService snapshotDates,
         SmartImportSnapshotEligibilityService snapshotEligibility,
@@ -163,6 +165,7 @@ public class SmartImportDryRunService {
         this.stockMovements = stockMovements;
         this.stockLedger = stockLedger;
         this.audit = audit;
+        this.destinationValidator = destinationValidator;
         this.fingerprints = fingerprints;
         this.snapshotDates = snapshotDates;
         this.snapshotEligibility = snapshotEligibility;
@@ -237,6 +240,12 @@ public class SmartImportDryRunService {
             entityManager.clear();
             previewCashbookAndAgeing(context);
             previewUnresolvedPlanIssues(context);
+            for (var violation : destinationValidator.validate(session.tenantId, session.id)) {
+                generated.add(item(context, DomainEnums.ImportDryRunItemType.FILE, DomainEnums.ImportDryRunAction.BLOCKED,
+                    violation.fileId(), violation.rowNumber(), null,
+                    linked("field", violation.field(), "message", violation.message()), null, "FINAL_FIELD_BOUNDS"));
+            }
+
 
             dryRunItems.saveAll(generated);
             counters.set("warnings", generated.stream().filter(item -> item.warningCode != null).count());
@@ -510,7 +519,7 @@ public class SmartImportDryRunService {
             var duplicate = voucher.matchStatus == DomainEnums.SmartMatchStatus.SKIP_DUPLICATE;
             var invoiceAction = voucher.reviewStatus == DomainEnums.SmartReviewStatus.PENDING
                 ? DomainEnums.ImportDryRunAction.REVIEW_REQUIRED
-                : duplicate || existingInvoice(existingInvoiceIndex, invoiceType, voucher.voucherNumber) ? DomainEnums.ImportDryRunAction.SKIP
+                : duplicate || existingInvoice(existingInvoiceIndex, invoiceType, voucher) ? DomainEnums.ImportDryRunAction.SKIP
                 : DomainEnums.ImportDryRunAction.CREATE;
             if (duplicate) context.counters.inc("duplicateVouchersSkipped");
             if (invoiceAction == DomainEnums.ImportDryRunAction.REVIEW_REQUIRED) context.counters.inc("vouchersBlocked");
@@ -1113,9 +1122,9 @@ public class SmartImportDryRunService {
 
     private ExistingInvoiceIndex existingInvoiceIndex(UUID tenantId) {
         var sales = salesInvoices.findByTenantId(tenantId).stream()
-            .map(invoice -> invoiceKey(invoice.invoiceNumber)).filter(value -> !value.isBlank()).collect(Collectors.toSet());
+            .map(invoice -> invoiceKey(invoice.invoiceNumber, invoice.invoiceDate, null)).collect(Collectors.toSet());
         var purchases = purchaseInvoices.findByTenantId(tenantId).stream()
-            .map(invoice -> invoiceKey(invoice.invoiceNumber)).filter(value -> !value.isBlank()).collect(Collectors.toSet());
+            .map(invoice -> invoiceKey(invoice.invoiceNumber, invoice.invoiceDate, invoice.supplierId)).collect(Collectors.toSet());
         var creditNotes = new HashSet<String>();
         var debitNotes = new HashSet<String>();
         for (var adjustment : financialAdjustments.findByTenantIdOrderByVoucherDateDesc(tenantId)) {
@@ -1127,9 +1136,12 @@ public class SmartImportDryRunService {
         return new ExistingInvoiceIndex(sales, purchases, creditNotes, debitNotes);
     }
 
-    private boolean existingInvoice(ExistingInvoiceIndex index, DomainEnums.ImportDryRunItemType type, String number) {
+    private boolean existingInvoice(ExistingInvoiceIndex index, DomainEnums.ImportDryRunItemType type, SmartStagedVoucher voucher) {
+        var number = voucher.voucherNumber;
         if (number == null || number.isBlank()) return false;
-        var key = invoiceKey(number);
+        var key = type == DomainEnums.ImportDryRunItemType.SALES_INVOICE || type == DomainEnums.ImportDryRunItemType.PURCHASE_INVOICE
+            ? invoiceKey(number, voucher.voucherDate, type == DomainEnums.ImportDryRunItemType.PURCHASE_INVOICE ? voucher.matchedPartyId : null)
+            : invoiceKey(number);
         return switch (type) {
             case SALES_INVOICE -> index.sales.contains(key);
             case PURCHASE_INVOICE -> index.purchases.contains(key);
@@ -1139,8 +1151,12 @@ public class SmartImportDryRunService {
         };
     }
 
+    private String invoiceKey(String value, LocalDate date, UUID supplierId) {
+        return invoiceKey(value) + "|" + (date == null ? "" : InvoiceIdentityService.fiscalYearStart(date)) + "|" + supplierId;
+    }
+
     private String invoiceKey(String value) {
-        return value == null ? "" : value.toUpperCase(Locale.ROOT);
+        return value == null ? "" : value.trim().toUpperCase(Locale.ROOT);
     }
 
     private DomainEnums.ImportDryRunItemType invoiceType(String voucherType) {

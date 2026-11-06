@@ -34,14 +34,16 @@ public class StockController {
 
     @PostMapping("/adjustment")
     @PreAuthorize("@permissionService.has('stock.adjust')")
-    public ApiDtos.MovementResponse adjustment(@Valid @RequestBody ApiDtos.StockAdjustmentRequest request) {
-        return stock.adjust(request);
+    public ApiDtos.MovementResponse adjustment(@Valid @RequestBody ApiDtos.StockAdjustmentRequest request,
+        @RequestHeader(value = "Idempotency-Key", required = false) String key) {
+        return stock.adjust(request, key);
     }
 
     @PostMapping("/transfer")
     @PreAuthorize("@permissionService.has('stock.transfer')")
-    public List<ApiDtos.MovementResponse> transfer(@Valid @RequestBody ApiDtos.StockTransferRequest request) {
-        return stock.transfer(request);
+    public List<ApiDtos.MovementResponse> transfer(@Valid @RequestBody ApiDtos.StockTransferRequest request,
+        @RequestHeader(value = "Idempotency-Key", required = false) String key) {
+        return stock.transfer(request, key);
     }
 
     @GetMapping("/movements")

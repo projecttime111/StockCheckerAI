@@ -19,7 +19,7 @@ public class TenantController {
     }
 
     @GetMapping
-    @PreAuthorize("@permissionService.has('dashboard.view') or @permissionService.has('settings.view')")
+    @PreAuthorize("@permissionService.has('dashboard.view') or @permissionService.has('settings.view') or @permissionService.has('portal.customer.view')")
     public ApiDtos.TenantResponse current() {
         return tenantService.response(tenantService.current());
     }

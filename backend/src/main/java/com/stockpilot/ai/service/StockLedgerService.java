@@ -30,6 +30,8 @@ public class StockLedgerService {
     private final Repositories.TenantRepository tenants;
     private final AuditService auditService;
     private final StockLockService stockLocks;
+    private final SensitiveDataService sensitive;
+    private final IdempotencyService idempotency;
 
     public StockLedgerService(
         Repositories.StockMovementRepository movements,
@@ -38,7 +40,7 @@ public class StockLedgerService {
         Repositories.UnitConversionRepository conversions,
         Repositories.TenantRepository tenants,
         AuditService auditService,
-        StockLockService stockLocks
+        StockLockService stockLocks, SensitiveDataService sensitive, IdempotencyService idempotency
     ) {
         this.movements = movements;
         this.products = products;
@@ -47,6 +49,7 @@ public class StockLedgerService {
         this.tenants = tenants;
         this.auditService = auditService;
         this.stockLocks = stockLocks;
+        this.sensitive = sensitive; this.idempotency = idempotency;
     }
 
     public BigDecimal currentStock(UUID tenantId, UUID productId, UUID warehouseId) {
@@ -76,7 +79,7 @@ public class StockLedgerService {
             for (var warehouse : warehouseList) {
                 var current = currentStock(tenantId, product.id, warehouse.id);
                 if (current.compareTo(BigDecimal.ZERO) != 0 || productId != null || warehouseId != null) {
-                    result.add(new ApiDtos.StockResponse(product.id, product.name, warehouse.id, warehouse.name, current, current.multiply(latestCost(tenantId, product))));
+                    result.add(new ApiDtos.StockResponse(product.id, product.name, warehouse.id, warehouse.name, current, sensitive.cost(MoneyMath.amount(current.multiply(latestCost(tenantId, product))))));
                 }
             }
         }
@@ -208,6 +211,17 @@ public class StockLedgerService {
 
     @Transactional
     public ApiDtos.MovementResponse adjust(ApiDtos.StockAdjustmentRequest request) {
+        return adjust(request, null);
+    }
+
+    @Transactional
+    public ApiDtos.MovementResponse adjust(ApiDtos.StockAdjustmentRequest request, String key) {
+        var tenantId = TenantContext.tenantId();
+        return idempotency.execute("STOCK_ADJUSTMENT", key, request, () -> performAdjustment(request),
+            id -> response(movements.findByTenantIdAndId(tenantId, id).orElseThrow(() -> ApiErrors.notFound("Stock movement not found"))));
+    }
+
+    private UUID performAdjustment(ApiDtos.StockAdjustmentRequest request) {
         var tenantId = TenantContext.tenantId();
         if (request.quantityDelta().compareTo(BigDecimal.ZERO) == 0) {
             throw ApiErrors.badRequest("Stock adjustment quantity cannot be zero");
@@ -228,11 +242,23 @@ public class StockLedgerService {
             request.notes()
         );
         auditService.logCurrent("STOCK_ADJUSTMENT", "StockMovement", movement.id, java.util.Map.of("quantityDelta", request.quantityDelta(), "reason", request.notes() == null ? "Unspecified" : request.notes()));
-        return response(movement);
+        return movement.id;
     }
 
     @Transactional
     public List<ApiDtos.MovementResponse> transfer(ApiDtos.StockTransferRequest request) {
+        return transfer(request, null);
+    }
+
+    @Transactional
+    public List<ApiDtos.MovementResponse> transfer(ApiDtos.StockTransferRequest request, String key) {
+        var tenantId = TenantContext.tenantId();
+        return idempotency.execute("STOCK_TRANSFER", key, request, () -> performTransfer(request),
+            reference -> movements.findByTenantIdAndReferenceTypeAndReferenceIdOrderByCreatedAtAsc(tenantId, "STOCK_TRANSFER", reference)
+                .stream().map(this::response).toList());
+    }
+
+    private UUID performTransfer(ApiDtos.StockTransferRequest request) {
         var tenantId = TenantContext.tenantId();
         if (request.sourceWarehouseId().equals(request.destinationWarehouseId())) {
             throw ApiErrors.badRequest("Source and destination warehouses must be different");
@@ -252,7 +278,7 @@ public class StockLedgerService {
         var out = createMovement(tenantId, request.productId(), request.sourceWarehouseId(), DomainEnums.MovementType.TRANSFER_OUT, request.quantity(), null, BigDecimal.ZERO, "STOCK_TRANSFER", referenceId, Instant.now(), request.notes());
         var in = createMovement(tenantId, request.productId(), request.destinationWarehouseId(), DomainEnums.MovementType.TRANSFER_IN, request.quantity(), null, BigDecimal.ZERO, "STOCK_TRANSFER", referenceId, Instant.now(), request.notes());
         auditService.logCurrent("STOCK_TRANSFER", "StockMovement", referenceId, java.util.Map.of("quantity", request.quantity()));
-        return List.of(response(out), response(in));
+        return referenceId;
     }
 
     public ApiDtos.MovementResponse response(StockMovement movement) {
@@ -263,7 +289,7 @@ public class StockLedgerService {
             movement.movementType,
             movement.quantity,
             movement.baseQuantity,
-            movement.rate,
+            sensitive.cost(movement.rate),
             movement.movementDate,
             movement.referenceType
         );
@@ -316,14 +342,14 @@ public class StockLedgerService {
             .filter(movement -> movement.baseQuantity != null && movement.baseQuantity.signum() != 0)
             .filter(movement -> movement.quantity != null && movement.rate != null)
             .map(movement -> movement.rate.multiply(movement.quantity.abs())
-                .divide(movement.baseQuantity.abs(), 6, java.math.RoundingMode.HALF_UP))
+                .divide(movement.baseQuantity.abs(), 12, java.math.RoundingMode.HALF_UP))
             .filter(rate -> rate != null && rate.compareTo(BigDecimal.ZERO) > 0)
             .orElse(fallback == null ? BigDecimal.ZERO : fallback);
     }
 
     BigDecimal toBaseRate(UUID tenantId, Product product, UUID unitId, BigDecimal sourceRate) {
         return sourceRate.divide(toBaseQuantity(tenantId, product, unitId, BigDecimal.ONE),
-            6, java.math.RoundingMode.HALF_UP);
+            12, java.math.RoundingMode.HALF_UP);
     }
 
     private StockPolicyResult enforceStockPolicy(UUID tenantId, UUID productId, UUID warehouseId, DomainEnums.MovementType type, BigDecimal signedQuantity) {

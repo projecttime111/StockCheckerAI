@@ -5,6 +5,9 @@ import { CheckCircle2, Merge, Sparkles, TriangleAlert } from "lucide-react";
 import { useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { EmptyState } from "@/components/EmptyState";
+import { Permission } from "@/lib/business";
+import { MutationFeedback, QueryFeedback } from "@/components/QueryFeedback";
+import { Pagination } from "@/components/Pagination";
 import { Panel } from "@/components/Panel";
 import { StatCard } from "@/components/StatCard";
 import { api } from "@/lib/api";
@@ -15,6 +18,7 @@ type MissingFields = { productId: string; productName: string; missingFields: st
 type Summary = { totalProducts: number; duplicateGroups: number; productsWithMissingFields: number; productsWithoutRecentSales: number; productsWithoutPurchaseCost: number; qualityScore: number };
 
 export default function DataQualityPage() {
+  const [missingPage, setMissingPage] = useState(0);
   const queryClient = useQueryClient();
   const [mergeConfirmations, setMergeConfirmations] = useState<Record<string, string>>({});
   const summary = useQuery({ queryKey: ["data-quality", "summary"], queryFn: () => api<Summary>("/api/data-quality/summary") });
@@ -33,8 +37,13 @@ export default function DataQualityPage() {
   const missingRows = missing.data ?? [];
   const hasProducts = Number(summaryData?.totalProducts ?? 0) > 0;
 
+  if (summary.isLoading || summary.error || duplicates.isLoading || duplicates.error || missing.isLoading || missing.error) return <AppShell title="Data Quality"><QueryFeedback queries={[summary, duplicates, missing]} /></AppShell>;
+
   return (
     <AppShell title="Data Quality">
+      <QueryFeedback queries={[summary, duplicates, missing]} />
+      <MutationFeedback mutation={apply} success="Suggestion applied." />
+      <MutationFeedback mutation={merge} success="Products merged." />
       <div className="space-y-6">
         <Panel title="Product Cleanup Engine">
           <p className="text-sm text-ink/65">Clean messy Tally or Excel item masters before forecasting. StockPilot AI detects duplicates, missing GST/HSN/unit/category, missing purchase cost, and suggests normalized names without changing your accounting records.</p>
@@ -60,7 +69,7 @@ export default function DataQualityPage() {
                 <div key={group.matchKey} className="rounded border border-ink/10 p-3">
                   <div className="flex items-center justify-between gap-2">
                     <div className="font-semibold">Similarity {group.similarityScore}%</div>
-                    <button className="rounded bg-moss px-3 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={(mergeConfirmations[group.matchKey] ?? "") !== "MERGE PRODUCTS"} onClick={() => merge.mutate(group)}>Merge into canonical</button>
+                    <Permission permission="data_quality.merge"><button className="rounded bg-moss px-3 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={merge.isPending || (mergeConfirmations[group.matchKey] ?? "") !== "MERGE PRODUCTS"} onClick={() => merge.mutate(group)}>Merge into canonical</button></Permission>
                   </div>
                   <div className="mt-2 text-sm text-ink/55">Suggested: {group.suggestedCanonical.normalizedName}</div>
                   <input
@@ -80,7 +89,7 @@ export default function DataQualityPage() {
 
           <Panel title="Missing Fields and Suggestions">
             <div className="space-y-3">
-              {missingRows.slice(0, 20).map((row) => (
+              {missingRows.slice(missingPage * 20, (missingPage + 1) * 20).map((row) => (
                 <div key={row.productId} className="rounded border border-ink/10 p-3">
                   <div className="flex items-start justify-between gap-3">
                     <div>
@@ -88,10 +97,11 @@ export default function DataQualityPage() {
                       <div className="text-sm text-ink/55">Missing: {row.missingFields.join(", ")}</div>
                       <div className="text-sm text-moss">Suggestion: {row.suggestion.normalizedName} / {row.suggestion.category}</div>
                     </div>
-                    <button className="rounded border border-ink/15 px-3 py-2 text-sm font-semibold" onClick={() => apply.mutate(row.suggestion)}>Apply</button>
+                    <Permission permission="data_quality.apply_suggestion"><button disabled={apply.isPending} className="rounded border border-ink/15 px-3 py-2 text-sm font-semibold" onClick={() => apply.mutate(row.suggestion)}>Apply</button></Permission>
                   </div>
                 </div>
               ))}
+              <Pagination data={{ content: missingRows, totalElements: missingRows.length, totalPages: Math.ceil(missingRows.length / 20), number: missingPage }} page={missingPage} onChange={setMissingPage} />
               {!missingRows.length ? <EmptyState title="No missing-field suggestions.">Products with missing unit, HSN, GST, category, or purchase cost will appear here.</EmptyState> : null}
             </div>
           </Panel>

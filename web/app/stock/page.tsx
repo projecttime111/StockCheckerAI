@@ -1,34 +1,41 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useMemo, useRef, useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { ErrorState } from "@/components/ErrorState";
 import { Field, PrimaryButton, SelectInput, TextInput } from "@/components/FormControls";
 import { LoadingState } from "@/components/LoadingState";
+import { RecordPicker } from "@/components/RecordPicker";
+import { MutationFeedback, QueryFeedback } from "@/components/QueryFeedback";
 import { Panel } from "@/components/Panel";
-import { api, money, Page, Product, Warehouse } from "@/lib/api";
+import { api, newOperationId, Product, Warehouse } from "@/lib/api";
+import { Permission, useAccess, useMoney } from "@/lib/business";
 
-type StockRow = { productId: string; productName: string; warehouseId: string; warehouseName: string; currentStock: number; stockValue: number };
+type StockRow = { productId: string; productName: string; warehouseId: string; warehouseName: string; currentStock: number; stockValue: number | null };
 
 export default function StockPage() {
+  const money = useMoney();
+  const { can } = useAccess();
+  const attempt = useRef({ body: "", key: "" });
   const queryClient = useQueryClient();
   const [form, setForm] = useState({ productId: "", warehouseId: "", quantityDelta: "", rate: "", notes: "Manual stock count adjustment" });
   const stock = useQuery({ queryKey: ["stock"], queryFn: () => api<StockRow[]>("/api/stock/current") });
-  const products = useQuery({ queryKey: ["products", "stock"], queryFn: () => api<Page<Product>>("/api/products?size=200") });
-  const warehouses = useQuery({ queryKey: ["warehouses"], queryFn: () => api<Warehouse[]>("/api/warehouses") });
+  const warehouses = useQuery({ queryKey: ["warehouses"], enabled: can("stock.adjust"), queryFn: () => api<Warehouse[]>("/api/warehouses") });
   const adjustment = useMutation({
-    mutationFn: () => api("/api/stock/adjustment", {
-      method: "POST",
-      body: JSON.stringify({ ...form, quantityDelta: Number(form.quantityDelta), rate: Number(form.rate || 0) })
-    }),
+    mutationFn: () => {
+      const body = JSON.stringify({ ...form, quantityDelta: Number(form.quantityDelta), rate: Number(form.rate || 0) });
+      if (attempt.current.body !== body) attempt.current = { body, key: newOperationId() };
+      return api("/api/stock/adjustment", { method: "POST", body, headers: { "Idempotency-Key": attempt.current.key } });
+    },
     onSuccess: () => {
+      attempt.current = { body: "", key: "" };
       setForm({ productId: "", warehouseId: "", quantityDelta: "", rate: "", notes: "Manual stock count adjustment" });
       queryClient.invalidateQueries({ queryKey: ["stock"] });
       queryClient.invalidateQueries({ queryKey: ["products"] });
     }
   });
-  const totalValue = useMemo(() => (stock.data ?? []).reduce((sum, row) => sum + Number(row.stockValue), 0), [stock.data]);
+  const totalValue = useMemo(() => !stock.data || stock.data.some(row => row.stockValue == null) ? null : stock.data.reduce((sum, row) => sum + Number(row.stockValue), 0), [stock.data]);
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -57,14 +64,10 @@ export default function StockPage() {
             </div>
           )}
         </Panel>
-        <Panel title="Stock Adjustment">
+        <Permission permission="stock.adjust"><Panel title="Stock Adjustment">
           <form onSubmit={submit} className="space-y-3">
-            <Field label="Product">
-              <SelectInput value={form.productId} onChange={(e) => setForm({ ...form, productId: e.target.value })} required>
-                <option value="">Select product</option>
-                {(products.data?.content ?? []).map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
-              </SelectInput>
-            </Field>
+            <RecordPicker<Product> path="/api/products" label="Product" value={form.productId} onChange={product => setForm({ ...form, productId: product?.id ?? "" })} />
+            <QueryFeedback queries={[warehouses]} />
             <Field label="Warehouse">
               <SelectInput value={form.warehouseId} onChange={(e) => setForm({ ...form, warehouseId: e.target.value })} required>
                 <option value="">Select warehouse</option>
@@ -80,10 +83,11 @@ export default function StockPage() {
             <Field label="Notes">
               <TextInput value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} required />
             </Field>
-            {adjustment.error ? <p className="text-sm text-coral">{adjustment.error.message}</p> : null}
+            <MutationFeedback mutation={adjustment} success="Stock adjustment saved." />
+
             <PrimaryButton className="w-full" disabled={adjustment.isPending}>Save adjustment</PrimaryButton>
           </form>
-        </Panel>
+        </Panel></Permission>
       </div>
     </AppShell>
   );

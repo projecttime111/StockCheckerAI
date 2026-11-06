@@ -44,7 +44,7 @@ type BulkResult = {
   results: { entryId: string; status: string; message: string; sourceRowNumber?: number }[];
 };
 
-export function CashbookReviewPanel({ sessionId }: { sessionId: string }) {
+export function CashbookReviewPanel({ sessionId, currency = "INR" }: { sessionId: string; currency?: string }) {
   const queryClient = useQueryClient();
   const [selected, setSelected] = useState<Record<string, string>>({});
   const [page, setPage] = useState(0);
@@ -133,7 +133,7 @@ export function CashbookReviewPanel({ sessionId }: { sessionId: string }) {
   if (rows.isLoading) return <LoadingState label="Loading cashbook review entries..." />;
   if (rows.error) return <ErrorState error={rows.error} />;
   if (!rows.data?.length) {
-    return <div className="space-y-3 py-4 text-sm"><p role="status">{notice || "No unresolved cashbook entries."}</p>{recheckControl}{bulkResult ? <BulkResultSummary result={bulkResult} /> : null}<Link className="text-moss underline" href="/sales/retail-counter">View retail counter sales</Link></div>;
+    return <div className="space-y-3 py-4 text-sm"><p role="status">{notice || "No unresolved cashbook entries."}</p>{recheckControl}{bulkResult ? <BulkResultSummary result={bulkResult} currency={currency} /> : null}<Link className="text-moss underline" href="/sales/retail-counter">View retail counter sales</Link></div>;
   }
   const lastPage = Math.max(0, Math.ceil(filteredRows.length / 10) - 1);
   const activePage = Math.min(page, lastPage);
@@ -142,7 +142,7 @@ export function CashbookReviewPanel({ sessionId }: { sessionId: string }) {
     <div className="divide-y divide-ink/10 border-y border-ink/10">
       {recheckControl}
       {notice ? <div role="status" className="py-3 text-sm text-moss">{notice} <Link className="underline" href="/sales/retail-counter">View retail counter sales</Link></div> : null}
-      {bulkResult ? <BulkResultSummary result={bulkResult} /> : null}
+      {bulkResult ? <BulkResultSummary result={bulkResult} currency={currency} /> : null}
       <div className="space-y-3 py-4">
         <label className="relative block">
           <span className="sr-only">Filter cashbook entries</span>
@@ -159,10 +159,10 @@ export function CashbookReviewPanel({ sessionId }: { sessionId: string }) {
           <span className="text-xs text-ink/55">{filteredRows.length} of {allRows.length} shown | {selectedRows.length} selected | Maximum 200 per batch</span>
         </div>
       </div>
-      {selectedRows.length ? <BulkRetailSaleForm rows={selectedRows} pending={bulk.isPending}
+      {selectedRows.length ? <BulkRetailSaleForm currency={currency} rows={selectedRows} pending={bulk.isPending}
         onCancel={() => setSelectedIds([])} onRecord={(decision) => {
           const total = selectedRows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
-          if (!window.confirm(`Record ${selectedRows.length} selected entries totaling ${formatMoney(total)} as retail counter sales?`)) return;
+          if (!window.confirm(`Record ${selectedRows.length} selected entries totaling ${formatMoney(total, currency)} as retail counter sales?`)) return;
           setBulkResult(null);
           bulk.mutate(decision);
         }} /> : null}
@@ -172,6 +172,7 @@ export function CashbookReviewPanel({ sessionId }: { sessionId: string }) {
         const selectedValue = selected[row.id] ?? "";
         return (
           <CashbookReviewRow
+            currency={currency}
             key={row.id}
             row={row}
             selectedValue={selectedValue}
@@ -210,8 +211,9 @@ export function CashbookReviewPanel({ sessionId }: { sessionId: string }) {
 }
 
 function CashbookReviewRow({
-  row, selectedValue, onSelect, pending, error, onPost, onIgnore, onKeep, onRetail, checked, selectionDisabled, onChecked
+  currency, row, selectedValue, onSelect, pending, error, onPost, onIgnore, onKeep, onRetail, checked, selectionDisabled, onChecked
 }: {
+  currency: string;
   row: CashbookReviewEntry;
   selectedValue: string;
   onSelect: (value: string) => void;
@@ -238,7 +240,7 @@ function CashbookReviewRow({
             checked={checked} onChange={(event) => onChecked(event.target.checked)}
             disabled={pending || selectionDisabled || !row.entryDate || row.amount <= 0} />
           <div><div className="flex flex-wrap items-center gap-2 text-sm"><strong>{row.partyName || "Unidentified party"}</strong><span className="text-ink/45">Row {row.sourceRowNumber}</span></div>
-        <div className="mt-2 text-sm text-ink/65">{row.entryDate || "No date"} | {row.direction} | {formatMoney(row.amount)}</div>
+        <div className="mt-2 text-sm text-ink/65">{row.entryDate || "No date"} | {row.direction} | {formatMoney(row.amount, currency)}</div>
         <div className="mt-1 text-xs text-ink/50">{row.referenceNumber || "No reference"}</div>
         <div className="mt-3 text-xs leading-5 text-amber-800">{row.matchReason || row.cashbookMatchStatus}</div>
         {row.sourceLedgerDetails ? <div className="mt-2 break-words text-xs text-ink/70">Source ledgers: {row.sourceLedgerDetails}</div> : null}
@@ -246,7 +248,7 @@ function CashbookReviewRow({
         </div>
       </div>
       <div className="space-y-3">
-        {retailOpen ? <RetailSaleReviewForm amount={row.amount} direction={row.direction} pending={pending} onRecord={onRetail} onCancel={() => setRetailOpen(false)} /> : <>
+        {retailOpen ? <RetailSaleReviewForm currency={currency} amount={row.amount} direction={row.direction} pending={pending} onRecord={onRetail} onCancel={() => setRetailOpen(false)} /> : <>
         <select
           aria-label={`Resolution target for row ${row.sourceRowNumber}`}
           className="focus-ring min-h-11 w-full border border-ink/20 bg-white px-3 text-sm"
@@ -280,14 +282,14 @@ function readable(value: string) {
   return value.toLowerCase().replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-function formatMoney(value: number) {
-  return new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 }).format(Number(value || 0));
+function formatMoney(value: number, currency: string) {
+  return new Intl.NumberFormat("en-IN", { style: "currency", currency, minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Number(value || 0));
 }
 
-function BulkResultSummary({ result }: { result: BulkResult }) {
+function BulkResultSummary({ result, currency }: { result: BulkResult; currency: string }) {
   const failures = result.results.filter((item) => item.status === "FAILED");
   return <div className="space-y-2 border-l-2 border-moss px-3 py-3 text-sm">
-    <p><strong>Bulk result:</strong> {result.recordedCount} recorded, {result.duplicateCount} duplicates skipped, {result.failedCount} failed. Newly recorded amount: {formatMoney(result.recordedAmount)}.</p>
+    <p><strong>Bulk result:</strong> {result.recordedCount} recorded, {result.duplicateCount} duplicates skipped, {result.failedCount} failed. Newly recorded amount: {formatMoney(result.recordedAmount, currency)}.</p>
     {failures.length ? <ul className="space-y-1 text-coral">{failures.map((failure) => <li key={failure.entryId}>Row {failure.sourceRowNumber ?? failure.entryId}: {failure.message}</li>)}</ul> : null}
   </div>;
 }

@@ -24,6 +24,7 @@ public class ProfitInsightService {
     private final Repositories.ProductRepository products;
     private final Repositories.CustomerRepository customers;
     private final Repositories.SupplierRepository suppliers;
+    private final StockLedgerService stock;
 
     public ProfitInsightService(
         DashboardService dashboard,
@@ -33,7 +34,7 @@ public class ProfitInsightService {
         Repositories.PurchaseInvoiceItemRepository purchaseItems,
         Repositories.ProductRepository products,
         Repositories.CustomerRepository customers,
-        Repositories.SupplierRepository suppliers
+        Repositories.SupplierRepository suppliers, StockLedgerService stock
     ) {
         this.dashboard = dashboard;
         this.salesInvoices = salesInvoices;
@@ -43,6 +44,7 @@ public class ProfitInsightService {
         this.products = products;
         this.customers = customers;
         this.suppliers = suppliers;
+        this.stock = stock;
     }
 
     public ApiDtos.ProfitDropResponse currentMonth() {
@@ -98,10 +100,10 @@ public class ProfitInsightService {
             .entrySet().stream()
             .map(entry -> {
                 var revenue = entry.getValue().stream().map(item -> item.lineTotal.subtract(item.taxAmount == null ? BigDecimal.ZERO : item.taxAmount)).reduce(BigDecimal.ZERO, BigDecimal::add);
-                var cost = entry.getValue().stream().map(item -> (item.costRate == null ? BigDecimal.ZERO : item.costRate).multiply(item.quantity)).reduce(BigDecimal.ZERO, BigDecimal::add);
+                var cost = entry.getValue().stream().map(item -> (item.costRate == null ? BigDecimal.ZERO : item.costRate).multiply(baseQuantity(tenantId, item.productId, item.unitId, item.quantity))).reduce(BigDecimal.ZERO, BigDecimal::add);
                 var margin = margin(revenue.subtract(cost), revenue);
                 var product = products.findByTenantIdAndId(tenantId, entry.getKey()).map(p -> p.name).orElse("Unknown product");
-                return Map.of("productName", product, "marginPercent", margin, "grossProfit", revenue.subtract(cost));
+                return Map.of("productName", product, "marginPercent", margin, "grossProfit", MoneyMath.amount(revenue.subtract(cost)));
             })
             .sorted((left, right) -> ((BigDecimal) right.get("marginPercent")).compareTo((BigDecimal) left.get("marginPercent")))
             .limit(5)
@@ -151,7 +153,7 @@ public class ProfitInsightService {
         return purchaseItems.findByTenantId(tenantId).stream()
             .filter(item -> invoiceIds.contains(item.purchaseInvoiceId))
             .collect(Collectors.groupingBy(item -> item.productId, Collectors.collectingAndThen(Collectors.toList(), rows -> {
-                var quantity = rows.stream().map(item -> item.quantity).reduce(BigDecimal.ZERO, BigDecimal::add);
+                var quantity = rows.stream().map(item -> baseQuantity(tenantId, item.productId, item.unitId, item.quantity)).reduce(BigDecimal.ZERO, BigDecimal::add);
                 var value = rows.stream().map(item -> item.quantity.multiply(item.rate)).reduce(BigDecimal.ZERO, BigDecimal::add);
                 return quantity.compareTo(BigDecimal.ZERO) == 0 ? BigDecimal.ZERO : value.divide(quantity, 2, RoundingMode.HALF_UP);
             })));
@@ -161,7 +163,7 @@ public class ProfitInsightService {
         var invoiceById = salesInvoices.findByTenantIdAndInvoiceDateBetweenOrderByInvoiceDateAsc(tenantId, from, to).stream().map(invoice -> invoice.id).collect(Collectors.toSet());
         return salesItems.findByTenantId(tenantId).stream()
             .filter(item -> productId.equals(item.productId) && invoiceById.contains(item.salesInvoiceId))
-            .map(item -> item.quantity)
+            .map(item -> baseQuantity(tenantId, item.productId, item.unitId, item.quantity))
             .reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
@@ -177,6 +179,11 @@ public class ProfitInsightService {
         return invoices.stream()
             .filter(invoice -> invoice.customerId != null)
             .collect(Collectors.groupingBy(invoice -> invoice.customerId, Collectors.mapping(invoice -> discountsByInvoice.getOrDefault(invoice.id, BigDecimal.ZERO), Collectors.reducing(BigDecimal.ZERO, BigDecimal::add))));
+    }
+
+    private BigDecimal baseQuantity(UUID tenantId, UUID productId, UUID unitId, BigDecimal quantity) {
+        var product = products.findByTenantIdAndId(tenantId, productId).orElse(null);
+        return product == null ? quantity : stock.toBaseQuantity(tenantId, product, unitId, quantity).abs();
     }
 
     private BigDecimal margin(BigDecimal profit, BigDecimal revenue) {

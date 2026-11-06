@@ -1,6 +1,7 @@
 package com.stockpilot.ai.web;
 
 import com.stockpilot.ai.service.DeadStockActionService;
+import com.stockpilot.ai.service.SensitiveDataService;
 import com.stockpilot.ai.web.dto.ApiDtos;
 import jakarta.validation.Valid;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -14,15 +15,17 @@ import java.util.UUID;
 @RequestMapping("/api/dead-stock")
 public class DeadStockController {
     private final DeadStockActionService deadStock;
+    private final SensitiveDataService sensitive;
 
-    public DeadStockController(DeadStockActionService deadStock) {
+    public DeadStockController(DeadStockActionService deadStock, SensitiveDataService sensitive) {
         this.deadStock = deadStock;
+        this.sensitive = sensitive;
     }
 
     @GetMapping
     @PreAuthorize("@permissionService.has('dead_stock.view')")
     public List<ApiDtos.DeadStockActionResponse> list() {
-        return deadStock.list();
+        return deadStock.list().stream().map(sensitive::deadStockAction).toList();
     }
 
     @PostMapping("/{productId}/action")

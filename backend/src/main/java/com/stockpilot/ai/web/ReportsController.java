@@ -9,6 +9,8 @@ import com.stockpilot.ai.service.DeadStockActionService;
 import com.stockpilot.ai.service.ReorderEngineService;
 import com.stockpilot.ai.service.StockLedgerService;
 import com.stockpilot.ai.service.OutstandingService;
+import com.stockpilot.ai.service.SensitiveDataService;
+import com.stockpilot.ai.service.PermissionService;
 import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -40,6 +42,8 @@ public class ReportsController {
     private final OutstandingService outstanding;
     private final Repositories.AuditLogRepository auditLogs;
     private final AuditService auditService;
+    private final SensitiveDataService sensitive;
+    private final PermissionService permissions;
 
     public ReportsController(
         StockLedgerService stockLedger,
@@ -53,7 +57,7 @@ public class ReportsController {
         Repositories.PurchaseInvoiceRepository purchaseInvoices,
         OutstandingService outstanding,
         Repositories.AuditLogRepository auditLogs,
-        AuditService auditService
+        AuditService auditService, SensitiveDataService sensitive, PermissionService permissions
     ) {
         this.stockLedger = stockLedger;
         this.dashboard = dashboard;
@@ -67,6 +71,8 @@ public class ReportsController {
         this.outstanding = outstanding;
         this.auditLogs = auditLogs;
         this.auditService = auditService;
+        this.sensitive = sensitive;
+        this.permissions = permissions;
     }
 
     @GetMapping("/export/{report}")
@@ -76,6 +82,18 @@ public class ReportsController {
             throw ApiErrors.badRequest("Only CSV export is available in the MVP");
         }
         var slug = report.toLowerCase(Locale.ROOT).replace('_', '-');
+        var required = switch (slug) {
+            case "products" -> "products.view";
+            case "customers" -> "customers.view_outstanding";
+            case "suppliers" -> "suppliers.view";
+            case "purchases", "purchase-invoices" -> "purchases.view_cost";
+            case "sales", "sales-invoices" -> "sales.view";
+            case "audit", "audit-logs" -> "audit.view";
+            case "reorder", "reorder-suggestions" -> "reorder.view";
+            case "dead-stock" -> "dead_stock.view";
+            default -> "stock.view";
+        };
+        if (!permissions.has(required)) throw ApiErrors.forbidden("You do not have permission to export this report");
         var csv = switch (slug) {
             case "current-stock", "stock" -> currentStockCsv();
             case "low-stock" -> lowStockCsv();
@@ -112,7 +130,7 @@ public class ReportsController {
 
     private String deadStockCsv() {
         var builder = new StringBuilder("product_id,product_name,warehouse,quantity,stock_value,last_sold_date,days_since_last_sale,average_monthly_sale,blocked_capital,recommended_action\n");
-        deadStock.list().forEach(row -> append(builder, row.productId(), row.productName(), row.warehouseName(), row.quantity(), row.stockValue(), row.lastSoldDate(), row.daysSinceLastSale(), row.averageMonthlySale(), row.blockedCapital(), row.recommendedAction()));
+        deadStock.list().forEach(row -> append(builder, row.productId(), row.productName(), row.warehouseName(), row.quantity(), sensitive.cost(row.stockValue()), row.lastSoldDate(), row.daysSinceLastSale(), row.averageMonthlySale(), sensitive.cost(row.blockedCapital()), row.recommendedAction()));
         return builder.toString();
     }
 
@@ -124,7 +142,7 @@ public class ReportsController {
 
     private String productsCsv() {
         var builder = new StringBuilder("product_id,sku,name,normalized_name,hsn,gst_percent,purchase_price,sales_price,reorder_point,active\n");
-        products.findByTenantIdAndActiveTrueOrderByNameAsc(TenantContext.tenantId()).forEach(row -> append(builder, row.id, row.sku, row.name, row.normalizedName, row.hsnCode, row.gstPercentage, row.defaultPurchasePrice, row.defaultSalesPrice, row.reorderPoint, row.active));
+        products.findByTenantIdAndActiveTrueOrderByNameAsc(TenantContext.tenantId()).forEach(row -> append(builder, row.id, row.sku, row.name, row.normalizedName, row.hsnCode, row.gstPercentage, sensitive.cost(row.defaultPurchasePrice), row.defaultSalesPrice, row.reorderPoint, row.active));
         return builder.toString();
     }
 
@@ -156,13 +174,13 @@ public class ReportsController {
 
     private String productMetricCsv(String header, java.util.List<com.stockpilot.ai.web.dto.ApiDtos.DashboardProductMetric> rows) {
         var builder = new StringBuilder(header).append('\n');
-        rows.forEach(row -> append(builder, row.productId(), row.productName(), row.quantity(), row.revenue(), row.stockQuantity(), row.stockValue(), row.lastSoldDate()));
+        rows.forEach(row -> append(builder, row.productId(), row.productName(), row.quantity(), row.revenue(), row.stockQuantity(), sensitive.cost(row.stockValue()), row.lastSoldDate()));
         return builder.toString();
     }
 
     private String auditCsv() {
         var builder = new StringBuilder("audit_id,created_at,actor_user_id,action,entity_type,entity_id,details\n");
-        auditLogs.findByTenantIdOrderByCreatedAtDesc(TenantContext.tenantId()).forEach(row -> append(builder, row.id, row.createdAt, row.actorUserId, row.action, row.entityType, row.entityId, row.detailsJson));
+        auditLogs.findByTenantIdOrderByCreatedAtDesc(TenantContext.tenantId()).forEach(row -> append(builder, row.id, row.createdAt, row.actorUserId, row.action, row.entityType, row.entityId, sensitive.auditDetails(row.detailsJson)));
         return builder.toString();
     }
 

@@ -18,49 +18,38 @@ import java.util.*;
 public class DeadStockActionService {
     private final Repositories.ProductRepository products;
     private final Repositories.WarehouseRepository warehouses;
-    private final Repositories.StockMovementRepository movements;
     private final StockLedgerService stockLedger;
     private final AuditService audit;
+    private final SalesHistoryService salesHistory;
 
     public DeadStockActionService(
         Repositories.ProductRepository products,
         Repositories.WarehouseRepository warehouses,
-        Repositories.StockMovementRepository movements,
         StockLedgerService stockLedger,
-        AuditService audit
+        AuditService audit, SalesHistoryService salesHistory
     ) {
         this.products = products;
         this.warehouses = warehouses;
-        this.movements = movements;
         this.stockLedger = stockLedger;
         this.audit = audit;
+        this.salesHistory = salesHistory;
     }
 
     public List<ApiDtos.DeadStockActionResponse> list() {
         var tenantId = TenantContext.tenantId();
         var today = LocalDate.now(ZoneOffset.UTC);
         var rows = new ArrayList<ApiDtos.DeadStockActionResponse>();
+        var history = salesHistory.history(tenantId);
         for (var product : products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)) {
             for (var warehouse : warehouses.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)) {
                 var stock = stockLedger.currentStock(tenantId, product.id, warehouse.id);
                 if (stock.compareTo(BigDecimal.ZERO) <= 0) continue;
-                var productMovements = movements.findByTenantIdAndProductIdOrderByMovementDateDesc(tenantId, product.id);
-                var lastSale = productMovements.stream()
-                    .filter(movement -> movement.movementType == DomainEnums.MovementType.SALE)
-                    .filter(movement -> warehouse.id.equals(movement.warehouseId))
-                    .findFirst()
-                    .map(movement -> movement.movementDate.atZone(ZoneOffset.UTC).toLocalDate())
-                    .orElse(null);
+                var lastSale = history.lastSale(product.id, warehouse.id, today);
                 var daysSince = lastSale == null ? 9999 : java.time.temporal.ChronoUnit.DAYS.between(lastSale, today);
                 if (daysSince < 90) continue;
-                var sold90 = productMovements.stream()
-                    .filter(movement -> movement.movementType == DomainEnums.MovementType.SALE)
-                    .filter(movement -> warehouse.id.equals(movement.warehouseId))
-                    .filter(movement -> !movement.movementDate.isBefore(today.minusDays(90).atStartOfDay().toInstant(ZoneOffset.UTC)))
-                    .map(movement -> movement.baseQuantity.abs())
-                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+                var sold90 = history.quantity(product.id, warehouse.id, today.minusDays(89), today);
                 var avgMonthly = sold90.divide(BigDecimal.valueOf(3), 3, RoundingMode.HALF_UP);
-                var value = stock.multiply(product.defaultPurchasePrice == null ? BigDecimal.ZERO : product.defaultPurchasePrice);
+                var value = stock.multiply(stockLedger.latestCost(tenantId, product.id, product.defaultPurchasePrice));
                 var action = actionFor(daysSince, avgMonthly);
                 rows.add(new ApiDtos.DeadStockActionResponse(product.id, product.name, warehouse.name, stock, value, lastSale, daysSince, avgMonthly, value, action));
             }

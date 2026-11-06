@@ -2,6 +2,8 @@ import { demoApi } from "./demoApi";
 
 export const DEMO_MODE = process.env.NEXT_PUBLIC_DEMO_MODE === "true";
 export const SESSION_CLEARED_EVENT = "stockpilot:session-cleared";
+export const SESSION_CHANGED_EVENT = "stockpilot:session-changed";
+let sessionTokenSnapshot: string | null | undefined;
 const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/\/+$/, "");
 
 if (process.env.NODE_ENV === "production" && !DEMO_MODE) {
@@ -34,7 +36,7 @@ export type Product = {
   brandName?: string;
   unitCode?: string;
   barcode?: string;
-  defaultPurchasePrice: number;
+  defaultPurchasePrice: number | null;
   defaultSalesPrice: number;
   reorderPoint: number;
   currentStock: number;
@@ -86,6 +88,7 @@ export function setSessionPermissions(permissions: string[]) {
 }
 
 export function setSession(token: string, role?: string, permissions?: string[]) {
+  sessionTokenSnapshot = token;
   window.localStorage.setItem("stockpilot.token", token);
   if (role) {
     window.localStorage.setItem("stockpilot.role", role);
@@ -100,6 +103,7 @@ export function setSession(token: string, role?: string, permissions?: string[])
 }
 
 export function clearSession() {
+  sessionTokenSnapshot = undefined;
   window.localStorage.removeItem("stockpilot.token");
   window.localStorage.removeItem("stockpilot.role");
   window.localStorage.removeItem("stockpilot.permissions");
@@ -116,10 +120,40 @@ export function loginDestination(role: string, search = window.location.search) 
   return destination.pathname + destination.search + destination.hash;
 }
 
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+export type ApiOptions = RequestInit & { timeoutMs?: number };
+
+export function observeSessionChange(event: StorageEvent) {
+  if (event.key !== null && !["stockpilot.token", "stockpilot.role", "stockpilot.permissions"].includes(event.key)) return;
+  if (sessionTokenSnapshot !== undefined && getToken() !== sessionTokenSnapshot) {
+    window.dispatchEvent(new Event(SESSION_CHANGED_EVENT));
+  }
+}
+
+export async function api<T>(path: string, init: ApiOptions = {}): Promise<T> {
   if (DEMO_MODE) {
+    assertSessionUnchanged(path);
     return demoApi<T>(path, init);
   }
+  return request(path, init, false) as Promise<T>;
+}
+
+export async function apiText(path: string, init: ApiOptions = {}): Promise<string> {
+  if (DEMO_MODE) return api<string>(path, init);
+  return request(path, init, true) as Promise<string>;
+}
+
+function assertSessionUnchanged(path: string) {
+  if (/^\/api\/auth\/(login|google|register|forgot-password|reset-password|verify-email|resend-verification)$/.test(path)) return;
+  const current = getToken();
+  if (sessionTokenSnapshot === undefined) sessionTokenSnapshot = current;
+  if (sessionTokenSnapshot !== current) {
+    window.dispatchEvent(new Event(SESSION_CHANGED_EVENT));
+    throw new ApiClientError("Your account changed in another tab. Reload before continuing.", 409, "SESSION_CHANGED");
+  }
+}
+
+async function request(path: string, init: ApiOptions, asText: boolean): Promise<unknown> {
+  assertSessionUnchanged(path);
   const publicAuth = /^\/api\/auth\/(login|google|register|forgot-password|reset-password|verify-email|resend-verification)$/.test(path);
   const token = publicAuth ? null : getToken();
   const headers = new Headers(init.headers);
@@ -129,7 +163,15 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
-  const response = await fetch(`${API_URL}${path}`, { ...init, headers });
+  const { timeoutMs = path.includes("/import") ? 180_000 : 30_000, ...options } = init;
+  const controller = new AbortController();
+  const cancel = () => controller.abort(init.signal?.reason);
+  if (init.signal?.aborted) cancel();
+  else init.signal?.addEventListener("abort", cancel, { once: true });
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+  try {
+  const response = await fetch(`${API_URL}${path}`, { ...options, headers, signal: controller.signal });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ message: response.statusText }));
     if (response.status === 401 && token && getToken() === token) {
@@ -139,15 +181,39 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
         window.location.replace(`/login?expired=1&next=${encodeURIComponent(next)}`);
       }
     }
-    throw new ApiClientError(body.message ?? "Request failed", response.status, body.error);
+    const fields = body.fieldErrors ? Object.entries(body.fieldErrors).map(([field, message]) => `${field}: ${message}`).join("; ") : "";
+    throw new ApiClientError([body.message ?? "Request failed", fields].filter(Boolean).join(". "), response.status, body.error);
   }
-  if (response.status === 204) {
-    return undefined as T;
+  const result = response.status === 204 ? undefined : await (asText ? response.text() : response.json());
+  // A response can finish after another tab signs into a different workspace.
+  // Discard it even when the request itself succeeded, before it can refill caches.
+  if (!publicAuth && getToken() !== token) {
+    window.dispatchEvent(new Event(SESSION_CHANGED_EVENT));
+    throw new ApiClientError("Your account changed while this request was running. Reload before continuing.", 409, "SESSION_CHANGED");
   }
-  return response.json() as Promise<T>;
+  return result;
+  } catch (error) {
+    if (timedOut) {
+      const write = !["GET", "HEAD"].includes((init.method ?? "GET").toUpperCase());
+      throw new ApiClientError(write ? "The request timed out; it may still have completed. Check the saved record or import status before retrying." : "The request timed out. Check your connection and try again.", 408, "REQUEST_TIMEOUT");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    init.signal?.removeEventListener("abort", cancel);
+  }
 }
 
-export function money(value: number | string | null | undefined) {
-  const amount = Number(value ?? 0);
-  return new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(amount);
+export function money(value: number | string | null | undefined, currency = "INR") {
+  if (value == null || !Number.isFinite(Number(value))) return "—";
+  const code = /^[A-Z]{3}$/.test(currency) ? currency : "INR";
+  return new Intl.NumberFormat("en-IN", { style: "currency", currency: code, minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Number(value));
 }
+
+export function localDate(offsetDays = 0, now = new Date()) {
+  const date = new Date(now);
+  date.setDate(date.getDate() + offsetDays);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+export function newOperationId() { return crypto.randomUUID(); }

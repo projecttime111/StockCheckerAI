@@ -8,9 +8,11 @@ import { AppShell } from "@/components/AppShell";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/ErrorState";
 import { LoadingState } from "@/components/LoadingState";
+import { QueryFeedback } from "@/components/QueryFeedback";
 import { Panel } from "@/components/Panel";
 import { StatCard } from "@/components/StatCard";
-import { api, money } from "@/lib/api";
+import { api } from "@/lib/api";
+import { Permission, useAccess, useMoney } from "@/lib/business";
 
 type Summary = {
   totalStockValue: number;
@@ -42,6 +44,8 @@ const modeDescriptions: Record<Tenant["businessMode"], string> = {
 };
 
 export default function DashboardPage() {
+  const money = useMoney();
+  const { can } = useAccess();
   const summary = useQuery({ queryKey: ["dashboard", "summary"], queryFn: () => api<Summary>("/api/dashboard/summary") });
   const salesTrend = useQuery({ queryKey: ["dashboard", "sales"], queryFn: () => api<TrendPoint[]>("/api/dashboard/sales-trend") });
   const profitTrend = useQuery({ queryKey: ["dashboard", "profit"], queryFn: () => api<TrendPoint[]>("/api/dashboard/profit-loss") });
@@ -50,7 +54,7 @@ export default function DashboardPage() {
   const actions = useQuery({ queryKey: ["dashboard", "actions"], queryFn: () => api<ActionCard[]>("/api/dashboard/actions") });
   const topProducts = useQuery({ queryKey: ["dashboard", "top-products"], queryFn: () => api<ProductMetric[]>("/api/dashboard/top-products") });
   const slowMoving = useQuery({ queryKey: ["dashboard", "slow-moving"], queryFn: () => api<ProductMetric[]>("/api/dashboard/slow-moving-products") });
-  const profitDrop = useQuery({ queryKey: ["profit-drop"], queryFn: () => api<ProfitDrop>("/api/insights/profit-drop?period=current-month") });
+  const profitDrop = useQuery({ queryKey: ["profit-drop"], enabled: can("insights.profit.view"), queryFn: () => api<ProfitDrop>("/api/insights/profit-drop?period=current-month") });
   const tenant = useQuery({ queryKey: ["tenant"], queryFn: () => api<Tenant>("/api/tenants/current") });
   const summaryData = summary.data;
   const hasBusinessData = hasDashboardBusinessData(summaryData);
@@ -64,6 +68,7 @@ export default function DashboardPage() {
     <AppShell title="Dashboard">
       {summary.isLoading ? <LoadingState /> : summary.error ? <ErrorState error={summary.error} /> : (
         <div className="space-y-6">
+          <QueryFeedback queries={[salesTrend, profitTrend, lowStock, deadStock, actions, topProducts, slowMoving, profitDrop, tenant]} />
           <Panel title="StockPilot AI is your intelligence layer">
             <div className="grid gap-4 lg:grid-cols-[1fr_340px]">
               <div className="grid gap-3 text-sm text-ink/70">
@@ -74,10 +79,10 @@ export default function DashboardPage() {
                 <div className="text-xs font-semibold uppercase tracking-normal text-ink/50">Current tenant mode</div>
                 <div className="mt-1 text-xl font-semibold text-moss">{tenant.data?.businessMode ?? "HYBRID"}</div>
                 <p className="mt-2 text-sm text-ink/60">{modeDescriptions[tenant.data?.businessMode ?? "HYBRID"]}</p>
-                <Link href="/settings" className="mt-3 inline-flex items-center gap-2 rounded border border-moss/25 bg-white px-3 py-2 text-sm font-semibold text-moss">
+                <Permission permission="settings.view"><Link href="/settings" className="mt-3 inline-flex items-center gap-2 rounded border border-moss/25 bg-white px-3 py-2 text-sm font-semibold text-moss">
                   <Settings size={16} />
                   Change mode
-                </Link>
+                </Link></Permission>
               </div>
             </div>
           </Panel>
@@ -92,14 +97,14 @@ export default function DashboardPage() {
           ) : null}
 
           <div className="grid gap-4 md:grid-cols-2">
-            <Link href="/settings" className="rounded border border-ink/10 bg-white p-4 shadow-sm transition hover:border-moss/40">
+            <Permission permission="settings.view"><Link href="/settings" className="rounded border border-ink/10 bg-white p-4 shadow-sm transition hover:border-moss/40">
               <div className="flex items-center gap-2 text-sm font-semibold text-moss"><Settings size={17} /> Retail / Wholesale / Hybrid Mode</div>
-              <p className="mt-2 text-sm text-ink/60">Choose RETAIL, WHOLESALE, or HYBRID tenant mode from Settings. The current demo tenant is {tenant.data?.businessMode ?? "HYBRID"}.</p>
-            </Link>
-            <Link href="/assistant" className="rounded border border-ink/10 bg-white p-4 shadow-sm transition hover:border-moss/40">
+              <p className="mt-2 text-sm text-ink/60">Choose RETAIL, WHOLESALE, or HYBRID tenant mode from Settings. The current tenant is {tenant.data?.businessMode ?? "HYBRID"}.</p>
+            </Link></Permission>
+            <Permission permission="ai.assistant.use"><Link href="/assistant" className="rounded border border-ink/10 bg-white p-4 shadow-sm transition hover:border-moss/40">
               <div className="flex items-center gap-2 text-sm font-semibold text-moss"><Bot size={17} /> AI Assistant</div>
               <p className="mt-2 text-sm text-ink/60">Ask data-backed questions like why profit dropped, what to reorder, and which imported products need cleanup.</p>
-            </Link>
+            </Link></Permission>
           </div>
 
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
@@ -112,7 +117,7 @@ export default function DashboardPage() {
           </div>
 
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
-            <StatCard label="Gross margin" value={`${summaryData?.grossMarginPercent ?? 0}%`} icon={<TrendingUp size={18} />} />
+            <StatCard label="Gross margin" value={summaryData?.grossMarginPercent == null ? "—" : `${summaryData.grossMarginPercent}%`} icon={<TrendingUp size={18} />} />
             <StatCard label="Products" value={summaryData?.totalProducts ?? 0} icon={<Package size={18} />} />
             <StatCard label="Customers" value={summaryData?.totalCustomers ?? 0} icon={<Store size={18} />} />
             <StatCard label="Suppliers" value={summaryData?.totalSuppliers ?? 0} icon={<Truck size={18} />} />
@@ -191,7 +196,7 @@ export default function DashboardPage() {
                 </ResponsiveContainer>
               </div>
             </Panel>
-            <Panel title="Profit Trend">
+            <Permission permission="insights.profit.view"><Panel title="Profit Trend">
               <div className="h-72">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={profitTrend.data ?? []}>
@@ -203,10 +208,10 @@ export default function DashboardPage() {
                   </BarChart>
                 </ResponsiveContainer>
               </div>
-            </Panel>
+            </Panel></Permission>
           </div>
 
-          <Panel title="Why Profit Changed">
+          <Permission permission="insights.profit.view"><Panel title="Why Profit Changed">
             <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
               <div>
                 <p className="text-sm text-ink/70">{profitDrop.data?.summary ?? "Profit explanation will appear once sales and purchase data are available."}</p>
@@ -225,7 +230,7 @@ export default function DashboardPage() {
                 ))}
               </div>
             </div>
-          </Panel>
+          </Panel></Permission>
 
           <div className="grid gap-4 xl:grid-cols-2">
             <Panel title="Low-Stock Alerts">

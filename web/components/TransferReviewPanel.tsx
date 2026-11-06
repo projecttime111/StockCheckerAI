@@ -4,8 +4,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { EmptyState } from "@/components/EmptyState";
 import { Field, PrimaryButton, SecondaryButton, TextInput } from "@/components/FormControls";
+import { RecordPicker } from "@/components/RecordPicker";
+import { QueryFeedback } from "@/components/QueryFeedback";
 import { LoadingState } from "@/components/LoadingState";
-import { api, Page } from "@/lib/api";
+import { api } from "@/lib/api";
 
 type TransferReview = {
   id: string;
@@ -44,10 +46,6 @@ export function TransferReviewPanel({ sessionId }: { sessionId: string }) {
     enabled: !!sessionId,
     queryFn: () => api<TransferReview[]>(`/api/import-sessions/${sessionId}/transfer-review`)
   });
-  const products = useQuery({
-    queryKey: ["products", "transfer-review"],
-    queryFn: () => api<Page<Product>>("/api/products?size=200")
-  });
   const warehouses = useQuery({
     queryKey: ["warehouses", "transfer-review"],
     queryFn: () => api<Warehouse[]>("/api/warehouses")
@@ -84,6 +82,7 @@ export function TransferReviewPanel({ sessionId }: { sessionId: string }) {
 
   return (
     <div className="space-y-4">
+      <QueryFeedback queries={[warehouses]} />
       <p className="text-sm leading-6 text-ink/65">
         Confirm only balanced movement of the same product between two different warehouses.
         Manufacturing and unbalanced journals remain deferred. Posting always creates one linked
@@ -123,12 +122,7 @@ export function TransferReviewPanel({ sessionId }: { sessionId: string }) {
 
       {selected ? (
         <div className="grid gap-3 border-l-2 border-moss/40 pl-4 sm:grid-cols-2">
-          <Field label="Product">
-            <select className="focus-ring h-10 w-full rounded border border-ink/15 bg-white px-3 text-sm" value={productId} onChange={(event) => setProductId(event.target.value)}>
-              <option value="">Choose product</option>
-              {products.data?.content.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
-            </select>
-          </Field>
+          <RecordPicker<Product> path="/api/products" label="Product" value={productId} onChange={product => setProductId(product?.id ?? "")} />
           <Field label="Normalized transfer quantity">
             <TextInput type="number" min="0.001" step="0.001" value={quantity} onChange={(event) => setQuantity(event.target.value)} />
           </Field>

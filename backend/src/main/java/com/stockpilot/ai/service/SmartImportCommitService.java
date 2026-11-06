@@ -42,6 +42,9 @@ public class SmartImportCommitService {
     private final SmartImportCommitExecutor executor;
     private final StockLedgerService stockLedger;
     private final AuditService audit;
+    private final SmartImportDestinationValidator destinationValidator;
+    private final TenantWriteLockService executionLock;
+    private final org.springframework.transaction.support.TransactionTemplate transactions;
 
     public SmartImportCommitService(
         Repositories.ImportSessionRepository sessions,
@@ -56,7 +59,10 @@ public class SmartImportCommitService {
         SmartImportSnapshotDateService snapshotDates,
         SmartImportCommitExecutor executor,
         StockLedgerService stockLedger,
-        AuditService audit
+        AuditService audit,
+        SmartImportDestinationValidator destinationValidator,
+        TenantWriteLockService executionLock,
+        org.springframework.transaction.PlatformTransactionManager transactionManager
     ) {
         this.sessions = sessions;
         this.dryRuns = dryRuns;
@@ -71,6 +77,9 @@ public class SmartImportCommitService {
         this.executor = executor;
         this.stockLedger = stockLedger;
         this.audit = audit;
+        this.destinationValidator = destinationValidator;
+        this.executionLock = executionLock;
+        this.transactions = new org.springframework.transaction.support.TransactionTemplate(transactionManager);
     }
 
     public Map<String, Object> commit(UUID sessionId, SmartImportDtos.CommitRequest request) {
@@ -78,13 +87,27 @@ public class SmartImportCommitService {
             throw ApiErrors.badRequest("Enter COMMIT IMPORT PLAN to confirm the safe foundation commit");
         }
         var tenantId = TenantContext.tenantId();
+        try {
+            return transactions.execute(status -> commitLocked(tenantId, sessionId, request));
+        } catch (ExecutionFailed failure) {
+            // The business transaction has fully rolled back before a separate failure record is written.
+            return transactions.execute(status -> recordFailure(tenantId, sessionId, failure));
+        }
+    }
+
+    private Map<String, Object> commitLocked(UUID tenantId, UUID sessionId, SmartImportDtos.CommitRequest request) {
+        executionLock.lock(tenantId);
         var session = session(tenantId, sessionId);
         var existing = commits.findByTenantIdAndImportSessionId(tenantId, sessionId).orElse(null);
         if (existing != null && existing.status == DomainEnums.SmartImportCommitStatus.COMMITTED) {
             return response(existing, true);
         }
+        // Ownership is the database transaction lock, never the age of a status marker.
+        // Acquiring this lock proves a previous transaction is no longer executing. New executions
+        // persist status and business effects atomically; legacy stranded markers can be retried.
         if (existing != null && existing.status == DomainEnums.SmartImportCommitStatus.COMMITTING) {
-            throw ApiErrors.conflict("This Smart Import commit is already in progress");
+            audit.logCurrent("SMART_IMPORT_INTERRUPTED_COMMIT_RECOVERED", "SmartImportCommit", existing.id,
+                Map.of("sessionId", sessionId));
         }
 
         var dryRun = requireFreshDryRun(tenantId, session, request.dryRunId());
@@ -110,29 +133,48 @@ public class SmartImportCommitService {
         try {
             return executor.execute(tenantId, session.id, commit.id);
         } catch (RuntimeException ex) {
-            log.error("Smart import commit {} failed for tenant {} session {}; transaction rolled back",
-                commit.id, tenantId, session.id, ex);
-            var failed = commits.findByTenantIdAndImportSessionIdAndId(tenantId, session.id, commit.id)
-                .orElse(commit);
-            failed.status = DomainEnums.SmartImportCommitStatus.FAILED;
-            failed.finishedAt = Instant.now();
-            failed.summaryJson = new LinkedHashMap<>(Map.of(
-                "phase", "4B-2E",
-                "failureReason", safeFailure(ex),
-                "transactionRolledBack", true,
-                "blockingErrors", 1
-            ));
-            failed.updatedBy = TenantContext.userId();
-            commits.save(failed);
-            session.status = DomainEnums.ImportSessionStatus.FAILED;
-            session.updatedBy = TenantContext.userId();
-            sessions.save(session);
-            audit.logCurrent("SMART_IMPORT_FAILED", "SmartImportCommit", failed.id, Map.of(
-                "sessionId", session.id,
-                "reason", safeFailure(ex),
-                "transactionRolledBack", true
-            ));
-            return response(failed, false);
+            throw new ExecutionFailed(commit.id, dryRun.id, dryRun.strategy, ex);
+        }
+    }
+
+    private Map<String, Object> recordFailure(UUID tenantId, UUID sessionId, ExecutionFailed failure) {
+        executionLock.lock(tenantId);
+        var session = session(tenantId, sessionId);
+        var failed = commits.findByTenantIdAndImportSessionId(tenantId, sessionId).orElse(null);
+        // Another successful retry may have acquired ownership after our rollback.
+        if (failed != null && failed.status == DomainEnums.SmartImportCommitStatus.COMMITTED) return response(failed, true);
+        if (failed == null) {
+            failed = new SmartImportCommit();
+            failed.tenantId = tenantId;
+            failed.importSessionId = sessionId;
+            failed.createdBy = TenantContext.userId();
+        }
+        failed.dryRunId = failure.dryRunId;
+        failed.strategy = failure.strategy;
+        failed.status = DomainEnums.SmartImportCommitStatus.FAILED;
+        failed.startedAt = Instant.now();
+        failed.finishedAt = Instant.now();
+        failed.committedBy = TenantContext.userId();
+        failed.updatedBy = TenantContext.userId();
+        failed.summaryJson = new LinkedHashMap<>(Map.of("phase", "4B-2E",
+            "failureReason", safeFailure(failure.original), "transactionRolledBack", true, "blockingErrors", 1));
+        commits.save(failed);
+        session.status = DomainEnums.ImportSessionStatus.FAILED;
+        session.updatedBy = TenantContext.userId();
+        sessions.save(session);
+        audit.logCurrent("SMART_IMPORT_FAILED", "SmartImportCommit", failed.id,
+            Map.of("sessionId", sessionId, "reason", safeFailure(failure.original), "transactionRolledBack", true));
+        log.error("Smart import transaction rolled back for tenant {} session {}", tenantId, sessionId, failure.original);
+        return response(failed, false);
+    }
+
+    private static final class ExecutionFailed extends RuntimeException {
+        final UUID dryRunId;
+        final DomainEnums.ImportStrategy strategy;
+        final RuntimeException original;
+        ExecutionFailed(UUID commitId, UUID dryRunId, DomainEnums.ImportStrategy strategy, RuntimeException original) {
+            super("Import execution " + commitId + " rolled back", original);
+            this.dryRunId = dryRunId; this.strategy = strategy; this.original = original;
         }
     }
 
@@ -229,6 +271,12 @@ public class SmartImportCommitService {
             .findFirst();
         if (unresolved.isPresent()) {
             throw ApiErrors.badRequest("Resolve import review item " + unresolved.get().code + " before committing");
+        }
+        var destinationErrors = destinationValidator.validate(tenantId, session.id);
+        if (!destinationErrors.isEmpty()) {
+            var violation = destinationErrors.getFirst();
+            throw ApiErrors.badRequest("Import row " + violation.rowNumber() + ": " + violation.message()
+                + ". Correct the source and run a new dry run before committing.");
         }
         verifySnapshotInputsStillMatch(tenantId, dryRun);
         return dryRun;

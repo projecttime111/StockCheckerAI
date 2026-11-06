@@ -27,8 +27,9 @@ public class SupplierController {
 
     @GetMapping
     @PreAuthorize("@permissionService.has('suppliers.view')")
-    public Page<ApiDtos.SupplierResponse> list(Pageable pageable) {
-        return suppliers.findByTenantId(TenantContext.tenantId(), pageable).map(this::response);
+    public Page<ApiDtos.SupplierResponse> list(@RequestParam(required = false) String query, Pageable pageable) {
+        return (query == null || query.isBlank() ? suppliers.findByTenantId(TenantContext.tenantId(), pageable)
+            : suppliers.findByTenantIdAndNameContainingIgnoreCase(TenantContext.tenantId(), query.trim(), pageable)).map(this::response);
     }
 
     @PostMapping

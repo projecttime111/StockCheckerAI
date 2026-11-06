@@ -8,6 +8,7 @@ import { AppShell } from "@/components/AppShell";
 import { ErrorState } from "@/components/ErrorState";
 import { LoadingState } from "@/components/LoadingState";
 import { SecondaryButton } from "@/components/FormControls";
+import { useMoney } from "@/lib/business";
 import { api, Page } from "@/lib/api";
 
 type RetailSale = {
@@ -18,6 +19,7 @@ type RetailSale = {
 const methodNames: Record<string, string> = { CASH: "Cash", UPI: "UPI / GPay", CASH_AND_UPI: "Cash + UPI combined" };
 
 export default function RetailCounterSalesPage() {
+  const money = useMoney();
   const [page, setPage] = useState(0);
   const sales = useQuery({ queryKey: ["retail-counter-sales", page],
     queryFn: () => api<Page<RetailSale>>(`/api/sales/retail-counter?page=${page}&size=25`) });
@@ -39,7 +41,7 @@ export default function RetailCounterSalesPage() {
             <tbody>{sales.data.content.map((sale) => <tr className="border-b border-ink/10 align-top" key={sale.id}>
               <td className="py-4 pr-4 whitespace-nowrap">{sale.saleDate}</td>
               <td className="py-4 pr-4">{methodNames[sale.collectionMethod] || sale.collectionMethod}</td>
-              <td className="py-4 pr-5 text-right whitespace-nowrap font-semibold">{new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", minimumFractionDigits: 2 }).format(sale.amount)}</td>
+              <td className="py-4 pr-5 text-right whitespace-nowrap font-semibold">{money(sale.amount)}</td>
               <td className="max-w-64 break-words py-4 pr-4"><div>{sale.sourcePartyName || "Cashbook"}</div><div className="mt-1 text-xs text-ink/50">{sale.referenceNumber || "No reference"} | Row {sale.sourceRowNumber} | {sale.sourceDirection}</div></td>
               <td className="max-w-80 break-words py-4">{sale.note || "-"}</td>
             </tr>)}</tbody>

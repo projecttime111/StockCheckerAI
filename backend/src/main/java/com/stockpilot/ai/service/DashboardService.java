@@ -25,10 +25,10 @@ public class DashboardService {
     private final Repositories.SalesInvoiceItemRepository salesItems;
     private final Repositories.CustomerRepository customers;
     private final Repositories.SupplierRepository suppliers;
-    private final Repositories.StockMovementRepository movements;
     private final StockLedgerService stockLedger;
     private final DataQualityService dataQuality;
     private final OutstandingService outstanding;
+    private final SalesHistoryService salesHistory;
 
     public DashboardService(
         Repositories.ProductRepository products,
@@ -36,20 +36,19 @@ public class DashboardService {
         Repositories.SalesInvoiceItemRepository salesItems,
         Repositories.CustomerRepository customers,
         Repositories.SupplierRepository suppliers,
-        Repositories.StockMovementRepository movements,
         StockLedgerService stockLedger,
         DataQualityService dataQuality,
-        OutstandingService outstanding
+        OutstandingService outstanding, SalesHistoryService salesHistory
     ) {
         this.products = products;
         this.salesInvoices = salesInvoices;
         this.salesItems = salesItems;
         this.customers = customers;
         this.suppliers = suppliers;
-        this.movements = movements;
         this.stockLedger = stockLedger;
         this.dataQuality = dataQuality;
         this.outstanding = outstanding;
+        this.salesHistory = salesHistory;
     }
 
     public ApiDtos.DashboardSummary summary() {
@@ -90,13 +89,13 @@ public class DashboardService {
 
     public List<ApiDtos.DeadStockResponse> deadStock() {
         var tenantId = TenantContext.tenantId();
-        var cutoff = LocalDate.now(ZoneOffset.UTC).minusDays(90);
+        var today = LocalDate.now(ZoneOffset.UTC);
+        var cutoff = today.minusDays(90);
+        var history = salesHistory.history(tenantId);
         return products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId).stream()
             .map(product -> {
                 var stock = stockLedger.currentStock(tenantId, product.id, null);
-                var lastSale = movements.findFirstByTenantIdAndProductIdAndMovementTypeOrderByMovementDateDesc(tenantId, product.id, DomainEnums.MovementType.SALE)
-                    .map(m -> m.movementDate.atZone(ZoneOffset.UTC).toLocalDate())
-                    .orElse(null);
+                var lastSale = history.lastSale(product.id, null, today);
                 var value = stock.multiply(latestCost(tenantId, product.id, product.defaultPurchasePrice));
                 var explanation = lastSale == null
                     ? "No sales found in the available history while stock is still on hand."
@@ -165,21 +164,14 @@ public class DashboardService {
 
     public List<ApiDtos.DashboardProductMetric> slowMovingProducts() {
         var tenantId = TenantContext.tenantId();
-        var cutoff = LocalDate.now(ZoneOffset.UTC).minusDays(30);
+        var today = LocalDate.now(ZoneOffset.UTC);
+        var cutoff = today.minusDays(29);
+        var history = salesHistory.history(tenantId);
         var rows = new ArrayList<ApiDtos.DashboardProductMetric>();
         for (var product : products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)) {
             var aggregate = new ProductAggregate();
-            for (var movement : movements.findByTenantIdAndProductIdOrderByMovementDateDesc(tenantId, product.id)) {
-                if (movement.movementType == DomainEnums.MovementType.SALE) {
-                    var saleDate = movement.movementDate.atZone(ZoneOffset.UTC).toLocalDate();
-                    if (aggregate.lastSoldDate == null || saleDate.isAfter(aggregate.lastSoldDate)) {
-                        aggregate.lastSoldDate = saleDate;
-                    }
-                    if (!saleDate.isBefore(cutoff)) {
-                        aggregate.quantity = aggregate.quantity.add(movement.baseQuantity.abs());
-                    }
-                }
-            }
+            aggregate.lastSoldDate = history.lastSale(product.id, null, today);
+            aggregate.quantity = history.quantity(product.id, null, cutoff, today);
             var stock = stockLedger.currentStock(tenantId, product.id, null);
             if (stock.compareTo(BigDecimal.ZERO) > 0 && (aggregate.lastSoldDate == null || aggregate.quantity.compareTo(product.reorderPoint == null ? BigDecimal.ZERO : product.reorderPoint) <= 0)) {
                 rows.add(productMetric(tenantId, product.id, aggregate));
@@ -201,7 +193,7 @@ public class DashboardService {
                 profit = profit.add(netRevenue.subtract(costRate.multiply(soldBaseQuantity)));
             }
         }
-        return profit;
+        return MoneyMath.amount(profit);
     }
 
     private BigDecimal latestCost(java.util.UUID tenantId, java.util.UUID productId, BigDecimal fallback) {

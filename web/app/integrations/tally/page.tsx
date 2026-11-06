@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, CheckCircle2, Database, FileUp, Sparkles } from "lucide-react";
 import Link from "next/link";
 import { AppShell } from "@/components/AppShell";
+import { QueryFeedback } from "@/components/QueryFeedback";
 import { Panel } from "@/components/Panel";
 import { StatCard } from "@/components/StatCard";
 import { api } from "@/lib/api";
@@ -27,6 +28,8 @@ type TallyStatus = {
 export default function TallyIntegrationPage() {
   const status = useQuery({ queryKey: ["integrations", "tally"], queryFn: () => api<TallyStatus>("/api/integrations/tally/status") });
   const data = status.data;
+
+  if (status.isLoading || status.error) return <AppShell title="Tally Integration"><QueryFeedback queries={[status]} /></AppShell>;
 
   return (
     <AppShell title="Tally Integration Hub" actions={<Link className="inline-flex h-10 items-center gap-2 rounded bg-moss px-4 text-sm font-semibold text-white" href="/imports"><FileUp size={16} />Upload Tally Export</Link>}>

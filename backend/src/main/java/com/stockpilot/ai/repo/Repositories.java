@@ -126,6 +126,8 @@ public final class Repositories {
     }
 
     public interface StockMovementRepository extends JpaRepository<StockMovement, UUID> {
+        Optional<StockMovement> findByTenantIdAndId(UUID tenantId, UUID id);
+        List<StockMovement> findByTenantIdAndReferenceTypeAndReferenceIdOrderByCreatedAtAsc(UUID tenantId, String referenceType, UUID referenceId);
         Page<StockMovement> findByTenantId(UUID tenantId, Pageable pageable);
         List<StockMovement> findByTenantIdAndProductIdOrderByMovementDateDesc(UUID tenantId, UUID productId);
         List<StockMovement> findByTenantIdAndReferenceTypeAndReferenceId(UUID tenantId, String referenceType, UUID referenceId);
@@ -158,6 +160,7 @@ public final class Repositories {
     }
 
     public interface SupplierRepository extends JpaRepository<Supplier, UUID> {
+        Page<Supplier> findByTenantIdAndNameContainingIgnoreCase(UUID tenantId, String query, Pageable pageable);
         Page<Supplier> findByTenantId(UUID tenantId, Pageable pageable);
         List<Supplier> findByTenantIdOrderByNameAsc(UUID tenantId);
         Optional<Supplier> findByTenantIdAndId(UUID tenantId, UUID id);
@@ -168,6 +171,7 @@ public final class Repositories {
     }
 
     public interface CustomerRepository extends JpaRepository<Customer, UUID> {
+        Page<Customer> findByTenantIdAndNameContainingIgnoreCase(UUID tenantId, String query, Pageable pageable);
         Page<Customer> findByTenantId(UUID tenantId, Pageable pageable);
         List<Customer> findByTenantIdOrderByNameAsc(UUID tenantId);
         Optional<Customer> findByTenantIdAndId(UUID tenantId, UUID id);
@@ -265,6 +269,7 @@ public final class Repositories {
     }
 
     public interface CustomerPaymentRepository extends JpaRepository<CustomerPayment, UUID> {
+        Optional<CustomerPayment> findByTenantIdAndId(UUID tenantId, UUID id);
         @Query(value = "select coalesce(sum(amount), 0) from customer_payments where tenant_id = :tenantId", nativeQuery = true)
         BigDecimal totalPayments(@Param("tenantId") UUID tenantId);
 

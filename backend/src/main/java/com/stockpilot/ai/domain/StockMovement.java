@@ -20,7 +20,9 @@ public class StockMovement extends TenantOwnedEntity {
     public BigDecimal quantity = BigDecimal.ZERO;
     public UUID unitId;
     public BigDecimal baseQuantity = BigDecimal.ZERO;
+    @jakarta.persistence.Column(precision = 24, scale = 12)
     public BigDecimal rate = BigDecimal.ZERO;
+    @jakarta.persistence.Column(precision = 26, scale = 12)
     public BigDecimal totalValue = BigDecimal.ZERO;
     public String referenceType;
     public UUID referenceId;

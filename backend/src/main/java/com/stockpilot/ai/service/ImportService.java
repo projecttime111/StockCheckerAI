@@ -59,6 +59,9 @@ public class ImportService {
     private final StockLedgerService stockLedger;
     private final AuditService auditService;
     private final EntityManager entityManager;
+    private final com.stockpilot.ai.repo.LegacyImportRawRowRepository rawRows;
+    private final InvoiceIdentityService invoiceIdentity;
+    private final ProductIntegrityService productIntegrity;
     private final boolean devToolsEnabled;
     private final long maxUploadBytes;
 
@@ -89,6 +92,9 @@ public class ImportService {
         StockLedgerService stockLedger,
         AuditService auditService,
         EntityManager entityManager,
+        com.stockpilot.ai.repo.LegacyImportRawRowRepository rawRows,
+        InvoiceIdentityService invoiceIdentity,
+        ProductIntegrityService productIntegrity,
         @Value("${app.dev-tools.enabled:false}") boolean devToolsEnabled,
         @Value("${app.import.max-upload-size:500MB}") DataSize maxUploadSize
     ) {
@@ -118,6 +124,9 @@ public class ImportService {
         this.stockLedger = stockLedger;
         this.auditService = auditService;
         this.entityManager = entityManager;
+        this.rawRows = rawRows;
+        this.invoiceIdentity = invoiceIdentity;
+        this.productIntegrity = productIntegrity;
         this.devToolsEnabled = devToolsEnabled;
         this.maxUploadBytes = maxUploadSize.toBytes();
     }
@@ -149,6 +158,13 @@ public class ImportService {
             batch.sourceType = adapter.sourceType();
             try (var input = storage.read(storageKey)) {
                 var preview = adapter.parse(new ErpImportAdapter.ImportRequest(tenantId, batch.id, upload.getOriginalFilename(), input));
+                int sourceRow = 1;
+                for (var values : preview.rows()) {
+                    var raw = new LegacyImportRawRow();
+                    raw.tenantId = tenantId; raw.importBatchId = batch.id; raw.rowNumber = sourceRow++;
+                    raw.rawMetadata = new LinkedHashMap<>(values);
+                    rawRows.save(raw);
+                }
                 stageRows(tenantId, batch.id, batch.sourceType, preview.rows());
                 batch.rowCount = preview.rows().size();
                 batch.importPurpose = inferImportPurpose(tenantId, batch.id);
@@ -243,7 +259,7 @@ public class ImportService {
             if (isTallyPurchaseRow(batch, row)) {
                 map.put("voucherNumber", invoiceNumber(row.rawMetadata));
                 map.put("voucherDate", row.movementDate);
-                map.put("partyName", raw(row.rawMetadata, "Party Name", "Supplier", "Ledger Name"));
+                map.put("partyName", raw(row.rawMetadata, "partyName", "Party Name", "Supplier", "Ledger Name"));
             }
             map.put("productName", row.productName);
             map.put("warehouseName", row.warehouseName);
@@ -267,6 +283,11 @@ public class ImportService {
             map.put("rawMetadata", row.rawMetadata);
             rows.add(map);
         });
+        var stagedNumbers = rows.stream().map(row -> (Integer) row.get("rowNumber")).collect(Collectors.toSet());
+        for (var raw : rawRows.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(tenantId, batchId)) {
+            if (!stagedNumbers.contains(raw.rowNumber)) rows.add(new LinkedHashMap<>(Map.of(
+                "type", "UNMAPPED", "rowNumber", raw.rowNumber, "rawMetadata", raw.rawMetadata)));
+        }
         rows.sort(Comparator.comparing(row -> (Integer) row.get("rowNumber")));
         return rows;
     }
@@ -282,26 +303,36 @@ public class ImportService {
         batch.mappingJson.put(VOUCHER_STOCK_IMPACT_MODE_KEY, previousVoucherMode.name());
         batch.mappingJson.put(VOUCHER_STOCK_IMPACT_CONFIRMED_KEY, previousVoucherConfirmation);
         batch.status = DomainEnums.ImportStatus.MAPPED;
-        var rows = stagingProducts.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(batch.tenantId, batchId);
-        for (var row : rows) {
-            remap(row, request.mapping());
+        if (batch.committedAt != null || batch.status == DomainEnums.ImportStatus.ROLLED_BACK) {
+            throw ApiErrors.conflict("Committed imports cannot be remapped; upload a new batch");
         }
-        stagingProducts.saveAll(rows);
-        var customerRows = stagingCustomers.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(batch.tenantId, batchId);
-        for (var row : customerRows) {
-            remap(row, request.mapping());
+        var originals = rawRows.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(batch.tenantId, batchId);
+        if (!originals.isEmpty()) {
+            for (var entity : List.of("StagingProduct", "StagingCustomer", "StagingSupplier", "StagingStockMovement")) {
+                entityManager.createQuery("delete from " + entity + " where tenantId = :tenant and importBatchId = :batch")
+                    .setParameter("tenant", batch.tenantId).setParameter("batch", batchId).executeUpdate();
+            }
+            var mappedRows = new ArrayList<Map<String, String>>();
+            for (var original : originals) {
+                var mapped = new LinkedHashMap<>(original.rawMetadata);
+                request.mapping().forEach((target, source) -> {
+                    var value = lookup(original.rawMetadata, source);
+                    if (value != null) mapped.put("name".equals(target) ? "partyName" : target, value);
+                });
+                mappedRows.add(mapped);
+            }
+            stageRows(batch.tenantId, batchId, batch.sourceType, mappedRows);
+        } else {
+            // Previously uploaded batches predate raw-row retention.
+            var products = stagingProducts.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(batch.tenantId, batchId);
+            products.forEach(row -> remap(row, request.mapping())); stagingProducts.saveAll(products);
+            var customers = stagingCustomers.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(batch.tenantId, batchId);
+            customers.forEach(row -> remap(row, request.mapping())); stagingCustomers.saveAll(customers);
+            var suppliers = stagingSuppliers.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(batch.tenantId, batchId);
+            suppliers.forEach(row -> remap(row, request.mapping())); stagingSuppliers.saveAll(suppliers);
+            var movements = stagingStockMovements.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(batch.tenantId, batchId);
+            movements.forEach(row -> remap(row, request.mapping())); stagingStockMovements.saveAll(movements);
         }
-        stagingCustomers.saveAll(customerRows);
-        var supplierRows = stagingSuppliers.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(batch.tenantId, batchId);
-        for (var row : supplierRows) {
-            remap(row, request.mapping());
-        }
-        stagingSuppliers.saveAll(supplierRows);
-        var movementRows = stagingStockMovements.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(batch.tenantId, batchId);
-        for (var row : movementRows) {
-            remap(row, request.mapping());
-        }
-        stagingStockMovements.saveAll(movementRows);
         batch.importPurpose = inferImportPurpose(batch.tenantId, batchId);
         initializeVoucherStockImpactContext(batch, previousVoucherMode, previousVoucherConfirmation);
         return batches.save(batch);
@@ -338,6 +369,19 @@ public class ImportService {
         var supplierRows = stagingSuppliers.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(tenantId, batchId);
         var movementRows = stagingStockMovements.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(tenantId, batchId);
         updateVoucherStockImpactContext(batch, movementRows, voucherStockImpactMode, confirmStockMovementsAfterSnapshot, latestSnapshot);
+        var mappedRowNumbers = new HashSet<Integer>();
+        productRows.forEach(row -> mappedRowNumbers.add(row.rowNumber));
+        customerRows.forEach(row -> mappedRowNumbers.add(row.rowNumber));
+        supplierRows.forEach(row -> mappedRowNumbers.add(row.rowNumber));
+        movementRows.forEach(row -> mappedRowNumbers.add(row.rowNumber));
+        for (var raw : rawRows.findByTenantIdAndImportBatchIdOrderByRowNumberAsc(tenantId, batchId)) {
+            if (!mappedRowNumbers.contains(raw.rowNumber)) {
+                errors.save(error(tenantId, batchId, raw.rowNumber, "mapping", "UNMAPPED_ROW",
+                    "No entity could be identified. Map the source columns before committing."));
+                invalidRows.add(raw.rowNumber); errorCount++;
+            }
+        }
+
         var seenSkus = new HashSet<String>();
         var seenBarcodes = new HashSet<String>();
         var seenNamesWithoutCodes = new HashSet<String>();
@@ -411,7 +455,7 @@ public class ImportService {
                 errors.saveAll(rowErrors);
             }
         }
-        var seenCustomersByGstin = new HashSet<String>();
+        var seenCustomersByGstin = new HashMap<String, String>();
         var seenCustomersByNamePhone = new HashSet<String>();
         for (var row : customerRows) {
             var rowErrors = validateCustomerRow(tenantId, batchId, row, seenCustomersByGstin, seenCustomersByNamePhone);
@@ -424,7 +468,7 @@ public class ImportService {
                 errors.saveAll(rowErrors);
             }
         }
-        var seenSuppliersByGstin = new HashSet<String>();
+        var seenSuppliersByGstin = new HashMap<String, String>();
         var seenSuppliersByNamePhone = new HashSet<String>();
         for (var row : supplierRows) {
             var rowErrors = validateSupplierRow(tenantId, batchId, row, seenSuppliersByGstin, seenSuppliersByNamePhone);
@@ -437,6 +481,7 @@ public class ImportService {
                 errors.saveAll(rowErrors);
             }
         }
+        var seenInvoiceRows = new HashMap<String, StagingStockMovement>();
         for (var row : movementRows) {
             var rowErrors = new ArrayList<ImportError>();
             DomainEnums.MovementType parsedType = null;
@@ -457,10 +502,21 @@ public class ImportService {
             if (parsedType != null && parsedType != DomainEnums.MovementType.ADJUSTMENT && parsedType != DomainEnums.MovementType.OPENING_BALANCE && (invoiceNumber == null || invoiceNumber.isBlank())) {
                 rowErrors.add(error(tenantId, batchId, row.rowNumber, "VOUCHER", "invoiceNumber", "INVOICE_NUMBER_REQUIRED", "Voucher/invoice number is required", "ERROR", raw(row.rawMetadata, "Voucher Number", "Voucher No", "Invoice Number"), "Map voucher number, bill number, or invoice number."));
             }
-            if (parsedType != null && invoiceNumber != null && existingInvoiceConflict(tenantId, parsedType, invoiceNumber)) {
+            if (invoiceNumber != null && row.movementDate != null
+                && (parsedType == DomainEnums.MovementType.SALE || parsedType == DomainEnums.MovementType.PURCHASE)) {
+                var key = parsedType + "|" + invoiceKey(row, parsedType == DomainEnums.MovementType.PURCHASE);
+                var prior = seenInvoiceRows.putIfAbsent(key, row);
+                if (prior != null && (!Objects.equals(prior.movementDate, row.movementDate)
+                    || !Objects.equals(normalizedValue(raw(prior.rawMetadata, "partyName", "Party Name", "Customer", "Supplier", "Ledger Name")),
+                        normalizedValue(raw(row.rawMetadata, "partyName", "Party Name", "Customer", "Supplier", "Ledger Name"))))) {
+                    rowErrors.add(error(tenantId, batchId, row.rowNumber, "invoiceNumber", "DUPLICATE_INVOICE",
+                        "Invoice number is reused with conflicting dates or parties in this financial year"));
+                }
+            }
+            if (parsedType != null && invoiceNumber != null && existingInvoiceConflict(tenantId, parsedType, invoiceNumber, row)) {
                 rowErrors.add(error(tenantId, batchId, row.rowNumber, "VOUCHER", "invoiceNumber", "DUPLICATE_INVOICE", parsedType + " invoice already exists: " + invoiceNumber, "ERROR", invoiceNumber, "Use a new invoice number or remove rows already imported."));
             }
-            var partyName = raw(row.rawMetadata, "Party Name", "Customer", "Supplier", "Ledger Name");
+            var partyName = raw(row.rawMetadata, "partyName", "Party Name", "Customer", "Supplier", "Ledger Name");
             if (parsedType != null
                 && (parsedType == DomainEnums.MovementType.SALE || parsedType == DomainEnums.MovementType.PURCHASE)
                 && (partyName == null || partyName.isBlank())) {
@@ -526,7 +582,7 @@ public class ImportService {
                 errors.saveAll(stockErrors);
             }
         }
-        batch.validCount = productRows.size() + customerRows.size() + supplierRows.size() + movementRows.size() - invalidRows.size();
+        batch.validCount = (int) mappedRowNumbers.stream().filter(row -> !invalidRows.contains(row)).count();
         batch.errorCount = errorCount;
         batch.status = errorCount > 0 ? DomainEnums.ImportStatus.VALIDATION_FAILED : DomainEnums.ImportStatus.VALIDATED;
         var saved = batches.save(batch);
@@ -843,7 +899,7 @@ public class ImportService {
             var referenceId = batchId;
             var invoiceNumber = invoiceNumber(row.rawMetadata);
             if (type == DomainEnums.MovementType.SALE && invoiceNumber != null) {
-                var invoice = salesByInvoice.computeIfAbsent(invoiceNumber.toLowerCase(Locale.ROOT), ignored -> createImportedSalesInvoice(tenantId, row, warehouse.id));
+                var invoice = salesByInvoice.computeIfAbsent(invoiceKey(row, false), ignored -> createImportedSalesInvoice(tenantId, row, warehouse.id));
                 recordCreatedEffect(tenantId, batchId, DomainEnums.ImportEffectEntityType.SALES_INVOICE, invoice.id, false, Map.of("invoiceNumber", invoice.invoiceNumber));
                 addImportedSalesItem(tenantId, invoice, product, row);
                 salesInvoiceItemsCreated++;
@@ -851,7 +907,7 @@ public class ImportService {
                 referenceId = invoice.id;
                 salesInvoicesCreated = salesByInvoice.size();
             } else if (type == DomainEnums.MovementType.PURCHASE && invoiceNumber != null) {
-                var invoice = purchaseByInvoice.computeIfAbsent(invoiceNumber.toLowerCase(Locale.ROOT), ignored -> createImportedPurchaseInvoice(tenantId, row, warehouse.id));
+                var invoice = purchaseByInvoice.computeIfAbsent(invoiceKey(row, true), ignored -> createImportedPurchaseInvoice(tenantId, row, warehouse.id));
                 recordCreatedEffect(tenantId, batchId, DomainEnums.ImportEffectEntityType.PURCHASE_INVOICE, invoice.id, false, Map.of("invoiceNumber", invoice.invoiceNumber));
                 addImportedPurchaseItem(tenantId, invoice, product, row);
                 purchaseInvoiceItemsCreated++;
@@ -1070,7 +1126,7 @@ public class ImportService {
         invoice.invoiceNumber = invoiceNumber(row.rawMetadata);
         invoice.invoiceDate = row.movementDate == null ? LocalDate.now(ZoneOffset.UTC) : row.movementDate;
         invoice.warehouseId = warehouseId;
-        var partyName = raw(row.rawMetadata, "Party Name", "Customer", "Ledger Name");
+        var partyName = raw(row.rawMetadata, "partyName", "Party Name", "Customer", "Ledger Name");
         if (partyName != null && !partyName.isBlank()) {
             customers.findByTenantIdAndNameIgnoreCase(tenantId, partyName).ifPresent(customer -> invoice.customerId = customer.id);
         }
@@ -1108,7 +1164,7 @@ public class ImportService {
         invoice.invoiceNumber = invoiceNumber(row.rawMetadata);
         invoice.invoiceDate = row.movementDate == null ? LocalDate.now(ZoneOffset.UTC) : row.movementDate;
         invoice.warehouseId = warehouseId;
-        var partyName = raw(row.rawMetadata, "Party Name", "Supplier", "Ledger Name");
+        var partyName = raw(row.rawMetadata, "partyName", "Party Name", "Supplier", "Ledger Name");
         if (partyName != null && !partyName.isBlank()) {
             suppliers.findByTenantIdAndNameIgnoreCase(tenantId, partyName).ifPresent(supplier -> invoice.supplierId = supplier.id);
         }
@@ -1888,7 +1944,9 @@ public class ImportService {
             product.brandId = catalogService.getOrCreateBrand(row.brand).id;
         }
         if (row.unitCode != null && !row.unitCode.isBlank()) {
-            product.baseUnitId = catalogService.getOrCreateUnit(row.unitCode).id;
+            var importedUnitId = catalogService.getOrCreateUnit(row.unitCode).id;
+            if (!creating) productIntegrity.assertBaseUnitChangeAllowed(product, importedUnitId);
+            product.baseUnitId = importedUnitId;
         } else if (creating) {
             product.baseUnitId = catalogService.getOrCreateUnit("PCS").id;
         }
@@ -2045,7 +2103,7 @@ public class ImportService {
             .toList();
     }
 
-    private List<ImportError> validateCustomerRow(UUID tenantId, UUID batchId, StagingCustomer row, Set<String> seenGstins, Set<String> seenNamePhones) {
+    private List<ImportError> validateCustomerRow(UUID tenantId, UUID batchId, StagingCustomer row, Map<String, String> seenGstins, Set<String> seenNamePhones) {
         var rowErrors = new ArrayList<ImportError>();
         if (row.name == null || row.name.isBlank()) {
             rowErrors.add(error(tenantId, batchId, row.rowNumber, "CUSTOMER", "name", "CUSTOMER_NAME_REQUIRED", "Customer name is required", "ERROR", raw(row.rawMetadata, "Customer", "Party Name", "Ledger Name"), "Map the customer/party name column."));
@@ -2054,8 +2112,11 @@ public class ImportService {
         validateEmail(tenantId, batchId, row.rowNumber, row.email).ifPresent(rowErrors::add);
         var gstin = normalizedValue(row.gstin);
         if (gstin != null) {
-            if (!seenGstins.add(gstin) || customers.findByTenantIdAndGstinIgnoreCase(tenantId, row.gstin).isPresent()) {
-                rowErrors.add(error(tenantId, batchId, row.rowNumber, "CUSTOMER", "gstin", "DUPLICATE_GSTIN", "Customer GSTIN is already used in this tenant or import batch", "ERROR", row.gstin, "Keep one customer per GSTIN or correct the GSTIN."));
+            var previousName = seenGstins.putIfAbsent(gstin, normalizedValue(row.name));
+            var existing = customers.findByTenantIdAndGstinIgnoreCase(tenantId, row.gstin);
+            if (previousName != null && !previousName.equals(normalizedValue(row.name))
+                || existing.isPresent() && !Objects.equals(normalizedValue(existing.get().name), normalizedValue(row.name))) {
+                rowErrors.add(error(tenantId, batchId, row.rowNumber, "CUSTOMER", "gstin", "DUPLICATE_GSTIN", "Customer GSTIN belongs to conflicting party names", "ERROR", row.gstin, "Keep one customer per GSTIN or correct the GSTIN."));
             }
             if (!validGstin(row.gstin)) {
                 rowErrors.add(error(tenantId, batchId, row.rowNumber, "CUSTOMER", "gstin", "BAD_GSTIN", "GSTIN should be 15 alphanumeric characters", "ERROR", row.gstin, "Use a 15-character GSTIN or leave it blank if unavailable."));
@@ -2069,7 +2130,7 @@ public class ImportService {
         return rowErrors;
     }
 
-    private List<ImportError> validateSupplierRow(UUID tenantId, UUID batchId, StagingSupplier row, Set<String> seenGstins, Set<String> seenNamePhones) {
+    private List<ImportError> validateSupplierRow(UUID tenantId, UUID batchId, StagingSupplier row, Map<String, String> seenGstins, Set<String> seenNamePhones) {
         var rowErrors = new ArrayList<ImportError>();
         if (row.name == null || row.name.isBlank()) {
             rowErrors.add(error(tenantId, batchId, row.rowNumber, "SUPPLIER", "name", "SUPPLIER_NAME_REQUIRED", "Supplier name is required", "ERROR", raw(row.rawMetadata, "Supplier", "Party Name", "Ledger Name"), "Map the supplier/party name column."));
@@ -2078,8 +2139,11 @@ public class ImportService {
         validateEmail(tenantId, batchId, row.rowNumber, row.email).ifPresent(rowErrors::add);
         var gstin = normalizedValue(row.gstin);
         if (gstin != null) {
-            if (!seenGstins.add(gstin) || suppliers.findByTenantIdAndGstinIgnoreCase(tenantId, row.gstin).isPresent()) {
-                rowErrors.add(error(tenantId, batchId, row.rowNumber, "SUPPLIER", "gstin", "DUPLICATE_GSTIN", "Supplier GSTIN is already used in this tenant or import batch", "ERROR", row.gstin, "Keep one supplier per GSTIN or correct the GSTIN."));
+            var previousName = seenGstins.putIfAbsent(gstin, normalizedValue(row.name));
+            var existing = suppliers.findByTenantIdAndGstinIgnoreCase(tenantId, row.gstin);
+            if (previousName != null && !previousName.equals(normalizedValue(row.name))
+                || existing.isPresent() && !Objects.equals(normalizedValue(existing.get().name), normalizedValue(row.name))) {
+                rowErrors.add(error(tenantId, batchId, row.rowNumber, "SUPPLIER", "gstin", "DUPLICATE_GSTIN", "Supplier GSTIN belongs to conflicting party names", "ERROR", row.gstin, "Keep one supplier per GSTIN or correct the GSTIN."));
             }
             if (!validGstin(row.gstin)) {
                 rowErrors.add(error(tenantId, batchId, row.rowNumber, "SUPPLIER", "gstin", "BAD_GSTIN", "GSTIN should be 15 alphanumeric characters", "ERROR", row.gstin, "Use a 15-character GSTIN or leave it blank if unavailable."));
@@ -2966,18 +3030,7 @@ public class ImportService {
     }
 
     private LocalDate date(String value) {
-        if (value == null || value.isBlank()) {
-            return null;
-        }
-        var trimmed = value.trim();
-        try {
-            if (trimmed.matches("\\d{8}")) {
-                return LocalDate.parse(trimmed.substring(0, 4) + "-" + trimmed.substring(4, 6) + "-" + trimmed.substring(6));
-            }
-            return LocalDate.parse(trimmed.substring(0, Math.min(10, trimmed.length())));
-        } catch (Exception ex) {
-            return null;
-        }
+        return ImportDates.parse(value);
     }
 
     private BigDecimal nvl(BigDecimal value) {
@@ -3045,21 +3098,21 @@ public class ImportService {
         return value == null || value.isBlank() ? null : value.trim();
     }
 
-    private boolean existingInvoiceConflict(UUID tenantId, DomainEnums.MovementType type, String invoiceNumber) {
-        if (type == DomainEnums.MovementType.SALE || type == DomainEnums.MovementType.RETURN_OUT) {
-            return invoicesAlreadyContainSales(tenantId, invoiceNumber);
-        }
-        if (type == DomainEnums.MovementType.PURCHASE || type == DomainEnums.MovementType.RETURN_IN) {
-            return invoicesAlreadyContainPurchase(tenantId, invoiceNumber);
+    private String invoiceKey(StagingStockMovement row, boolean purchase) {
+        var date = row.movementDate;
+        int year = date == null ? 0 : date.getYear() - (date.getMonthValue() < 4 ? 1 : 0);
+        return invoiceNumber(row.rawMetadata).toLowerCase(Locale.ROOT) + "|" + year
+            + (purchase ? "|" + normalizedValue(raw(row.rawMetadata, "partyName", "partyName", "Party Name", "Supplier", "Ledger Name")) : "");
+    }
+
+    private boolean existingInvoiceConflict(UUID tenantId, DomainEnums.MovementType type, String number, StagingStockMovement row) {
+        if (row.movementDate == null) return false;
+        if (type == DomainEnums.MovementType.SALE) return invoiceIdentity.matchSale(tenantId, number, row.movementDate).isPresent();
+        if (type == DomainEnums.MovementType.PURCHASE) {
+            var partyName = raw(row.rawMetadata, "partyName", "partyName", "Party Name", "Supplier", "Ledger Name");
+            var supplierId = partyName == null ? null : suppliers.findByTenantIdAndNameIgnoreCase(tenantId, partyName).map(party -> party.id).orElse(null);
+            return invoiceIdentity.matchPurchase(tenantId, supplierId, number, row.movementDate).isPresent();
         }
         return false;
-    }
-
-    private boolean invoicesAlreadyContainSales(UUID tenantId, String invoiceNumber) {
-        return salesInvoices.existsByTenantIdAndInvoiceNumberIgnoreCase(tenantId, invoiceNumber);
-    }
-
-    private boolean invoicesAlreadyContainPurchase(UUID tenantId, String invoiceNumber) {
-        return purchaseInvoices.existsByTenantIdAndInvoiceNumberIgnoreCase(tenantId, invoiceNumber);
     }
 }

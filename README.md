@@ -23,7 +23,7 @@ StockPilot AI is designed to work with Tally, not replace it. Accounting, GST, l
 - Smart reorder engine that considers demand, lead time, safety stock, pending orders, MOQ, and warehouse-level stock.
 - Dead-stock action center with blocked capital, last-sold date, warehouse, and recommended clearance actions.
 - Dealer/customer ordering portal for assigned pricing, available products, sales orders, outstanding, and invoices.
-- Invoice upload endpoint with local/mock extraction service.
+- Invoice upload endpoint reports extraction as unavailable until a real provider is configured; it never returns invented invoice data.
 - Tenant-scoped audit log viewer for imports, stock changes, payment follow-ups, payments, and cleanup actions.
 - Next.js admin dashboard and Expo mobile app consuming the same Spring Boot APIs.
 
@@ -123,13 +123,12 @@ cd backend
 
 On macOS/Linux, use `./mvnw` instead of `.\mvnw.cmd`.
 
-If macOS resolves an older Java first, point the current terminal at a JDK 21 or
-newer installation before starting the backend. This machine's Homebrew JDK can
-be selected with:
+If macOS resolves an older Java first, point the current terminal at a JDK 21
+installation before starting the backend. With Homebrew `openjdk@21` installed:
 
 ```bash
-export JAVA_HOME="$(brew --prefix openjdk)/libexec/openjdk.jdk/Contents/Home"
-export PATH="$(brew --prefix openjdk)/bin:$PATH"
+export JAVA_HOME="$(brew --prefix openjdk@21)/libexec/openjdk.jdk/Contents/Home"
+export PATH="$JAVA_HOME/bin:$PATH"
 java -version
 ```
 

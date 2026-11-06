@@ -26,6 +26,9 @@ public class PurchaseService {
     private final Repositories.WarehouseRepository warehouses;
     private final StockLedgerService stockLedger;
     private final AuditService auditService;
+    private final InvoiceIdentityService identity;
+    private final TenantWriteLockService locks;
+    private final SensitiveDataService sensitive;
 
     public PurchaseService(
         Repositories.PurchaseInvoiceRepository invoices,
@@ -34,7 +37,8 @@ public class PurchaseService {
         Repositories.SupplierRepository suppliers,
         Repositories.WarehouseRepository warehouses,
         StockLedgerService stockLedger,
-        AuditService auditService
+        AuditService auditService,
+        InvoiceIdentityService identity, TenantWriteLockService locks, SensitiveDataService sensitive
     ) {
         this.invoices = invoices;
         this.items = items;
@@ -43,6 +47,7 @@ public class PurchaseService {
         this.warehouses = warehouses;
         this.stockLedger = stockLedger;
         this.auditService = auditService;
+        this.identity = identity; this.locks = locks; this.sensitive = sensitive;
     }
 
     public Page<ApiDtos.InvoiceResponse> list(Pageable pageable) {
@@ -56,7 +61,8 @@ public class PurchaseService {
     @Transactional
     public ApiDtos.InvoiceResponse create(ApiDtos.PurchaseInvoiceRequest request) {
         var tenantId = TenantContext.tenantId();
-        if (invoices.existsByTenantIdAndInvoiceNumberIgnoreCase(tenantId, request.invoiceNumber())) {
+        locks.lock(tenantId);
+        if (identity.matchPurchase(tenantId, request.supplierId(), request.invoiceNumber(), request.invoiceDate()).isPresent()) {
             throw ApiErrors.conflict("Purchase invoice number already exists");
         }
         if (request.supplierId() != null) {
@@ -65,6 +71,9 @@ public class PurchaseService {
         warehouses.findByTenantIdAndId(tenantId, request.warehouseId()).orElseThrow(() -> ApiErrors.notFound("Warehouse not found"));
         var productById = new java.util.LinkedHashMap<UUID, com.stockpilot.ai.domain.Product>();
         for (var line : request.items()) {
+            if (line.discountAmount() != null && line.discountAmount().signum() != 0) {
+                throw ApiErrors.badRequest("Purchase lines require the net rate after discount");
+            }
             var product = products.findByTenantIdAndId(tenantId, line.productId()).orElseThrow(() -> ApiErrors.notFound("Product not found"));
             productById.put(product.id, product);
         }
@@ -75,7 +84,7 @@ public class PurchaseService {
         invoice.tenantId = tenantId;
         invoice.supplierId = request.supplierId();
         invoice.warehouseId = request.warehouseId();
-        invoice.invoiceNumber = request.invoiceNumber();
+        invoice.invoiceNumber = request.invoiceNumber().trim();
         invoice.invoiceDate = request.invoiceDate();
         invoices.save(invoice);
 
@@ -83,9 +92,9 @@ public class PurchaseService {
         BigDecimal tax = BigDecimal.ZERO;
         for (var line : request.items()) {
             var product = productById.get(line.productId());
-            var lineSubtotal = line.quantity().multiply(line.rate());
+            var lineSubtotal = MoneyMath.storedAmount(line.quantity().multiply(line.rate()));
             var taxRate = line.taxPercentage() == null ? nvl(product.gstPercentage) : line.taxPercentage();
-            var lineTax = lineSubtotal.multiply(taxRate).divide(BigDecimal.valueOf(100));
+            var lineTax = MoneyMath.amount(lineSubtotal.multiply(taxRate).divide(BigDecimal.valueOf(100)));
             var item = new PurchaseInvoiceItem();
             item.tenantId = tenantId;
             item.purchaseInvoiceId = invoice.id;
@@ -95,7 +104,7 @@ public class PurchaseService {
             item.rate = line.rate();
             item.taxPercentage = taxRate;
             item.taxAmount = lineTax;
-            item.lineTotal = lineSubtotal.add(lineTax);
+            item.lineTotal = MoneyMath.storedAmount(lineSubtotal.add(lineTax));
             items.save(item);
             subtotal = subtotal.add(lineSubtotal);
             tax = tax.add(lineTax);
@@ -103,9 +112,9 @@ public class PurchaseService {
             products.save(product);
             stockLedger.createMovement(tenantId, product.id, request.warehouseId(), DomainEnums.MovementType.PURCHASE, line.quantity(), item.unitId, line.rate(), "PURCHASE_INVOICE", invoice.id, request.invoiceDate().atStartOfDay().toInstant(ZoneOffset.UTC), "Purchase " + request.invoiceNumber());
         }
-        invoice.subtotal = subtotal;
-        invoice.taxAmount = tax;
-        invoice.totalAmount = subtotal.add(tax);
+        invoice.subtotal = MoneyMath.storedAmount(subtotal);
+        invoice.taxAmount = MoneyMath.storedAmount(tax);
+        invoice.totalAmount = MoneyMath.storedAmount(subtotal.add(tax));
         invoices.save(invoice);
         auditService.logCurrent("PURCHASE_INVOICE_CREATED", "PurchaseInvoice", invoice.id, Map.of("invoiceNumber", invoice.invoiceNumber, "total", invoice.totalAmount));
         return response(invoice);
@@ -116,6 +125,6 @@ public class PurchaseService {
     }
 
     private ApiDtos.InvoiceResponse response(PurchaseInvoice invoice) {
-        return new ApiDtos.InvoiceResponse(invoice.id, invoice.invoiceNumber, invoice.invoiceDate, invoice.subtotal, invoice.taxAmount, invoice.totalAmount);
+        return new ApiDtos.InvoiceResponse(invoice.id, invoice.invoiceNumber, invoice.invoiceDate, sensitive.cost(invoice.subtotal), sensitive.cost(invoice.taxAmount), sensitive.cost(invoice.totalAmount));
     }
 }

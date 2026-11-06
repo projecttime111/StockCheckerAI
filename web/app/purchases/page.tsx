@@ -1,70 +1,7 @@
 "use client";
-
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FormEvent, useState } from "react";
 import { AppShell } from "@/components/AppShell";
-import { Field, PrimaryButton, SelectInput, TextInput } from "@/components/FormControls";
-import { Panel } from "@/components/Panel";
-import { api, money, Page, Product, Warehouse } from "@/lib/api";
-
-type Invoice = { id: string; invoiceNumber: string; invoiceDate: string; totalAmount: number };
-type Supplier = { id: string; name: string };
+import { InvoiceWorkspace } from "@/components/InvoiceWorkspace";
 
 export default function PurchasesPage() {
-  const queryClient = useQueryClient();
-  const [form, setForm] = useState({ supplierId: "", warehouseId: "", invoiceNumber: `P-${Date.now()}`, invoiceDate: new Date().toISOString().slice(0, 10), productId: "", quantity: "1", rate: "" });
-  const invoices = useQuery({ queryKey: ["purchases"], queryFn: () => api<Page<Invoice>>("/api/purchases?size=50") });
-  const products = useQuery({ queryKey: ["products", "purchase"], queryFn: () => api<Page<Product>>("/api/products?size=200") });
-  const warehouses = useQuery({ queryKey: ["warehouses"], queryFn: () => api<Warehouse[]>("/api/warehouses") });
-  const suppliers = useQuery({ queryKey: ["suppliers"], queryFn: () => api<Page<Supplier>>("/api/suppliers?size=100") });
-  const create = useMutation({
-    mutationFn: () => api("/api/purchases", {
-      method: "POST",
-      body: JSON.stringify({
-        supplierId: form.supplierId || null,
-        warehouseId: form.warehouseId,
-        invoiceNumber: form.invoiceNumber,
-        invoiceDate: form.invoiceDate,
-        items: [{ productId: form.productId, quantity: Number(form.quantity), rate: Number(form.rate || 0) }]
-      })
-    }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["purchases"] });
-      queryClient.invalidateQueries({ queryKey: ["stock"] });
-    }
-  });
-
-  function productChanged(id: string) {
-    const product = products.data?.content.find((item) => item.id === id);
-    setForm({ ...form, productId: id, rate: product ? String(product.defaultPurchasePrice) : form.rate });
-  }
-
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    create.mutate();
-  }
-
-  return (
-    <AppShell title="Purchases">
-      <div className="grid gap-4 xl:grid-cols-[1fr_400px]">
-        <Panel title="Purchase Invoices">
-          <table className="w-full text-left text-sm">
-            <thead className="text-ink/50"><tr><th className="py-2">Invoice</th><th>Date</th><th>Total</th></tr></thead>
-            <tbody>{(invoices.data?.content ?? []).map((invoice) => <tr key={invoice.id} className="border-t border-ink/10"><td className="py-3 font-medium">{invoice.invoiceNumber}</td><td>{invoice.invoiceDate}</td><td>{money(invoice.totalAmount)}</td></tr>)}</tbody>
-          </table>
-        </Panel>
-        <Panel title="Create Purchase">
-          <form onSubmit={submit} className="space-y-3">
-            <Field label="Supplier"><SelectInput value={form.supplierId} onChange={(e) => setForm({ ...form, supplierId: e.target.value })}><option value="">No supplier</option>{(suppliers.data?.content ?? []).map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</SelectInput></Field>
-            <Field label="Warehouse"><SelectInput value={form.warehouseId} onChange={(e) => setForm({ ...form, warehouseId: e.target.value })} required><option value="">Select</option>{(warehouses.data ?? []).map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}</SelectInput></Field>
-            <div className="grid grid-cols-2 gap-3"><Field label="Invoice no"><TextInput value={form.invoiceNumber} onChange={(e) => setForm({ ...form, invoiceNumber: e.target.value })} required /></Field><Field label="Date"><TextInput type="date" value={form.invoiceDate} onChange={(e) => setForm({ ...form, invoiceDate: e.target.value })} required /></Field></div>
-            <Field label="Product"><SelectInput value={form.productId} onChange={(e) => productChanged(e.target.value)} required><option value="">Select</option>{(products.data?.content ?? []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</SelectInput></Field>
-            <div className="grid grid-cols-2 gap-3"><Field label="Quantity"><TextInput type="number" value={form.quantity} onChange={(e) => setForm({ ...form, quantity: e.target.value })} required /></Field><Field label="Rate"><TextInput type="number" step="0.01" value={form.rate} onChange={(e) => setForm({ ...form, rate: e.target.value })} required /></Field></div>
-            {create.error ? <p className="text-sm text-coral">{create.error.message}</p> : null}
-            <PrimaryButton className="w-full" disabled={create.isPending}>Create purchase</PrimaryButton>
-          </form>
-        </Panel>
-      </div>
-    </AppShell>
-  );
+  return <AppShell title="Purchases"><InvoiceWorkspace kind="purchases" /></AppShell>;
 }

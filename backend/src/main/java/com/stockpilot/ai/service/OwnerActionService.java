@@ -17,19 +17,23 @@ public class OwnerActionService {
     private final DataQualityService dataQuality;
     private final Repositories.ImportBatchRepository batches;
     private final Repositories.PurchaseOrderRepository purchaseOrders;
+    private final SensitiveDataService sensitive;
+    private final PermissionService permissions;
 
     public OwnerActionService(
         DashboardService dashboard,
         ReorderEngineService reorder,
         DataQualityService dataQuality,
         Repositories.ImportBatchRepository batches,
-        Repositories.PurchaseOrderRepository purchaseOrders
+        Repositories.PurchaseOrderRepository purchaseOrders, SensitiveDataService sensitive, PermissionService permissions
     ) {
         this.dashboard = dashboard;
         this.reorder = reorder;
         this.dataQuality = dataQuality;
         this.batches = batches;
         this.purchaseOrders = purchaseOrders;
+        this.sensitive = sensitive;
+        this.permissions = permissions;
     }
 
     public List<ApiDtos.ActionCard> today() {
@@ -42,11 +46,11 @@ public class OwnerActionService {
             actions.add(new ApiDtos.ActionCard("Reorder urgent products", reorderRows.size() + " products may hit reorder thresholds soon", impact, "/forecasts", "View reorder"));
         }
         var outstanding = dashboard.outstandingReceivables();
-        if (outstanding.compareTo(BigDecimal.ZERO) > 0) {
+        if (permissions.has("customers.view_outstanding") && outstanding.compareTo(BigDecimal.ZERO) > 0) {
             actions.add(new ApiDtos.ActionCard("Follow up overdue customers", "Receivables need owner attention", outstanding, "/customers", "Open customers"));
         }
         var deadValue = dashboard.deadStock().stream().map(ApiDtos.DeadStockResponse::stockValue).reduce(BigDecimal.ZERO, BigDecimal::add);
-        if (deadValue.compareTo(BigDecimal.ZERO) > 0) {
+        if (sensitive.canViewCost() && deadValue.compareTo(BigDecimal.ZERO) > 0) {
             actions.add(new ApiDtos.ActionCard("Clear dead stock", deadValue + " blocked in slow-moving stock", deadValue, "/dead-stock", "View dead stock"));
         }
         var importErrors = batches.findByTenantId(tenantId, PageRequest.of(0, 20)).stream().mapToInt(batch -> batch.errorCount).sum();
@@ -61,7 +65,7 @@ public class OwnerActionService {
         if (pending > 0) {
             actions.add(new ApiDtos.ActionCard("Confirm pending purchase orders", pending + " draft purchase orders are ready to review", BigDecimal.ZERO, "/purchases", "Open purchases"));
         }
-        if (summary.monthlySales().compareTo(BigDecimal.ZERO) != 0 || summary.grossProfit().compareTo(BigDecimal.ZERO) != 0) {
+        if (sensitive.canViewProfit() && (summary.monthlySales().compareTo(BigDecimal.ZERO) != 0 || summary.grossProfit().compareTo(BigDecimal.ZERO) != 0)) {
             actions.add(new ApiDtos.ActionCard("Review margin drop", "Check whether current profit is moving because of cost, discount, or sales mix", summary.grossProfit(), "/dashboard", "Why profit changed"));
         }
         return actions.stream().limit(8).toList();

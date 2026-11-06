@@ -5,9 +5,11 @@ import { ShoppingCart, Wallet } from "lucide-react";
 import { useMemo, useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { PrimaryButton } from "@/components/FormControls";
+import { MutationFeedback, QueryFeedback } from "@/components/QueryFeedback";
 import { Panel } from "@/components/Panel";
 import { StatCard } from "@/components/StatCard";
-import { api, money } from "@/lib/api";
+import { api } from "@/lib/api";
+import { Permission, useMoney } from "@/lib/business";
 
 type Product = { productId: string; productName: string; price: number; availableStock: number };
 type Order = { orderId: string; orderNumber: string; status: string; totalAmount: number };
@@ -16,6 +18,7 @@ type Invoice = { invoiceId: string; invoiceNumber: string; invoiceDate: string; 
 type Me = { role: string };
 
 export default function PortalPage() {
+  const money = useMoney();
   const queryClient = useQueryClient();
   const [query, setQuery] = useState("");
   const [cart, setCart] = useState<Record<string, number>>({});
@@ -44,13 +47,15 @@ export default function PortalPage() {
 
   return (
     <AppShell title="Dealer Portal">
+      <QueryFeedback queries={[me, products, orders, outstanding, invoices]} />
+      <MutationFeedback mutation={place} success="Order placed successfully." />
       <div className="space-y-6">
         <Panel title="Customer Ordering">
           <p className="text-sm text-ink/65">Wholesale customers can view assigned prices, available stock, place sales orders, reorder previous items, and track outstanding without touching accounting records.</p>
         </Panel>
         {me.data && !isCustomerUser ? (
           <Panel title="Portal Preview">
-            <p className="text-sm text-ink/65">This page is for dealer/customer logins linked to a customer account. Use the local demo portal login `ravi@demo.com` with `password123` to place a customer order.</p>
+            <p className="text-sm text-ink/65">This page is for dealer/customer logins linked to a customer account. Sign in with your assigned dealer account.</p>
           </Panel>
         ) : null}
         {isCustomerUser ? (
@@ -67,21 +72,22 @@ export default function PortalPage() {
                 <div key={product.productId} className="rounded border border-ink/10 p-3">
                   <div className="font-semibold">{product.productName}</div>
                   <div className="text-sm text-ink/55">Stock {product.availableStock} - {money(product.price)}</div>
-                  <button className="mt-3 rounded bg-moss px-3 py-2 text-sm font-semibold text-white" onClick={() => add(product.productId)}>Add</button>
+                  <Permission permission="portal.customer.order_create"><button disabled={place.isPending} className="mt-3 rounded bg-moss px-3 py-2 text-sm font-semibold text-white" onClick={() => add(product.productId)}>Add</button></Permission>
                 </div>
               ))}
-              {!products.isLoading && filtered.length === 0 ? (
+              {!products.isLoading && !products.error && filtered.length === 0 ? (
                 <div className="rounded border border-ink/10 bg-paper p-4 text-sm text-ink/60 md:col-span-2">
                   No products have been assigned to your catalog yet.
                 </div>
               ) : null}
             </div>
           </Panel>
-          <Panel title="Cart and Orders" action={<PrimaryButton onClick={() => place.mutate()} disabled={place.isPending || !Object.values(cart).some((qty) => qty > 0)}>Place order</PrimaryButton>}>
+          <Panel title="Cart and Orders" action={<Permission permission="portal.customer.order_create"><PrimaryButton onClick={() => place.mutate()} disabled={place.isPending || !Object.values(cart).some((qty) => qty > 0)}>Place order</PrimaryButton></Permission>}>
             <div className="space-y-2">
+              {Object.keys(cart).length ? <button disabled={place.isPending} className="text-sm underline" onClick={() => setCart({})}>Clear cart</button> : null}
               {Object.entries(cart).map(([id, qty]) => {
                 const product = products.data?.find((row) => row.productId === id);
-                return <div key={id} className="flex justify-between rounded border border-ink/10 p-2 text-sm"><span>{product?.productName}</span><span>{qty}</span></div>;
+                return <div key={id} className="flex justify-between rounded border border-ink/10 p-2 text-sm"><span>{product?.productName}</span><div className="flex gap-2"><input aria-label={`Quantity for ${product?.productName}`} className="w-20 rounded border p-1" type="number" min="1" step="1" value={qty} disabled={place.isPending} onChange={event => { const quantity = Number(event.target.value); if (Number.isInteger(quantity) && quantity > 0) setCart(current => ({ ...current, [id]: quantity })); }} /><button disabled={place.isPending} type="button" aria-label={`Remove ${product?.productName}`} onClick={() => setCart(current => { const next = { ...current }; delete next[id]; return next; })}>Remove</button></div></div>;
               })}
               <div className="pt-4">
                 <div className="font-semibold">Recent orders</div>

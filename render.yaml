@@ -2,11 +2,15 @@ services:
   - type: web
     name: stockpilot-api
     runtime: docker
-    plan: free
+    plan: starter
     rootDir: backend
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /actuator/health
+    disk:
+      name: stockpilot-uploads
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: SPRING_PROFILES_ACTIVE
         value: prod
@@ -45,7 +49,7 @@ services:
       - key: SWAGGER_PUBLIC_ENABLED
         value: "false"
       - key: LOCAL_STORAGE_ROOT
-        value: /app/uploads
+        value: /var/data/uploads
       - key: SENTRY_ENABLED
         value: "false"
       - key: SENTRY_DSN

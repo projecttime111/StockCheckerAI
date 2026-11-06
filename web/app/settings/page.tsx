@@ -8,6 +8,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { BusinessMode, BusinessModeSelector } from "@/components/BusinessModeSelector";
 import { Field, PrimaryButton, SecondaryButton, TextInput } from "@/components/FormControls";
+import { MutationFeedback, QueryFeedback } from "@/components/QueryFeedback";
 import { Panel } from "@/components/Panel";
 import { api, clearSession, getSessionRole, setSession, Warehouse } from "@/lib/api";
 
@@ -118,12 +119,13 @@ export default function SettingsPage() {
 
   return (
     <AppShell title="Settings">
+      <QueryFeedback queries={[tenant, warehouses]} />
       <div className="grid gap-4 xl:grid-cols-2">
         <Panel title="Business Info">
           <form onSubmit={(event: FormEvent) => { event.preventDefault(); saveBusiness.mutate(); }} className="space-y-3">
             <Field label="Business name"><TextInput value={business.name} onChange={(e) => setBusiness({ ...business, name: e.target.value })} /></Field>
             <div className="grid gap-3 sm:grid-cols-2">
-              <Field label="Currency"><TextInput value={business.currency} onChange={(e) => setBusiness({ ...business, currency: e.target.value })} /></Field>
+              <Field label="Currency"><TextInput required pattern="[A-Z]{3}" maxLength={3} title="Three-letter currency code, for example INR or USD" value={business.currency} onChange={(e) => setBusiness({ ...business, currency: e.target.value.toUpperCase() })} /></Field>
               <div className="rounded border border-moss/20 bg-mint/60 p-3 text-sm">
                 <div className="text-xs font-semibold uppercase tracking-normal text-ink/50">Current tenant mode</div>
                 <div className="mt-1 text-base font-semibold text-moss">{business.businessMode} - {modeLabels[business.businessMode] ?? business.businessMode}</div>
@@ -136,7 +138,8 @@ export default function SettingsPage() {
             <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={business.gstEnabled} onChange={(e) => setBusiness({ ...business, gstEnabled: e.target.checked })} /> GST enabled</label>
             <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={business.allowNegativeStock} onChange={(e) => setBusiness({ ...business, allowNegativeStock: e.target.checked })} /> Allow negative stock movements</label>
             <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={business.portalShowAllActiveProducts} onChange={(e) => setBusiness({ ...business, portalShowAllActiveProducts: e.target.checked })} /> Show all active products in dealer portal when no price list is assigned</label>
-            {saveBusiness.error ? <p className="text-sm text-coral">{saveBusiness.error.message}</p> : null}
+            <MutationFeedback mutation={saveBusiness} success="Settings saved." />
+
             <PrimaryButton disabled={saveBusiness.isPending}>Save settings</PrimaryButton>
           </form>
         </Panel>
@@ -144,6 +147,7 @@ export default function SettingsPage() {
           <div className="mb-4 space-y-2">
             {(warehouses.data ?? []).map((item) => <div key={item.id} className="rounded border border-ink/10 p-3 text-sm"><div className="font-medium">{item.name}</div><div className="text-ink/50">{item.code}</div></div>)}
           </div>
+          <MutationFeedback mutation={createWarehouse} success="Warehouse added." />
           <form onSubmit={(event: FormEvent) => { event.preventDefault(); createWarehouse.mutate(); }} className="grid gap-3 sm:grid-cols-3">
             <Field label="Name"><TextInput value={warehouse.name} onChange={(e) => setWarehouse({ ...warehouse, name: e.target.value })} required /></Field>
             <Field label="Code"><TextInput value={warehouse.code} onChange={(e) => setWarehouse({ ...warehouse, code: e.target.value })} /></Field>

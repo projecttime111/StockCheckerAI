@@ -68,6 +68,7 @@ public class SmartImportCommitExecutor {
     private final SmartImportTransferService transferService;
     private final RetailCounterSaleService retailSales;
     private final SmartImportSnapshotDateService snapshotDates;
+    private final InvoiceIdentityService invoiceIdentity;
     private final EntityManager entityManager;
 
     public SmartImportCommitExecutor(
@@ -112,6 +113,7 @@ public class SmartImportCommitExecutor {
         SmartImportTransferService transferService,
         RetailCounterSaleService retailSales,
         SmartImportSnapshotDateService snapshotDates,
+        InvoiceIdentityService invoiceIdentity,
         EntityManager entityManager
     ) {
         this.sessions = sessions;
@@ -155,6 +157,7 @@ public class SmartImportCommitExecutor {
         this.transferService = transferService;
         this.retailSales = retailSales;
         this.snapshotDates = snapshotDates;
+        this.invoiceIdentity = invoiceIdentity;
         this.entityManager = entityManager;
     }
 
@@ -1232,6 +1235,7 @@ public class SmartImportCommitExecutor {
     ) {
         var customer = resolveVoucherCustomer(tenantId, voucher);
         if (customer == null) throw ApiErrors.badRequest("Customer is unresolved for sales voucher " + nullSafe(voucher.voucherNumber));
+        voucher.matchedPartyId = customer.id;
         var existing = existingSalesInvoice(tenantId, voucher, customer.id);
         if (existing != null) {
             counts.inc("duplicateSalesVouchersSkipped");
@@ -1309,6 +1313,7 @@ public class SmartImportCommitExecutor {
     ) {
         var supplier = resolveVoucherSupplier(tenantId, voucher);
         if (supplier == null) throw ApiErrors.badRequest("Supplier is unresolved for purchase voucher " + nullSafe(voucher.voucherNumber));
+        voucher.matchedPartyId = supplier.id;
         var existing = existingPurchaseInvoice(tenantId, voucher, supplier.id);
         if (existing != null) {
             counts.inc("duplicatePurchaseVouchersSkipped");
@@ -1604,6 +1609,7 @@ public class SmartImportCommitExecutor {
             throw ApiErrors.badRequest("Supplier is unresolved for debit note " + nullSafe(voucher.voucherNumber));
         }
         var partyId = customer == null ? supplier.id : customer.id;
+        voucher.matchedPartyId = partyId;
         var existing = existingFinancialAdjustment(tenantId, voucher, adjustmentType);
         var documentEntityType = adjustmentType == DomainEnums.FinancialAdjustmentType.CREDIT_NOTE
             ? DomainEnums.SmartImportEffectEntityType.CREDIT_NOTE : DomainEnums.SmartImportEffectEntityType.DEBIT_NOTE;
@@ -1805,7 +1811,7 @@ public class SmartImportCommitExecutor {
             return mapped;
         }
         var numbered = voucher.voucherNumber == null ? null
-            : salesInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, voucher.voucherNumber).orElse(null);
+            : invoiceIdentity.matchSale(tenantId, voucher.voucherNumber, voucher.voucherDate).orElse(null);
         if (numbered != null) requireSameVoucher(numbered.invoiceDate, numbered.customerId, numbered.totalAmount, voucher);
         return numbered;
     }
@@ -1818,7 +1824,7 @@ public class SmartImportCommitExecutor {
             return mapped;
         }
         var numbered = voucher.voucherNumber == null ? null
-            : purchaseInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, voucher.voucherNumber).orElse(null);
+            : invoiceIdentity.matchPurchase(tenantId, supplierId, voucher.voucherNumber, voucher.voucherDate).orElse(null);
         if (numbered != null) requireSameVoucher(numbered.invoiceDate, numbered.supplierId, numbered.totalAmount, voucher);
         return numbered;
     }

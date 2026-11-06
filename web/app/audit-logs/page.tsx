@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+import { Pagination } from "@/components/Pagination";
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { AppShell } from "@/components/AppShell";
@@ -19,7 +21,8 @@ type AuditLog = {
 };
 
 export default function AuditLogsPage() {
-  const logs = useQuery({ queryKey: ["audit-logs"], queryFn: () => api<Page<AuditLog>>("/api/audit-logs?size=75&sort=createdAt,desc") });
+  const [page, setPage] = useState(0);
+  const logs = useQuery({ queryKey: ["audit-logs", page], queryFn: () => api<Page<AuditLog>>(`/api/audit-logs?size=25&page=${page}&sort=createdAt,desc`) });
 
   return (
     <AppShell title="Audit Logs">
@@ -54,6 +57,7 @@ export default function AuditLogsPage() {
             {!(logs.data?.content ?? []).length ? <p className="py-8 text-center text-sm text-ink/55">No audit logs yet. Stock adjustments, imports, payment reminders, and invoice actions will appear here.</p> : null}
           </div>
         )}
+        <Pagination data={logs.data} page={page} onChange={setPage} />
       </Panel>
     </AppShell>
   );

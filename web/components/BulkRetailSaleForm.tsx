@@ -7,7 +7,8 @@ import type { RetailSaleDecision } from "@/components/RetailSaleReviewForm";
 
 type BulkRow = { entryDate?: string; amount: number; direction: string };
 
-export function BulkRetailSaleForm({ rows, pending, onRecord, onCancel }: {
+export function BulkRetailSaleForm({ currency = "INR", rows, pending, onRecord, onCancel }: {
+  currency?: string;
   rows: BulkRow[];
   pending: boolean;
   onRecord: (decision: RetailSaleDecision) => void;
@@ -33,7 +34,7 @@ export function BulkRetailSaleForm({ rows, pending, onRecord, onCancel }: {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h4 className="flex items-center gap-2 text-sm font-semibold"><Store size={16} />Bulk retail counter sales</h4>
-          <p className="mt-1 text-xs text-ink/60">{rows.length} selected | {dateRange(dates)} | {formatMoney(total)}</p>
+          <p className="mt-1 text-xs text-ink/60">{rows.length} selected | {dateRange(dates)} | {formatMoney(total, currency)}</p>
         </div>
         <span className="text-xs text-ink/55">Amount only | Stock unchanged</span>
       </div>
@@ -73,6 +74,6 @@ function dateRange(dates: string[]) {
   return dates[0] === dates[dates.length - 1] ? dates[0] : `${dates[0]} to ${dates[dates.length - 1]}`;
 }
 
-function formatMoney(value: number) {
-  return new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", minimumFractionDigits: 2 }).format(value);
+function formatMoney(value: number, currency: string) {
+  return new Intl.NumberFormat("en-IN", { style: "currency", currency, minimumFractionDigits: 2 }).format(value);
 }

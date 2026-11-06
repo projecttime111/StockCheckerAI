@@ -37,13 +37,13 @@ export default function OnboardingPage() {
         <section className="rounded border border-ink/10 bg-white p-6 shadow-soft">
           <div className="mb-5 flex items-center gap-3">
             <div className="flex h-11 w-11 items-center justify-center rounded bg-moss text-white"><BarChart3 /></div>
-            <div><h1 className="text-2xl font-semibold">Create a new workspace</h1><p className="text-sm text-ink/55">Your previous workspace was deleted. Set up a clean workspace to continue.</p></div>
+            <div><h1 className="text-2xl font-semibold">Create a new workspace</h1><p className="text-sm text-ink/55">Set up your business workspace to continue.</p></div>
           </div>
           <form className="space-y-4" onSubmit={(event: FormEvent) => { event.preventDefault(); createWorkspace.mutate(); }}>
             <Field label="Business name"><TextInput value={form.businessName} onChange={(event) => setForm({ ...form, businessName: event.target.value })} required /></Field>
             <div><div className="mb-2 text-sm font-medium text-ink/70">Business mode</div><BusinessModeSelector value={form.businessMode} onChange={(value: BusinessMode) => setForm({ ...form, businessMode: value })} /></div>
             <div className="grid gap-3 sm:grid-cols-2">
-              <Field label="Currency"><TextInput value={form.currency} onChange={(event) => setForm({ ...form, currency: event.target.value })} required /></Field>
+              <Field label="Currency"><TextInput pattern="[A-Z]{3}" maxLength={3} title="Three-letter currency code" value={form.currency} onChange={(event) => setForm({ ...form, currency: event.target.value.toUpperCase() })} required /></Field>
               <label className="flex items-center gap-2 pt-7 text-sm"><input type="checkbox" checked={form.gstEnabled} onChange={(event) => setForm({ ...form, gstEnabled: event.target.checked })} /> GST enabled</label>
             </div>
             {createWorkspace.error ? <p className="text-sm text-coral">{createWorkspace.error.message}</p> : null}

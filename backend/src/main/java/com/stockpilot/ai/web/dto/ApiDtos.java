@@ -72,16 +72,16 @@ public final class ApiDtos {
     }
 
     public record ProductRequest(
-        String sku,
-        @NotBlank String name,
-        String categoryName,
-        String brandName,
-        @NotBlank String unitCode,
-        String barcode,
-        String hsnCode,
+        @Size(max = 80) String sku,
+        @NotBlank @Size(max = 220) String name,
+        @Size(max = 160) String categoryName,
+        @Size(max = 160) String brandName,
+        @NotBlank @Size(max = 20) String unitCode,
+        @Size(max = 120) String barcode,
+        @Size(max = 30) String hsnCode,
         @PositiveOrZero @DecimalMax("100.00") BigDecimal gstPercentage,
-        @PositiveOrZero BigDecimal defaultPurchasePrice,
-        @PositiveOrZero BigDecimal defaultSalesPrice,
+        @PositiveOrZero @Digits(integer = 12, fraction = 12) BigDecimal defaultPurchasePrice,
+        @PositiveOrZero @Digits(integer = 12, fraction = 2) BigDecimal defaultSalesPrice,
         @PositiveOrZero BigDecimal reorderPoint,
         @PositiveOrZero BigDecimal safetyStock,
         @Min(0) Integer leadTimeDays,
@@ -121,7 +121,7 @@ public final class ApiDtos {
     }
 
     public record CustomerPaymentRequest(
-        @NotNull @Positive BigDecimal amount,
+        @NotNull @Positive @Digits(integer = 12, fraction = 2) BigDecimal amount,
         @NotNull LocalDate paymentDate,
         String mode,
         String referenceNumber,
@@ -136,7 +136,7 @@ public final class ApiDtos {
     public record PaymentReminderRequest(
         @NotNull LocalDate reminderDate,
         String reminderTime,
-        @NotNull @Positive BigDecimal amountDue,
+        @NotNull @Positive @Digits(integer = 12, fraction = 2) BigDecimal amountDue,
         String notes
     ) {
     }
@@ -149,18 +149,18 @@ public final class ApiDtos {
 
     public record InvoiceLineRequest(
         @NotNull UUID productId,
-        @NotNull @Positive BigDecimal quantity,
+        @NotNull @Positive @Digits(integer = 11, fraction = 3) BigDecimal quantity,
         UUID unitId,
-        @NotNull @Positive BigDecimal rate,
+        @NotNull @Positive @Digits(integer = 12, fraction = 2) BigDecimal rate,
         @PositiveOrZero @DecimalMax("100.00") BigDecimal taxPercentage,
-        @PositiveOrZero BigDecimal discountAmount
+        @PositiveOrZero @Digits(integer = 12, fraction = 2) BigDecimal discountAmount
     ) {
     }
 
     public record PurchaseInvoiceRequest(
         UUID supplierId,
         @NotNull UUID warehouseId,
-        @NotBlank String invoiceNumber,
+        @NotBlank @Size(max = 80) String invoiceNumber,
         @NotNull LocalDate invoiceDate,
         @NotEmpty List<@Valid InvoiceLineRequest> items
     ) {
@@ -169,7 +169,7 @@ public final class ApiDtos {
     public record SalesInvoiceRequest(
         UUID customerId,
         @NotNull UUID warehouseId,
-        @NotBlank String invoiceNumber,
+        @NotBlank @Size(max = 80) String invoiceNumber,
         @NotNull LocalDate invoiceDate,
         @NotEmpty List<@Valid InvoiceLineRequest> items
     ) {
@@ -229,13 +229,19 @@ public final class ApiDtos {
     public record AuditLogResponse(UUID id, UUID actorUserId, String action, String entityType, UUID entityId, Map<String, Object> details, Instant createdAt) {
     }
 
-    public record ForecastResponse(UUID productId, String productName, BigDecimal currentStock, BigDecimal averageDailyDemand, BigDecimal next7DaysDemand, BigDecimal next30DaysDemand, LocalDate stockoutDate) {
+    public record ForecastResponse(UUID productId, String productName, BigDecimal currentStock, BigDecimal averageDailyDemand, BigDecimal next7DaysDemand, BigDecimal next30DaysDemand, LocalDate stockoutDate, Boolean salesHistoryAvailable) {
+        public ForecastResponse(UUID productId, String productName, BigDecimal currentStock, BigDecimal averageDailyDemand, BigDecimal next7DaysDemand, BigDecimal next30DaysDemand, LocalDate stockoutDate) {
+            this(productId, productName, currentStock, averageDailyDemand, next7DaysDemand, next30DaysDemand, stockoutDate, null);
+        }
     }
 
     public record ReorderSuggestionResponse(UUID productId, String productName, BigDecimal reorderPoint, BigDecimal suggestedQuantity, String reason, String status) {
     }
 
-    public record SmartReorderSuggestion(UUID productId, String productName, UUID warehouseId, String warehouseName, BigDecimal currentStock, BigDecimal averageDailyDemand, BigDecimal last7DaysDemand, BigDecimal last30DaysDemand, LocalDate expectedStockoutDate, int supplierLeadTimeDays, BigDecimal safetyStock, BigDecimal minimumOrderQuantity, BigDecimal pendingPurchaseQuantity, BigDecimal pendingSalesQuantity, BigDecimal recommendedQuantity, String reason) {
+    public record SmartReorderSuggestion(UUID productId, String productName, UUID warehouseId, String warehouseName, BigDecimal currentStock, BigDecimal averageDailyDemand, BigDecimal last7DaysDemand, BigDecimal last30DaysDemand, LocalDate expectedStockoutDate, int supplierLeadTimeDays, BigDecimal safetyStock, BigDecimal minimumOrderQuantity, BigDecimal pendingPurchaseQuantity, BigDecimal pendingSalesQuantity, BigDecimal recommendedQuantity, String reason, Boolean salesHistoryAvailable) {
+        public SmartReorderSuggestion(UUID productId, String productName, UUID warehouseId, String warehouseName, BigDecimal currentStock, BigDecimal averageDailyDemand, BigDecimal last7DaysDemand, BigDecimal last30DaysDemand, LocalDate expectedStockoutDate, int supplierLeadTimeDays, BigDecimal safetyStock, BigDecimal minimumOrderQuantity, BigDecimal pendingPurchaseQuantity, BigDecimal pendingSalesQuantity, BigDecimal recommendedQuantity, String reason) {
+            this(productId, productName, warehouseId, warehouseName, currentStock, averageDailyDemand, last7DaysDemand, last30DaysDemand, expectedStockoutDate, supplierLeadTimeDays, safetyStock, minimumOrderQuantity, pendingPurchaseQuantity, pendingSalesQuantity, recommendedQuantity, reason, null);
+        }
     }
 
     public record DraftPurchaseOrderRequest(UUID supplierId, List<UUID> productIds) {

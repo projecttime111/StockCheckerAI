@@ -21,6 +21,7 @@ public class Product extends TenantOwnedEntity {
     public UUID baseUnitId;
     public String hsnCode;
     public BigDecimal gstPercentage = BigDecimal.ZERO;
+    @jakarta.persistence.Column(precision = 24, scale = 12)
     public BigDecimal defaultPurchasePrice = BigDecimal.ZERO;
     public BigDecimal defaultSalesPrice = BigDecimal.ZERO;
     public BigDecimal reorderPoint = BigDecimal.ZERO;

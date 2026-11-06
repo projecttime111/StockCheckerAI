@@ -8,6 +8,12 @@ public final class ForecastMath {
     private ForecastMath() {
     }
 
+    public static java.time.LocalDate stockoutDate(BigDecimal currentStock, BigDecimal dailyDemand, java.time.LocalDate today) {
+        if (currentStock.signum() <= 0) return today;
+        if (dailyDemand.signum() <= 0) return null;
+        return today.plusDays(currentStock.divide(dailyDemand, 0, RoundingMode.CEILING).longValue());
+    }
+
     public static BigDecimal averageDailyDemand(List<BigDecimal> dailySales) {
         if (dailySales == null || dailySales.isEmpty()) {
             return BigDecimal.ZERO;

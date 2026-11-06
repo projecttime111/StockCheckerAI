@@ -111,7 +111,7 @@ test("smart import Phase 4B-2D separates financial notes from confirmed physical
 test("physical return review requires product, warehouse, disposition, and exact confirmation", () => {
   assert.match(page, /Physical Return Review/);
   assert.match(returnReview, /return-review/);
-  assert.match(returnReview, /Choose product/);
+  assert.match(returnReview, /RecordPicker<Product> path="\/api\/products" label="Product"/);
   assert.match(returnReview, /Choose warehouse/);
   assert.match(returnReview, /RESTOCK_TO_AVAILABLE/);
   assert.match(returnReview, /POST RETURN STOCK/);
@@ -162,7 +162,7 @@ test("smart import Phase 4B-2E exposes confirmed balanced warehouse transfers", 
 
 test("warehouse transfer review requires scoped entities and exact confirmation", () => {
   assert.match(transferReview, /transfer-review/);
-  assert.match(transferReview, /Choose product/);
+  assert.match(transferReview, /RecordPicker<Product> path="\/api\/products" label="Product"/);
   assert.match(transferReview, /Choose source warehouse/);
   assert.match(transferReview, /Choose destination warehouse/);
   assert.match(transferReview, /POST STOCK TRANSFER/);

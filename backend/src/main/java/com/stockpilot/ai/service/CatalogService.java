@@ -22,6 +22,9 @@ public class CatalogService {
     private final Repositories.UnitRepository units;
     private final Repositories.ProductBarcodeRepository barcodes;
     private final StockLedgerService stockLedger;
+    private final ProductIntegrityService integrity;
+    private final TenantWriteLockService locks;
+    private final SensitiveDataService sensitive;
 
     public CatalogService(
         Repositories.ProductRepository products,
@@ -29,7 +32,7 @@ public class CatalogService {
         Repositories.BrandRepository brands,
         Repositories.UnitRepository units,
         Repositories.ProductBarcodeRepository barcodes,
-        StockLedgerService stockLedger
+        StockLedgerService stockLedger, ProductIntegrityService integrity, TenantWriteLockService locks, SensitiveDataService sensitive
     ) {
         this.products = products;
         this.categories = categories;
@@ -37,6 +40,7 @@ public class CatalogService {
         this.units = units;
         this.barcodes = barcodes;
         this.stockLedger = stockLedger;
+        this.integrity = integrity; this.locks = locks; this.sensitive = sensitive;
     }
 
     public Page<ApiDtos.ProductResponse> list(String query, Pageable pageable) {
@@ -65,6 +69,7 @@ public class CatalogService {
 
     @Transactional
     public ApiDtos.ProductResponse update(UUID id, ApiDtos.ProductRequest request) {
+        locks.lock(TenantContext.tenantId());
         var product = findProduct(id);
         apply(product, request);
         return response(products.save(product));
@@ -102,7 +107,9 @@ public class CatalogService {
         product.safetyStock = nvl(request.safetyStock());
         product.leadTimeDays = request.leadTimeDays() == null ? 7 : request.leadTimeDays();
         product.minimumOrderQuantity = nvl(request.minimumOrderQuantity());
-        product.baseUnitId = getOrCreateUnit(request.unitCode()).id;
+        var newUnitId = getOrCreateUnit(request.unitCode()).id;
+        integrity.assertBaseUnitChangeAllowed(product, newUnitId);
+        product.baseUnitId = newUnitId;
         product.categoryId = request.categoryName() == null || request.categoryName().isBlank() ? null : getOrCreateCategory(request.categoryName()).id;
         product.brandId = request.brandName() == null || request.brandName().isBlank() ? null : getOrCreateBrand(request.brandName()).id;
         var saved = products.save(product);
@@ -173,7 +180,7 @@ public class CatalogService {
             barcode,
             product.hsnCode,
             product.gstPercentage,
-            product.defaultPurchasePrice,
+            sensitive.cost(product.defaultPurchasePrice),
             product.defaultSalesPrice,
             product.reorderPoint,
             stock,

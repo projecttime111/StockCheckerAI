@@ -26,6 +26,9 @@ public class SalesService {
     private final Repositories.WarehouseRepository warehouses;
     private final StockLedgerService stockLedger;
     private final AuditService auditService;
+    private final InvoiceIdentityService identity;
+    private final TenantWriteLockService locks;
+    private final SensitiveDataService sensitive;
 
     public SalesService(
         Repositories.SalesInvoiceRepository invoices,
@@ -34,7 +37,8 @@ public class SalesService {
         Repositories.CustomerRepository customers,
         Repositories.WarehouseRepository warehouses,
         StockLedgerService stockLedger,
-        AuditService auditService
+        AuditService auditService,
+        InvoiceIdentityService identity, TenantWriteLockService locks, SensitiveDataService sensitive
     ) {
         this.invoices = invoices;
         this.items = items;
@@ -43,6 +47,7 @@ public class SalesService {
         this.warehouses = warehouses;
         this.stockLedger = stockLedger;
         this.auditService = auditService;
+        this.identity = identity; this.locks = locks; this.sensitive = sensitive;
     }
 
     public Page<ApiDtos.InvoiceResponse> list(Pageable pageable) {
@@ -56,7 +61,8 @@ public class SalesService {
     @Transactional
     public ApiDtos.InvoiceResponse create(ApiDtos.SalesInvoiceRequest request) {
         var tenantId = TenantContext.tenantId();
-        if (invoices.existsByTenantIdAndInvoiceNumberIgnoreCase(tenantId, request.invoiceNumber())) {
+        locks.lock(tenantId);
+        if (identity.matchSale(tenantId, request.invoiceNumber(), request.invoiceDate()).isPresent()) {
             throw ApiErrors.conflict("Sales invoice number already exists");
         }
         if (request.customerId() != null) {
@@ -87,7 +93,7 @@ public class SalesService {
         invoice.tenantId = tenantId;
         invoice.customerId = request.customerId();
         invoice.warehouseId = request.warehouseId();
-        invoice.invoiceNumber = request.invoiceNumber();
+        invoice.invoiceNumber = request.invoiceNumber().trim();
         invoice.invoiceDate = request.invoiceDate();
         invoices.save(invoice);
 
@@ -96,14 +102,14 @@ public class SalesService {
         BigDecimal discount = BigDecimal.ZERO;
         for (var line : request.items()) {
             var product = productById.get(line.productId());
-            var lineSubtotal = line.quantity().multiply(line.rate());
-            var lineDiscount = line.discountAmount() == null ? BigDecimal.ZERO : line.discountAmount();
+            var lineSubtotal = MoneyMath.storedAmount(line.quantity().multiply(line.rate()));
+            var lineDiscount = MoneyMath.amount(line.discountAmount());
             if (lineDiscount.compareTo(lineSubtotal) > 0) {
                 throw ApiErrors.badRequest("Discount cannot exceed line subtotal for " + product.name);
             }
             var taxable = lineSubtotal.subtract(lineDiscount).max(BigDecimal.ZERO);
             var taxRate = line.taxPercentage() == null ? nvl(product.gstPercentage) : line.taxPercentage();
-            var lineTax = taxable.multiply(taxRate).divide(BigDecimal.valueOf(100));
+            var lineTax = MoneyMath.amount(taxable.multiply(taxRate).divide(BigDecimal.valueOf(100)));
             var item = new SalesInvoiceItem();
             item.tenantId = tenantId;
             item.salesInvoiceId = invoice.id;
@@ -115,7 +121,7 @@ public class SalesService {
             item.taxPercentage = taxRate;
             item.discountAmount = lineDiscount;
             item.taxAmount = lineTax;
-            item.lineTotal = taxable.add(lineTax);
+            item.lineTotal = MoneyMath.storedAmount(taxable.add(lineTax));
             items.save(item);
             subtotal = subtotal.add(lineSubtotal);
             tax = tax.add(lineTax);
@@ -123,10 +129,10 @@ public class SalesService {
             var sourceUnitCost = item.costRate.multiply(stockLedger.toBaseQuantity(tenantId, product, item.unitId, BigDecimal.ONE));
             stockLedger.createMovement(tenantId, product.id, request.warehouseId(), DomainEnums.MovementType.SALE, line.quantity(), item.unitId, sourceUnitCost, "SALES_INVOICE", invoice.id, request.invoiceDate().atStartOfDay().toInstant(ZoneOffset.UTC), "Sale " + request.invoiceNumber());
         }
-        invoice.subtotal = subtotal;
-        invoice.taxAmount = tax;
-        invoice.discountAmount = discount;
-        invoice.totalAmount = subtotal.subtract(discount).add(tax);
+        invoice.subtotal = MoneyMath.storedAmount(subtotal);
+        invoice.taxAmount = MoneyMath.storedAmount(tax);
+        invoice.discountAmount = MoneyMath.storedAmount(discount);
+        invoice.totalAmount = MoneyMath.storedAmount(subtotal.subtract(discount).add(tax));
         invoices.save(invoice);
         auditService.logCurrent("SALES_INVOICE_CREATED", "SalesInvoice", invoice.id, Map.of("invoiceNumber", invoice.invoiceNumber, "total", invoice.totalAmount));
         return response(invoice);

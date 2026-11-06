@@ -7,6 +7,9 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { EmptyState } from "@/components/EmptyState";
 import { Field, PrimaryButton, SecondaryButton, SelectInput } from "@/components/FormControls";
+import { useAccess } from "@/lib/business";
+import { Pagination } from "@/components/Pagination";
+import { QueryFeedback, MutationFeedback } from "@/components/QueryFeedback";
 import { Panel } from "@/components/Panel";
 import { api, Page } from "@/lib/api";
 
@@ -71,6 +74,8 @@ const voucherModeLabels: Record<Exclude<VoucherStockImpactMode, "BLOCK_IF_SNAPSH
 };
 
 export default function ImportsPage() {
+  const { can } = useAccess();
+  const [page, setPage] = useState(0);
   const queryClient = useQueryClient();
   const [sourceType, setSourceType] = useState("CSV");
   const [file, setFile] = useState<File | null>(null);
@@ -94,11 +99,11 @@ export default function ImportsPage() {
   });
 
   const tenant = useQuery({ queryKey: ["tenant"], queryFn: () => api<Tenant>("/api/tenants/current") });
-  const batches = useQuery({ queryKey: ["imports"], queryFn: () => api<Page<ImportBatch>>("/api/imports?size=20") });
+  const batches = useQuery({ queryKey: ["imports", page], queryFn: () => api<Page<ImportBatch>>(`/api/imports?size=20&page=${page}`) });
   const preview = useQuery({ queryKey: ["imports", batchId, "preview"], enabled: !!batchId, queryFn: () => api<PreviewRow[]>(`/api/imports/${batchId}/preview`) });
   const errors = useQuery({ queryKey: ["imports", batchId, "errors"], enabled: !!batchId, queryFn: () => api<ImportError[]>(`/api/imports/${batchId}/errors`) });
   const reconciliation = useQuery({ queryKey: ["imports", batchId, "reconciliation"], enabled: !!batchId, queryFn: () => api<Reconciliation>(`/api/imports/${batchId}/reconciliation`) });
-  const undoPreview = useQuery({ queryKey: ["imports", batchId, "undo-preview"], enabled: !!batchId, queryFn: () => api<UndoPreview>(`/api/imports/${batchId}/undo-preview`) });
+  const undoPreview = useQuery({ queryKey: ["imports", batchId, "undo-preview"], enabled: !!batchId && can("imports.rollback"), queryFn: () => api<UndoPreview>(`/api/imports/${batchId}/undo-preview`) });
 
   const sourceColumns = useMemo(() => {
     const columns = new Set<string>();
@@ -253,6 +258,8 @@ export default function ImportsPage() {
 
   return (
     <AppShell title="Imports" actions={<Link className="focus-ring inline-flex h-10 items-center gap-2 rounded bg-moss px-4 text-sm font-semibold text-white" href="/imports/smart"><Layers3 size={16} />Smart Import</Link>}>
+      <QueryFeedback queries={[batches, preview, errors, reconciliation]} />
+      <MutationFeedback mutation={commit} success="Import committed. Business records refreshed." />
       <div className="grid gap-4 xl:grid-cols-[360px_1fr]">
         <div className="space-y-4">
           <Panel title="Import Companion Data">
@@ -281,7 +288,7 @@ export default function ImportsPage() {
               </Field>
               <input className="block w-full text-sm" type="file" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
               {upload.error ? <p className="text-sm text-coral">{upload.error.message}</p> : null}
-              <PrimaryButton className="w-full" disabled={upload.isPending}>{upload.isPending ? "Uploading..." : "Upload and preview"}</PrimaryButton>
+              <PrimaryButton className="w-full" disabled={!can("imports.upload") || upload.isPending}>{upload.isPending ? "Uploading..." : "Upload and preview"}</PrimaryButton>
             </form>
           </Panel>
           <Panel title="Recent Batches">
@@ -297,12 +304,13 @@ export default function ImportsPage() {
                   </button>
                   <div className="mt-3 flex flex-wrap gap-2">
                     <SecondaryButton onClick={() => selectBatch(batch)}>View reconciliation</SecondaryButton>
-                    <SecondaryButton onClick={() => selectBatch(batch)} disabled={batch.status !== "COMMITTED"}>Undo import</SecondaryButton>
+                    <SecondaryButton onClick={() => selectBatch(batch)} disabled={!can("imports.rollback") || batch.status !== "COMMITTED"}>Undo import</SecondaryButton>
                   </div>
                 </div>
               ))}
-              {!recentBatches.length ? <EmptyState title="No imports yet.">Upload a Tally, Excel, CSV, XML, or JSON export to create the first staged import batch for this backend tenant.</EmptyState> : null}
+              {!batches.error && !batches.isLoading && !recentBatches.length ? <EmptyState title="No imports yet.">Upload a Tally, Excel, CSV, XML, or JSON export to create the first staged import batch for this backend tenant.</EmptyState> : null}
             </div>
+            <Pagination data={batches.data} page={page} onChange={setPage} />
           </Panel>
         </div>
 
@@ -360,10 +368,10 @@ export default function ImportsPage() {
                     <input className="w-full rounded border border-ink/15 px-3 py-2" value={undoConfirmation} onChange={(event) => setUndoConfirmation(event.target.value)} />
                   </Field>
                   <div className="flex flex-wrap gap-2">
-                    <SecondaryButton onClick={() => undoImport.mutate()} disabled={undoConfirmation !== "UNDO IMPORT" || undoImport.isPending || !undoPreview.data?.canUndo}>
+                    <SecondaryButton onClick={() => undoImport.mutate()} disabled={!can("imports.rollback") || undoConfirmation !== "UNDO IMPORT" || undoImport.isPending || !undoPreview.data?.canUndo}>
                       {undoImport.isPending ? "Rolling back..." : "Undo Import"}
                     </SecondaryButton>
-                    <PrimaryButton onClick={() => replaceImport.mutate()} disabled={undoConfirmation !== "UNDO IMPORT" || replaceImport.isPending || !undoPreview.data?.canUndo}>
+                    <PrimaryButton onClick={() => replaceImport.mutate()} disabled={!can("imports.rollback") || undoConfirmation !== "UNDO IMPORT" || replaceImport.isPending || !undoPreview.data?.canUndo}>
                       {replaceImport.isPending ? "Rolling back..." : "Undo and upload replacement"}
                     </PrimaryButton>
                   </div>
@@ -376,7 +384,7 @@ export default function ImportsPage() {
           ) : null}
 
           {batchId ? (
-            <Panel title="Column Mapping" action={<SecondaryButton onClick={() => applyMapping.mutate()} disabled={applyMapping.isPending || !sourceColumns.length}>{applyMapping.isPending ? "Saving..." : "Apply mapping"}</SecondaryButton>}>
+            <Panel title="Column Mapping" action={<SecondaryButton onClick={() => applyMapping.mutate()} disabled={!can("imports.map") || applyMapping.isPending || !sourceColumns.length}>{applyMapping.isPending ? "Saving..." : "Apply mapping"}</SecondaryButton>}>
               {!sourceColumns.length ? <p className="text-sm text-ink/55">No source columns were detected for this batch.</p> : (
                 <div className="grid gap-3 md:grid-cols-2">
                   {mappingFields.map(([target, label]) => (
@@ -492,7 +500,7 @@ export default function ImportsPage() {
             </Panel>
           ) : null}
 
-          <Panel title="Preview" action={batchId ? <div className="flex gap-2"><SecondaryButton onClick={() => validate.mutate()} disabled={validate.isPending}>Validate</SecondaryButton><PrimaryButton onClick={() => commit.mutate()} disabled={commit.isPending || hasUnresolvedBlockingErrors || (requiresStockImpactConfirmation && !confirmStockMovementsAfterSnapshot)}>Commit</PrimaryButton></div> : null}>
+          <Panel title="Preview" action={batchId ? <div className="flex gap-2"><SecondaryButton onClick={() => validate.mutate()} disabled={!can("imports.validate") || validate.isPending}>Validate</SecondaryButton><PrimaryButton onClick={() => commit.mutate()} disabled={!can("imports.commit") || commit.isPending || hasUnresolvedBlockingErrors || (requiresStockImpactConfirmation && !confirmStockMovementsAfterSnapshot)}>Commit</PrimaryButton></div> : null}>
             {!batchId ? <p className="text-sm text-ink/55">Upload or select a batch to inspect staged rows.</p> : (
               <div>
                 {isSnapshotBatch ? (

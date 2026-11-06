@@ -8,8 +8,11 @@ import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/ErrorState";
 import { Field, PrimaryButton, TextInput } from "@/components/FormControls";
 import { LoadingState } from "@/components/LoadingState";
+import { Pagination } from "@/components/Pagination";
+import { MutationFeedback } from "@/components/QueryFeedback";
 import { Panel } from "@/components/Panel";
-import { api, money, Page, Product } from "@/lib/api";
+import { api, Page, Product } from "@/lib/api";
+import { Permission, useMoney } from "@/lib/business";
 
 const blank = {
   sku: "",
@@ -29,10 +32,12 @@ const blank = {
 };
 
 export default function ProductsPage() {
+  const money = useMoney();
   const queryClient = useQueryClient();
   const [query, setQuery] = useState("");
+  const [page, setPage] = useState(0);
   const [form, setForm] = useState(blank);
-  const products = useQuery({ queryKey: ["products", query], queryFn: () => api<Page<Product>>(`/api/products?size=100${query ? `&query=${encodeURIComponent(query)}` : ""}`) });
+  const products = useQuery({ queryKey: ["products", query, page], queryFn: () => api<Page<Product>>(`/api/products?size=25&page=${page}${query ? `&query=${encodeURIComponent(query)}` : ""}`) });
   const create = useMutation({
     mutationFn: () => api<Product>("/api/products", {
       method: "POST",
@@ -61,7 +66,7 @@ export default function ProductsPage() {
   return (
     <AppShell title="Products">
       <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
-        <Panel title="Product Catalog" action={<input className="focus-ring h-10 rounded border border-ink/15 px-3 text-sm" placeholder="Search products" value={query} onChange={(e) => setQuery(e.target.value)} />}>
+        <Panel title="Product Catalog" action={<input className="focus-ring h-10 rounded border border-ink/15 px-3 text-sm" placeholder="Search products" value={query} onChange={(e) => { setQuery(e.target.value); setPage(0); }} />}>
           {products.isLoading ? <LoadingState /> : products.error ? <ErrorState error={products.error} /> : products.data?.content.length ? (
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm">
@@ -81,9 +86,10 @@ export default function ProductsPage() {
               </table>
             </div>
           ) : <EmptyState label="No products yet" />}
+        <Pagination data={products.data} page={page} onChange={setPage} />
         </Panel>
 
-        <Panel title="Add Product" action={<Plus size={18} />}>
+        <Permission permission="products.create"><Panel title="Add Product" action={<Plus size={18} />}>
           <form onSubmit={submit} className="space-y-3">
             <Field label="Name"><TextInput value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required /></Field>
             <div className="grid grid-cols-2 gap-3">
@@ -103,10 +109,11 @@ export default function ProductsPage() {
               <Field label="GST %"><TextInput value={form.gstPercentage} onChange={(e) => setForm({ ...form, gstPercentage: e.target.value })} type="number" /></Field>
               <Field label="Reorder point"><TextInput value={form.reorderPoint} onChange={(e) => setForm({ ...form, reorderPoint: e.target.value })} type="number" /></Field>
             </div>
-            {create.error ? <p className="text-sm text-coral">{create.error.message}</p> : null}
+            <MutationFeedback mutation={create} success="Product saved." />
+
             <PrimaryButton className="w-full" disabled={create.isPending}>{create.isPending ? "Saving..." : "Save product"}</PrimaryButton>
           </form>
-        </Panel>
+        </Panel></Permission>
       </div>
     </AppShell>
   );

@@ -25,6 +25,9 @@ public class DataQualityService {
     private final CatalogService catalog;
     private final StockLedgerService stockLedger;
     private final AuditService audit;
+    private final ProductIntegrityService integrity;
+    private final TenantWriteLockService locks;
+    private final SalesHistoryService history;
 
     public DataQualityService(
         Repositories.ProductRepository products,
@@ -35,7 +38,7 @@ public class DataQualityService {
         ProductCategorizationService categorization,
         CatalogService catalog,
         StockLedgerService stockLedger,
-        AuditService audit
+        AuditService audit, ProductIntegrityService integrity, TenantWriteLockService locks, SalesHistoryService history
     ) {
         this.products = products;
         this.barcodes = barcodes;
@@ -46,6 +49,7 @@ public class DataQualityService {
         this.catalog = catalog;
         this.stockLedger = stockLedger;
         this.audit = audit;
+        this.integrity = integrity; this.locks = locks; this.history = history;
     }
 
     public ApiDtos.DataQualitySummary summary() {
@@ -53,10 +57,11 @@ public class DataQualityService {
         var productRows = products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId);
         var missing = missingFields().size();
         var duplicateGroups = duplicates().size();
+        var salesHistory = history.history(tenantId);
         var noRecentSales = productRows.stream()
             .filter(product -> stockLedger.currentStock(tenantId, product.id, null).compareTo(BigDecimal.ZERO) > 0)
-            .filter(product -> movements.findFirstByTenantIdAndProductIdAndMovementTypeOrderByMovementDateDesc(tenantId, product.id, com.stockpilot.ai.domain.DomainEnums.MovementType.SALE)
-                .map(movement -> movement.movementDate.atZone(ZoneOffset.UTC).toLocalDate().isBefore(LocalDate.now(ZoneOffset.UTC).minusDays(90)))
+            .filter(product -> Optional.ofNullable(salesHistory.lastSale(product.id, null, LocalDate.now(ZoneOffset.UTC)))
+                .map(date -> date.isBefore(LocalDate.now(ZoneOffset.UTC).minusDays(90)))
                 .orElse(true))
             .count();
         var purchaseCostProductIds = purchaseItems.findByTenantId(tenantId).stream()
@@ -126,11 +131,16 @@ public class DataQualityService {
         if (!"MERGE PRODUCTS".equals(request.confirmation())) {
             throw ApiErrors.badRequest("Type MERGE PRODUCTS to confirm duplicate product merge");
         }
+        locks.lock(tenantId);
         var target = products.findByTenantIdAndId(tenantId, request.targetProductId()).orElseThrow(() -> ApiErrors.notFound("Target product not found"));
         var merged = 0;
         for (var sourceId : request.sourceProductIds()) {
             if (sourceId.equals(target.id)) continue;
             var source = products.findByTenantIdAndId(tenantId, sourceId).orElseThrow(() -> ApiErrors.notFound("Source product not found"));
+            integrity.prepareMerge(source, target);
+            if (stockLedger.latestCost(tenantId, source.id, source.defaultPurchasePrice).compareTo(stockLedger.latestCost(tenantId, target.id, target.defaultPurchasePrice)) != 0) {
+                throw ApiErrors.conflict("Products with different stock cost bases must be reconciled before merging");
+            }
             products.moveStockMovements(tenantId, source.id, target.id);
             products.moveSalesInvoiceItems(tenantId, source.id, target.id);
             products.movePurchaseInvoiceItems(tenantId, source.id, target.id);

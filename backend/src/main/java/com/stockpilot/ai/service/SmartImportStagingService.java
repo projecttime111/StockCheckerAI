@@ -13,8 +13,6 @@ import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -22,12 +20,6 @@ import java.util.stream.Collectors;
 public class SmartImportStagingService {
     private static final BigDecimal ZERO = BigDecimal.ZERO;
     private static final int PREVIEW_LIMIT = 100;
-    private static final List<DateTimeFormatter> DATE_FORMATS = List.of(
-        DateTimeFormatter.BASIC_ISO_DATE,
-        DateTimeFormatter.ISO_LOCAL_DATE,
-        DateTimeFormatter.ofPattern("d-M-uuuu"),
-        DateTimeFormatter.ofPattern("d/M/uuuu")
-    );
 
     private final Repositories.ImportSessionRepository sessions;
     private final Repositories.ImportSessionFileRepository files;
@@ -64,6 +56,7 @@ public class SmartImportStagingService {
     private final AuditService audit;
     private final RetailCounterSaleService retailSales;
     private final SmartImportCashbookMatchingService cashbookMatching;
+    private final InvoiceIdentityService invoiceIdentity;
 
     public SmartImportStagingService(
         Repositories.ImportSessionRepository sessions,
@@ -100,7 +93,8 @@ public class SmartImportStagingService {
         ObjectStorageService storage,
         AuditService audit,
         RetailCounterSaleService retailSales,
-        SmartImportCashbookMatchingService cashbookMatching
+        SmartImportCashbookMatchingService cashbookMatching,
+        InvoiceIdentityService invoiceIdentity
     ) {
         this.sessions = sessions;
         this.files = files;
@@ -137,6 +131,7 @@ public class SmartImportStagingService {
         this.audit = audit;
         this.retailSales = retailSales;
         this.cashbookMatching = cashbookMatching;
+        this.invoiceIdentity = invoiceIdentity;
     }
 
     @Transactional
@@ -173,10 +168,18 @@ public class SmartImportStagingService {
             }
             try {
                 var rows = parser.parse(session.tenantId, session.id, file);
+                boolean invalidBounds = false;
+                for (int rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
+                    for (var violation : ImportFieldBounds.validate(rows.get(rowIndex))) {
+                        parseFailures.add(new ParseFailure(file, rowIndex + 1, "FINAL_FIELD_BOUNDS", violation.message()));
+                        invalidBounds = true;
+                    }
+                }
+                if (invalidBounds) continue;
                 stageRows(session, file, rows, productIndex, partyIndex, warehouseIndex, unitIndex, voucherIndex,
                     resolutionMap);
             } catch (Exception ex) {
-                parseFailures.add(new ParseFailure(file, safeMessage(ex)));
+                parseFailures.add(new ParseFailure(file, 0, "STAGING_PARSE_FAILED", safeMessage(ex)));
             }
         }
 
@@ -648,7 +651,7 @@ public class SmartImportStagingService {
         var voucherNumber = lookup(row, "Voucher Number", "Voucher No", "Invoice Number", "Invoice No");
         var voucherDate = date(lookup(row, "Voucher Date", "Date", "Invoice Date"));
         var partyName = lookup(row, "Party Name", "Customer", "Supplier", "Ledger Name");
-        var voucherKey = normalize(voucherType) + "|" + normalize(voucherNumber) + "|" + voucherDate + "|" + normalizeName(partyName);
+        var voucherKey = file.id + "|" + normalize(voucherType) + "|" + normalize(voucherNumber) + "|" + voucherDate + "|" + normalizeName(partyName);
         if (voucherNumber == null || voucherNumber.isBlank()) {
             voucherKey += "|ROW:" + rowNumber;
         }
@@ -1315,7 +1318,9 @@ public class SmartImportStagingService {
         var snapshots = stagedSnapshots.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id);
         var latestSnapshotDate = snapshots.stream().map(row -> row.snapshotDate).filter(Objects::nonNull).max(LocalDate::compareTo).orElse(null);
         var hasSnapshot = !snapshots.isEmpty();
-        var seenFingerprints = new HashSet<String>();
+        var documentContents = new HashMap<String, String>();
+        var voucherItems = stagedVoucherItems.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(session.tenantId, session.id)
+            .stream().collect(Collectors.groupingBy(item -> item.stagedVoucherId));
         var vouchers = stagedVouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(session.tenantId, session.id);
         for (var row : vouchers) {
             if (excludedVoucher(row)) {
@@ -1331,8 +1336,19 @@ public class SmartImportStagingService {
                 : latestSnapshotDate != null && row.voucherDate != null && row.voucherDate.isAfter(latestSnapshotDate)
                     ? DomainEnums.SmartVoucherStockImpactSuggestion.APPLY_AFTER_SNAPSHOT_DATE
                     : DomainEnums.SmartVoucherStockImpactSuggestion.CREATE_INVOICES_ONLY;
-            var repeatedInSession = row.fingerprint != null && !seenFingerprints.add(row.fingerprint);
+            var identity = normalize(row.voucherType) + "|" + normalize(row.voucherNumber) + "|" + row.voucherDate + "|" + normalizeName(row.partyName);
+            var contents = row.totalAmount + "|" + voucherItems.getOrDefault(row.id, List.of()).stream()
+                .map(item -> normalizeName(item.productName) + "|" + normalizeUnit(item.unitCode) + "|"
+                    + nvl(item.quantity).stripTrailingZeros() + "|" + nvl(item.rate).stripTrailingZeros() + "|"
+                    + nvl(item.amount).stripTrailingZeros() + "|" + normalizeName(item.warehouseName))
+                .sorted().collect(Collectors.joining(";"));
+            var previous = documentContents.putIfAbsent(identity, contents);
+            var repeatedInSession = previous != null && previous.equals(contents);
             updateVoucherMatch(session.tenantId, row, party, repeatedInSession);
+            if (previous != null && !previous.equals(contents)) {
+                row.matchStatus = DomainEnums.SmartMatchStatus.AMBIGUOUS_REVIEW;
+                row.reviewStatus = DomainEnums.SmartReviewStatus.PENDING;
+            }
         }
         stagedVouchers.saveAll(vouchers);
 
@@ -1406,8 +1422,8 @@ public class SmartImportStagingService {
         issues.saveAll(phaseIssues);
 
         for (var failure : parseFailures) {
-            generated.add(reviewIssue(session, failure.file.id, 0, DomainEnums.ImportPlanIssueSeverity.ERROR,
-                "STAGING_PARSE_FAILED", "The classified file could not be parsed into canonical staging: " + failure.message,
+            generated.add(reviewIssue(session, failure.file.id, failure.rowNumber, DomainEnums.ImportPlanIssueSeverity.ERROR,
+                failure.code, "The classified file could not be parsed into canonical staging: " + failure.message,
                 "Correct the source file or override its file type, then rebuild staging.",
                 fileTypeChoices(), Map.of("resolutionKey", "FILE_TYPE:" + failure.file.id, "entityType", "FILE")));
         }
@@ -1763,7 +1779,7 @@ public class SmartImportStagingService {
     }
 
     private ExistingVoucherStatus existingVoucherStatus(UUID tenantId, SmartStagedVoucher voucher) {
-        if (voucher.voucherNumber == null) return ExistingVoucherStatus.NONE;
+        if (voucher.voucherNumber == null || voucher.voucherDate == null) return ExistingVoucherStatus.NONE;
         var normalized = normalize(voucher.voucherType);
         if (normalized.contains("DEBIT")) {
             return financialAdjustments.findByTenantIdAndAdjustmentTypeAndVoucherNumberIgnoreCase(
@@ -1780,13 +1796,13 @@ public class SmartImportStagingService {
                 .orElse(ExistingVoucherStatus.NONE);
         }
         if (normalized.contains("PURCHASE")) {
-            return purchaseInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, voucher.voucherNumber)
+            return invoiceIdentity.matchPurchase(tenantId, voucher.matchedPartyId, voucher.voucherNumber, voucher.voucherDate)
                 .map(invoice -> sameVoucher(invoice.invoiceDate, invoice.supplierId, invoice.totalAmount, voucher)
                     ? ExistingVoucherStatus.EXACT_DUPLICATE : ExistingVoucherStatus.AMBIGUOUS_CONFLICT)
                 .orElse(ExistingVoucherStatus.NONE);
         }
         if (normalized.contains("SALES") || normalized.contains("SALE")) {
-            return salesInvoices.findByTenantIdAndInvoiceNumberIgnoreCase(tenantId, voucher.voucherNumber)
+            return invoiceIdentity.matchSale(tenantId, voucher.voucherNumber, voucher.voucherDate)
                 .map(invoice -> sameVoucher(invoice.invoiceDate, invoice.customerId, invoice.totalAmount, voucher)
                     ? ExistingVoucherStatus.EXACT_DUPLICATE : ExistingVoucherStatus.AMBIGUOUS_CONFLICT)
                 .orElse(ExistingVoucherStatus.NONE);
@@ -2027,11 +2043,7 @@ public class SmartImportStagingService {
     }
 
     private LocalDate date(String value) {
-        if (value == null || value.isBlank()) return null;
-        for (var format : DATE_FORMATS) {
-            try { return LocalDate.parse(value.trim(), format); } catch (DateTimeParseException ignored) { }
-        }
-        return null;
+        return ImportDates.parse(value);
     }
 
     private Integer integer(String value) {
@@ -2121,5 +2133,5 @@ public class SmartImportStagingService {
         return message == null || message.isBlank() ? "invalid file content" : message.replaceAll("[\\r\\n]+", " ");
     }
 
-    private record ParseFailure(ImportSessionFile file, String message) { }
+    private record ParseFailure(ImportSessionFile file, int rowNumber, String code, String message) { }
 }

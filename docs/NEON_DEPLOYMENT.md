@@ -156,9 +156,9 @@ starts the executable Spring Boot JAR. Render supplies `PORT`; the backend alrea
 uses it.
 
 The root [`render.yaml`](../render.yaml) is an optional Blueprint for a new service.
-It uses Render's free plan to avoid automatically selecting a paid instance. For
-real production traffic, upgrade the service: free instances sleep when idle and
-their filesystem is ephemeral.
+It declares Render's paid `starter` plan and a 1 GB persistent disk mounted at
+`/var/data`. Uploads use `/var/data/uploads`. Applying this Blueprint creates paid
+resources; editing the file alone does not deploy or change an existing service.
 
 ### Required Render variables
 
@@ -211,7 +211,7 @@ APP_AUTH_REQUIRE_EMAIL_VERIFICATION=true
 APP_DEMO_SEED_ENABLED=false
 APP_DEV_TOOLS_ENABLED=false
 SWAGGER_PUBLIC_ENABLED=false
-LOCAL_STORAGE_ROOT=/app/uploads
+LOCAL_STORAGE_ROOT=/var/data/uploads
 ```
 
 Do not add `PORT`; Render creates it. Do not add Redis, RabbitMQ, or MinIO variables
@@ -377,19 +377,55 @@ contain placeholders only.
 
 ## 7. Upload persistence
 
-Neon persists database records, but the current upload implementation writes files
-under `/app/uploads`.
+Neon persists database records. The supplied Blueprint stores original import
+files under `/var/data/uploads` on its persistent disk. Existing services must
+also have the disk mounted at `/var/data` and `LOCAL_STORAGE_ROOT` set to that
+uploads directory; changing an environment variable alone does not create a disk.
 
-Render free services lose local files on restart, redeploy, or idle spin-down.
-Imports that must survive those events need either:
+Before switching an existing service, copy any files still on its old filesystem
+to the durable upload directory. Do not discard them: staged imports retain their
+storage keys and need the original files for remapping and review.
 
-1. a paid Render service with a persistent disk mounted at `/app/uploads`, or
-2. a future S3-compatible object-storage implementation.
-
-This limitation does not erase Neon rows, but a staged import can lose its original
-uploaded file.
+After deployment, upload a small test import, restart the service, and verify the
+same staged file can still be read/remapped. Repeat after a redeploy. This checks
+retention on the actual host; local tests cannot establish hosted durability.
+Keep backups of both database records and uploaded files. A future S3-compatible
+storage adapter can replace the disk when multiple application instances are needed.
 
 ## 8. Deployment order and smoke test
+
+### Invoice identity migration preflight
+
+V24 scopes purchase invoice numbers by supplier and April-March financial year,
+and sales numbers by financial year. Both indexes ignore case and surrounding
+spaces. Before upgrading a populated database, run these read-only checks:
+
+```sql
+select tenant_id, supplier_id,
+       extract(year from invoice_date)::int -
+         case when extract(month from invoice_date) < 4 then 1 else 0 end as fiscal_year,
+       lower(btrim(invoice_number)) as normalized_number, count(*)
+from purchase_invoices
+group by 1, 2, 3, 4
+having count(*) > 1;
+
+select tenant_id,
+       extract(year from invoice_date)::int -
+         case when extract(month from invoice_date) < 4 then 1 else 0 end as fiscal_year,
+       lower(btrim(invoice_number)) as normalized_number, count(*)
+from sales_invoices
+group by 1, 2, 3
+having count(*) > 1;
+```
+
+If either query returns rows, review the original documents and resolve their
+identities with the data owner before migration. Do not delete or renumber
+financial records automatically. Back up the database first. V24 increases unit
+cost precision; it cannot recover precision already lost in historical values.
+V25 stores original classic-import rows for future remapping; previously discarded
+rows require re-upload from the original file.
+
+### Deploy and verify
 
 1. Push the cleaned repository to the new GitHub remote.
 2. Configure Render with the backend variables and deploy.

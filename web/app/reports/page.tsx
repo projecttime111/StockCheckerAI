@@ -5,7 +5,8 @@ import { useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { PrimaryButton } from "@/components/FormControls";
 import { Panel } from "@/components/Panel";
-import { API_URL, DEMO_MODE, api, getToken } from "@/lib/api";
+import { apiText } from "@/lib/api";
+import { Permission, useAccess } from "@/lib/business";
 
 const reports = [
   { id: "current-stock", name: "Current Stock", description: "Warehouse-wise quantity and stock value from the ledger." },
@@ -23,6 +24,7 @@ const reports = [
 ];
 
 export default function ReportsPage() {
+  const { can } = useAccess();
   const [downloading, setDownloading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -30,7 +32,7 @@ export default function ReportsPage() {
     setDownloading(reportId);
     setError(null);
     try {
-      const csv = DEMO_MODE ? await api<string>(`/api/reports/export/${reportId}?format=csv`) : await fetchReport(reportId);
+      const csv = await apiText(`/api/reports/export/${reportId}?format=csv`);
       const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -49,6 +51,7 @@ export default function ReportsPage() {
     <AppShell title="Reports">
       <div className="space-y-4">
         <Panel title="Export Reports">
+          {!can("reports.export") ? <p className="mb-4 text-sm text-ink/60">Your role can view report descriptions. Ask an authorized exporter for CSV files.</p> : null}
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
             {reports.map((report) => (
               <div key={report.id} className="rounded border border-ink/10 p-4">
@@ -61,10 +64,10 @@ export default function ReportsPage() {
                     <p className="mt-1 min-h-10 text-sm text-ink/55">{report.description}</p>
                   </div>
                 </div>
-                <PrimaryButton className="mt-4 w-full gap-2" onClick={() => download(report.id)} disabled={downloading === report.id}>
+                <Permission permission="reports.export"><PrimaryButton className="mt-4 w-full gap-2" onClick={() => download(report.id)} disabled={downloading === report.id}>
                   <Download size={16} />
                   {downloading === report.id ? "Preparing..." : "Download CSV"}
-                </PrimaryButton>
+                </PrimaryButton></Permission>
               </div>
             ))}
           </div>
@@ -73,16 +76,4 @@ export default function ReportsPage() {
       </div>
     </AppShell>
   );
-}
-
-async function fetchReport(reportId: string) {
-  const token = getToken();
-  const response = await fetch(`${API_URL}/api/reports/export/${reportId}?format=csv`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {}
-  });
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({ message: response.statusText }));
-    throw new Error(body.message ?? "Report download failed");
-  }
-  return response.text();
 }

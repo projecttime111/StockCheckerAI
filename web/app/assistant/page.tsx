@@ -5,6 +5,7 @@ import { Send } from "lucide-react";
 import { FormEvent, useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { PrimaryButton } from "@/components/FormControls";
+import { ErrorState } from "@/components/ErrorState";
 import { Panel } from "@/components/Panel";
 import { api } from "@/lib/api";
 
@@ -35,6 +36,7 @@ export default function AssistantPage() {
   });
 
   function ask(text: string) {
+    if (chat.isPending) return;
     setMessages((current) => [...current, { role: "user", content: text }]);
     chat.mutate(text);
   }
@@ -59,14 +61,15 @@ export default function AssistantPage() {
             ))}
             {chat.isPending ? <div className="max-w-md rounded border border-ink/10 bg-white px-4 py-3 text-sm text-ink/55">Thinking with your data...</div> : null}
           </div>
+          {chat.error ? <ErrorState error={chat.error} /> : null}
           <form onSubmit={submit} className="flex gap-2">
-            <input className="focus-ring h-11 flex-1 rounded border border-ink/15 px-3 text-sm" value={message} onChange={(e) => setMessage(e.target.value)} />
-            <PrimaryButton disabled={chat.isPending}><Send size={16} /></PrimaryButton>
+            <input aria-label="Message" className="focus-ring h-11 flex-1 rounded border border-ink/15 px-3 text-sm" value={message} onChange={(e) => setMessage(e.target.value)} />
+            <PrimaryButton aria-label="Send message" disabled={chat.isPending}><Send size={16} /></PrimaryButton>
           </form>
         </Panel>
         <Panel title="Suggested Questions">
           <div className="space-y-2">
-            {prompts.map((prompt) => <button key={prompt} className="focus-ring w-full rounded border border-ink/10 p-3 text-left text-sm hover:bg-ink/[0.03]" onClick={() => ask(prompt)}>{prompt}</button>)}
+            {prompts.map((prompt) => <button disabled={chat.isPending} key={prompt} className="focus-ring w-full rounded border border-ink/10 p-3 text-left text-sm hover:bg-ink/[0.03]" onClick={() => ask(prompt)}>{prompt}</button>)}
           </div>
         </Panel>
       </div>

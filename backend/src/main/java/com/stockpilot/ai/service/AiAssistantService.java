@@ -36,6 +36,7 @@ public class AiAssistantService {
     private final DataQualityService dataQuality;
     private final PermissionService permissions;
     private final AuditService audit;
+    private final SensitiveDataService sensitive;
 
     public AiAssistantService(
         DashboardService dashboard,
@@ -51,7 +52,7 @@ public class AiAssistantService {
         ReorderEngineService reorderEngine,
         DataQualityService dataQuality,
         PermissionService permissions,
-        AuditService audit
+        AuditService audit, SensitiveDataService sensitive
     ) {
         this.dashboard = dashboard;
         this.forecast = forecast;
@@ -67,6 +68,7 @@ public class AiAssistantService {
         this.dataQuality = dataQuality;
         this.permissions = permissions;
         this.audit = audit;
+        this.sensitive = sensitive;
     }
 
     @Transactional
@@ -117,7 +119,8 @@ public class AiAssistantService {
                 response = noBusinessData(evidence);
             } else {
                 var analysis = profitInsights.currentMonth();
-                evidence.put("profitDrop", analysis);
+                evidence.put("purchaseCostReasons", analysis.topReasons().stream()
+                    .filter(reason -> reason.reason().toLowerCase().contains("purchase cost")).toList());
                 response = analysis.topReasons().stream().filter(reason -> reason.reason().toLowerCase().contains("purchase cost")).findFirst()
                     .map(reason -> reason.evidence() + ".")
                     .orElse("I do not see enough comparable purchase data to identify which supplier or item increased cost the most.");
@@ -150,11 +153,12 @@ public class AiAssistantService {
             } else if (noBusinessData) {
                 response = noBusinessData(evidence);
             } else {
-                var dead = dashboard.deadStock();
+                var dead = dashboard.deadStock().stream().map(sensitive::deadStock).toList();
                 evidence.put("deadStock", dead);
                 response = dead.isEmpty()
                     ? "No dead-stock products were detected from current stock and the 90 day sales window."
-                    : "The highest dead-stock risk is " + dead.getFirst().productName() + " valued at " + dead.getFirst().stockValue() + ".";
+                    : "The highest dead-stock risk is " + dead.getFirst().productName()
+                        + (sensitive.canViewCost() ? " valued at " + dead.getFirst().stockValue() : " with " + dead.getFirst().stockQuantity() + " units on hand") + ".";
             }
         } else if (lower.contains("stock out") || lower.contains("stockout") || lower.contains("this week")) {
             if (lacks("stock.view", conversation.id, "stockout")) {
@@ -202,9 +206,11 @@ public class AiAssistantService {
             } else if (noBusinessData) {
                 response = noBusinessData(evidence);
             } else {
-                var summary = dashboard.summary();
+                var summary = sensitive.summary(dashboard.summary());
                 evidence.put("summary", summary);
-                response = "I can answer using your tenant data. Current summary: monthly sales " + summary.monthlySales() + ", gross profit " + summary.grossProfit() + ", low-stock products " + summary.lowStockCount() + ".";
+                response = "I can answer using your tenant data. Current summary: monthly sales " + summary.monthlySales()
+                    + (sensitive.canViewProfit() ? ", gross profit " + summary.grossProfit() : "")
+                    + ", low-stock products " + summary.lowStockCount() + ".";
             }
         }
         saveMessage(tenantId, conversation.id, DomainEnums.AiRole.ASSISTANT, response, evidence);
@@ -213,9 +219,9 @@ public class AiAssistantService {
 
     public Map<String, Object> insights() {
         return Map.of(
-            "summary", dashboard.summary(),
+            "summary", sensitive.summary(dashboard.summary()),
             "lowStock", dashboard.lowStock(),
-            "deadStock", dashboard.deadStock(),
+            "deadStock", dashboard.deadStock().stream().map(sensitive::deadStock).toList(),
             "reorderSuggestions", forecast.suggestions()
         );
     }

@@ -12,7 +12,8 @@ export type RetailSaleDecision = {
   confirmation: "RECORD RETAIL SALES";
 };
 
-export function RetailSaleReviewForm({ amount, direction, pending, onRecord, onCancel }: {
+export function RetailSaleReviewForm({ currency = "INR", amount, direction, pending, onRecord, onCancel }: {
+  currency?: string;
   amount: number;
   direction: string;
   pending: boolean;
@@ -33,7 +34,7 @@ export function RetailSaleReviewForm({ amount, direction, pending, onRecord, onC
       onRecord({ collectionMethod: method, receivedFromRetailSales: received, notAlreadyRecorded: notRecorded,
         note: note.trim(), confirmation: "RECORD RETAIL SALES" });
     }}>
-      <h4 className="text-sm font-semibold">Retail counter sale: {new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", minimumFractionDigits: 2 }).format(amount)}</h4>
+      <h4 className="text-sm font-semibold">Retail counter sale: {new Intl.NumberFormat("en-IN", { style: "currency", currency, minimumFractionDigits: 2 }).format(amount)}</h4>
       <div className="text-xs text-ink/60">Amount only | Stock unchanged | Cost and margin unavailable</div>
       <Field label="Collection method">
         <SelectInput value={method} onChange={(event) => setMethod(event.target.value as typeof method)} required disabled={pending}>

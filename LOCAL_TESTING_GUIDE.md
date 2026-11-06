@@ -7,10 +7,13 @@ This guide walks through the full demo on web and mobile.
 Preferred path:
 
 ```bash
-docker compose up --build
+docker compose -p stockpilot-demo -f docker-compose.yml -f docker-compose.demo.yml up --build
 ```
 
-The backend seeds demo data automatically on startup.
+This explicit local demo override seeds the demo tenant on startup. The ordinary
+`docker compose up --build` command keeps seeding disabled for real import work.
+Use the separate `stockpilot-demo` project shown above to isolate demo volumes.
+Do not enable demo seeding on a hosted or client-data environment.
 
 Demo users all use password: `password123`
 
@@ -33,7 +36,9 @@ Backend URLs:
 - Swagger: `http://127.0.0.1:8080/swagger-ui.html`
 - Adminer: `http://127.0.0.1:8081`
 
-If you already started the app before this guide was added, restart the backend once. The seeder is idempotent and will add the extra demo data for Tally Hub, Data Quality, Dead Stock, and Reorder screens.
+The seeder is idempotent when the demo override is enabled. A restart without
+that override does not create demo accounts or records. For a real-data demo,
+register your own account and import the prepared source files instead.
 
 ## 2. Start the Web App
 
@@ -233,4 +238,4 @@ Test these screens:
 - Full web app loads but data calls fail: backend is not running on `8080`.
 - Mobile emulator cannot call backend: use `http://10.0.2.2:8080`.
 - Physical phone cannot call backend: use your laptop LAN IP and allow firewall access.
-- Backend demo data not visible: restart backend once after pulling latest code.
+- Backend demo data not visible: use the explicit local demo override above; the default stack intentionally starts without demo data.

@@ -124,6 +124,7 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
   const queryClient = useQueryClient();
   const [role, setRole] = useState<Role | null>(null);
   const [permissions, setPermissions] = useState<string[]>([]);
+  const [accessError, setAccessError] = useState<string | null>(null);
   const [workspaceName, setWorkspaceName] = useState("Workspace");
 
   useEffect(() => {
@@ -147,7 +148,7 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
         setPermissions(nextPermissions);
         setSessionPermissions(nextPermissions);
       })
-      .catch(() => undefined);
+      .catch(error => { if (active) setAccessError(error instanceof Error ? error.message : "Could not check workspace access"); });
 
     api<TenantResponse>("/api/tenants/current")
       .then((tenant) => {
@@ -168,6 +169,9 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
         .map((group) => ({ ...group, items: group.items.filter((item) => canAccess(item, activeRole, permissions)) }))
         .filter((group) => group.items.length > 0);
   const canUseAssistant = canUsePermission("ai.assistant.use", activeRole, permissions, ["OWNER", "ADMIN", "MANAGER", "STAFF"]);
+
+  const route = [...navGroups, ...portalNav].flatMap(group => group.items).find(item => pathname === item.href || pathname.startsWith(`${item.href}/`));
+  const permitted = !route || canAccess(route, activeRole, permissions);
 
   return (
     <div className="min-h-screen bg-[#f7faf8]">
@@ -215,7 +219,7 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
               <p className="text-sm text-ink/55">{workspaceName} - {activeRole ? roleLabels[activeRole] : "Workspace"} - Connect Tally or Excel. Predict stockouts. Reduce dead stock. Improve profit.</p>
             </div>
             <div className="flex items-center gap-2">
-              {actions}
+              {permitted ? actions : null}
               {activeRole !== "CUSTOMER_USER" && canUseAssistant ? (
                 <Link
                   className="focus-ring inline-flex items-center gap-2 rounded bg-moss px-3 py-2 text-sm font-semibold text-white"
@@ -252,7 +256,7 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
               ))}
           </div>
         </header>
-        <main className="px-4 py-6 sm:px-6">{children}</main>
+        <main className="px-4 py-6 sm:px-6">{accessError ? <div role="alert"><p>{accessError}</p><button className="mt-3 underline" onClick={() => window.location.reload()}>Retry access check</button></div> : !activeRole ? <p role="status">Checking your workspace access…</p> : !permitted ? <div role="alert" className="rounded border border-amber/30 bg-white p-5">Your role does not have access to this page. Choose an available page from the navigation.</div> : children}</main>
       </div>
     </div>
   );

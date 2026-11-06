@@ -32,6 +32,8 @@ import { ReturnReviewPanel } from "@/components/ReturnReviewPanel";
 import { TransferReviewPanel } from "@/components/TransferReviewPanel";
 import { VoucherRateReviewForm, VoucherRateAction } from "@/components/VoucherRateReviewForm";
 import { SmartImportSnapshotDates, SavedSnapshotDates, SnapshotDates, snapshotDatesFromSummary, snapshotDatesValid, snapshotDatesMatch } from "@/components/SmartImportSnapshotDates";
+import { useAccess, useMoney, useWorkspaceCurrency } from "@/lib/business";
+import { Pagination } from "@/components/Pagination";
 import { api, Page } from "@/lib/api";
 
 type SessionStatus = "CREATED" | "FILES_UPLOADED" | "CLASSIFIED" | "PLAN_READY" | "STAGED" | "NEEDS_REVIEW" | "COMMITTING" | "COMMITTED" | "FAILED" | "CANCELLED";
@@ -437,6 +439,10 @@ const TABS: Array<{ id: WorkspaceTab; label: string; icon: typeof Files }> = [
 ];
 
 export default function SmartImportsPage() {
+  const { can } = useAccess();
+  const money = useMoney();
+  const currency = useWorkspaceCurrency();
+  const [sessionPage, setSessionPage] = useState(0);
   const queryClient = useQueryClient();
   const [sessionName, setSessionName] = useState("");
   const [sessionId, setSessionId] = useState("");
@@ -455,8 +461,8 @@ export default function SmartImportsPage() {
   const [dateDraft, setDateDraft] = useState<{ sessionId: string; value: SnapshotDates } | null>(null);
 
   const sessions = useQuery({
-    queryKey: ["smart-import-sessions"],
-    queryFn: () => api<Page<SessionSummary>>("/api/import-sessions?size=20")
+    queryKey: ["smart-import-sessions", sessionPage],
+    queryFn: () => api<Page<SessionSummary>>(`/api/import-sessions?size=20&page=${sessionPage}`)
   });
   const current = useQuery({
     queryKey: ["smart-import-session", sessionId],
@@ -741,7 +747,7 @@ export default function SmartImportsPage() {
               <Field label="Session name">
                 <TextInput value={sessionName} onChange={(event) => setSessionName(event.target.value)} placeholder="June Tally exports" maxLength={160} />
               </Field>
-              <PrimaryButton className="w-full gap-2" onClick={() => createSession.mutate()} disabled={createSession.isPending}>
+              <PrimaryButton className="w-full gap-2" onClick={() => createSession.mutate()} disabled={!can("imports.upload") || createSession.isPending}>
                 <Plus size={16} /> {createSession.isPending ? "Creating..." : "New Smart Import Session"}
               </PrimaryButton>
             </div>
@@ -761,10 +767,12 @@ export default function SmartImportsPage() {
               ))}
               {!sessions.isLoading && !sessions.data?.content.length ? <EmptyState label="No smart import sessions yet." /> : null}
             </div>
+            {sessions.error ? <ErrorState error={sessions.error} /> : null}
+            <Pagination data={sessions.data} page={sessionPage} onChange={setSessionPage} />
           </Panel>
 
           {details && details.status !== "CANCELLED" ? (
-            <SecondaryButton className="w-full gap-2 text-coral" onClick={() => cancel.mutate()} disabled={cancel.isPending}>
+            <SecondaryButton className="w-full gap-2 text-coral" onClick={() => cancel.mutate()} disabled={!can("imports.upload") || cancel.isPending}>
               <Ban size={16} /> Cancel session
             </SecondaryButton>
           ) : null}
@@ -787,7 +795,7 @@ export default function SmartImportsPage() {
                     <span>Review items: <strong className="text-ink/75">{openReviewCount}</strong></span>
                   </div>
                 </div>
-                <SecondaryButton className="shrink-0 gap-2" onClick={() => rebuild.mutate()} disabled={rebuild.isPending || details.files.length === 0 || details.status === "CANCELLED"}>
+                <SecondaryButton className="shrink-0 gap-2" onClick={() => rebuild.mutate()} disabled={!can("imports.validate") || rebuild.isPending || details.files.length === 0 || details.status === "CANCELLED"}>
                   <RefreshCw size={16} /> {rebuild.isPending ? "Rebuilding..." : "Rebuild workspace"}
                 </SecondaryButton>
               </div>
@@ -844,7 +852,7 @@ export default function SmartImportsPage() {
                           ))}
                         </div>
                         <div className="mt-3 flex flex-wrap gap-2">
-                          <PrimaryButton className="gap-2" onClick={() => upload.mutate()} disabled={upload.isPending}>
+                          <PrimaryButton className="gap-2" onClick={() => upload.mutate()} disabled={!can("imports.upload") || upload.isPending}>
                             <FolderUp size={16} /> {upload.isPending ? "Uploading..." : "Upload selected files"}
                           </PrimaryButton>
                           <SecondaryButton onClick={() => setSelectedFiles([])}>Clear selection</SecondaryButton>
@@ -856,7 +864,7 @@ export default function SmartImportsPage() {
                   <Panel
                     title="Detected Files"
                     action={
-                      <PrimaryButton className="gap-2" onClick={() => analyze.mutate()} disabled={analyze.isPending || details.files.length === 0 || details.status === "CANCELLED"}>
+                      <PrimaryButton className="gap-2" onClick={() => analyze.mutate()} disabled={!can("imports.validate") || analyze.isPending || details.files.length === 0 || details.status === "CANCELLED"}>
                         <FileSearch size={16} /> {analyze.isPending ? "Building workspace..." : "Classify, stage, and match"}
                       </PrimaryButton>
                     }
@@ -884,7 +892,7 @@ export default function SmartImportsPage() {
                                     className="focus-ring h-9 min-w-[190px] rounded border border-ink/15 bg-white px-2 text-sm"
                                     value={file.selectedFileType || file.detectedFileType || "UNKNOWN"}
                                     onChange={(event) => overrideType.mutate({ fileId: file.id, selectedFileType: event.target.value })}
-                                    disabled={overrideType.isPending || file.status === "DUPLICATE"}
+                                    disabled={!can("imports.validate") || overrideType.isPending || file.status === "DUPLICATE"}
                                     aria-label={`Selected type for ${file.originalFileName}`}
                                   >
                                     {FILE_TYPES.map((type) => <option key={type} value={type}>{readable(type)}</option>)}
@@ -900,7 +908,7 @@ export default function SmartImportsPage() {
                                   ) : null}
                                 </td>
                                 <td className="px-2 py-3">
-                                  <button className="focus-ring inline-flex h-9 w-9 items-center justify-center rounded text-coral hover:bg-coral/10" onClick={() => removeFile.mutate(file.id)} disabled={removeFile.isPending} aria-label={`Remove ${file.originalFileName}`} title="Remove file">
+                                  <button className="focus-ring inline-flex h-9 w-9 items-center justify-center rounded text-coral hover:bg-coral/10" onClick={() => removeFile.mutate(file.id)} disabled={!can("imports.upload") || removeFile.isPending} aria-label={`Remove ${file.originalFileName}`} title="Remove file">
                                     <Trash2 size={16} />
                                   </button>
                                 </td>
@@ -1055,16 +1063,16 @@ export default function SmartImportsPage() {
                                   {item.resolved ? <StatusPill value="RESOLVED" /> : null}
                                 </div>
                                 {!item.resolved && (item.code === "INVALID_RATE" || item.code === "ZERO_RATE_ITEM") ? (
-                                  <VoucherRateReviewForm sessionId={sessionId} item={item} onResolved={async (workspace) => {
+                                  <fieldset disabled={!can("imports.validate")}><VoucherRateReviewForm sessionId={sessionId} item={item} onResolved={async (workspace) => {
                                     await queryClient.cancelQueries({ queryKey: ["smart-import-staging", sessionId] });
                                     queryClient.setQueryData(["smart-import-staging", sessionId], workspace as StagingWorkspace);
                                     await refresh(sessionId);
                                   }}
-                                    onRebuild={() => rebuild.mutateAsync()} rebuilding={rebuild.isPending} />
+                                    onRebuild={() => rebuild.mutateAsync()} rebuilding={rebuild.isPending} /></fieldset>
                                 ) : !item.resolved && item.availableChoices?.length ? (
                                   <div className="mt-3 flex flex-wrap gap-2">
                                     {item.availableChoices.map((choice) => (
-                                      <SecondaryButton key={`${choice.action}:${choice.targetId || choice.selectedFileType || choice.label}`} className="min-h-9 h-auto py-2 text-left" onClick={() => resolveReview.mutate({ itemId: item.id, choice })} disabled={resolveReview.isPending}>
+                                      <SecondaryButton key={`${choice.action}:${choice.targetId || choice.selectedFileType || choice.label}`} className="min-h-9 h-auto py-2 text-left" onClick={() => resolveReview.mutate({ itemId: item.id, choice })} disabled={!can("imports.validate") || resolveReview.isPending}>
                                         {choice.label}
                                       </SecondaryButton>
                                     ))}
@@ -1080,14 +1088,14 @@ export default function SmartImportsPage() {
                 </Panel>
                 <section id="cashbook-resolution" className="scroll-mt-4">
                 <Panel title="Unmatched Cashbook Resolution" action={<Link2 size={18} className="text-moss" />}>
-                  <CashbookReviewPanel sessionId={sessionId} />
+                  <fieldset disabled={!can("imports.commit")}><CashbookReviewPanel sessionId={sessionId} currency={currency} /></fieldset>
                 </Panel>
                 </section>
                 <Panel title="Physical Return Review" action={<Boxes size={18} className="text-moss" />}>
-                  <ReturnReviewPanel sessionId={sessionId} />
+                  <fieldset disabled={!can("imports.commit")}><ReturnReviewPanel sessionId={sessionId} /></fieldset>
                 </Panel>
                 <Panel title="Stock Journal and Transfer Review" action={<Boxes size={18} className="text-moss" />}>
-                  <TransferReviewPanel sessionId={sessionId} />
+                  <fieldset disabled={!can("imports.commit")}><TransferReviewPanel sessionId={sessionId} /></fieldset>
                 </Panel>
                 </div>
               ) : null}
@@ -1146,12 +1154,12 @@ export default function SmartImportsPage() {
                           </select>
                         </Field>
                       </div>
-                      <PrimaryButton className="gap-2" onClick={() => runDryRun.mutate()} disabled={runDryRun.isPending || !datesValid || staging.isLoading || dryRun.isLoading || dryRunStrategy === "UNKNOWN" || !plan?.details?.stagingComplete}>
+                      <PrimaryButton className="gap-2" onClick={() => runDryRun.mutate()} disabled={!can("imports.validate") || runDryRun.isPending || !datesValid || staging.isLoading || dryRun.isLoading || dryRunStrategy === "UNKNOWN" || !plan?.details?.stagingComplete}>
                         <FileSearch size={16} /> {runDryRun.isPending ? "Running..." : "Run Dry Run"}
                       </PrimaryButton>
                     </div>
                     <SmartImportSnapshotDates value={snapshotDates} stockMissing={stockDatesMissing} outstandingMissing={outstandingDatesMissing}
-                      disabled={runDryRun.isPending || dryRun.isLoading || staging.isLoading}
+                      disabled={!can("imports.validate") || runDryRun.isPending || dryRun.isLoading || staging.isLoading}
                       onChange={(value) => { setDateDraft({ sessionId, value }); setCommitConfirmation(""); }} />
                     <div className="mt-4 border-l-2 border-moss/40 pl-3 text-sm leading-6 text-ink/65">
                       <p className="font-semibold text-ink">{strategyExplanation(dryRunStrategy)}</p>
@@ -1246,7 +1254,7 @@ export default function SmartImportsPage() {
                           <Field label="Type COMMIT IMPORT PLAN">
                             <TextInput value={commitConfirmation} onChange={(event) => setCommitConfirmation(event.target.value)} autoComplete="off" />
                           </Field>
-                          <PrimaryButton className="gap-2" onClick={() => commitFoundation.mutate()} disabled={commitRunning || commitFoundation.isPending || commitConfirmation !== "COMMIT IMPORT PLAN" || commitResult.data?.status === "COMMITTED"}>
+                          <PrimaryButton className="gap-2" onClick={() => commitFoundation.mutate()} disabled={commitRunning || commitFoundation.isPending || commitConfirmation !== "COMMIT IMPORT PLAN" || commitResult.data?.status === "COMMITTED" || !can("imports.commit")}>
                             <Boxes size={16} /> {commitRunning ? "Committing safely..." : commitResult.data?.status === "COMMITTED" ? "Import committed" : "Commit Reviewed Import"}
                           </PrimaryButton>
                         </div>
@@ -1574,9 +1582,4 @@ function number(value?: number) {
 function signedNumber(value?: number) {
   const numeric = Number(value || 0);
   return `${numeric > 0 ? "+" : ""}${number(numeric)}`;
-}
-
-function money(value?: number) {
-  if (value == null) return "-";
-  return `₹${Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
 }

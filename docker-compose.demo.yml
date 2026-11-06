@@ -1,0 +1,5 @@
+# Explicit, local-only demo data. Use a separate Compose project to isolate its volumes.
+services:
+  backend:
+    environment:
+      APP_DEMO_SEED_ENABLED: "true"

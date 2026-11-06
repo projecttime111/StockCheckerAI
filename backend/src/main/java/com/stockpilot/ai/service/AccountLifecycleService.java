@@ -33,6 +33,7 @@ public class AccountLifecycleService {
     private final ObjectStorageService objectStorage;
     private final AuditService audit;
     private final JwtService jwtService;
+    private final TenantWriteLockService locks;
 
     public AccountLifecycleService(
         EntityManager entityManager,
@@ -41,7 +42,7 @@ public class AccountLifecycleService {
         Repositories.MembershipRepository memberships,
         ObjectStorageService objectStorage,
         AuditService audit,
-        JwtService jwtService
+        JwtService jwtService, TenantWriteLockService locks
     ) {
         this.entityManager = entityManager;
         this.tenants = tenants;
@@ -50,6 +51,7 @@ public class AccountLifecycleService {
         this.objectStorage = objectStorage;
         this.audit = audit;
         this.jwtService = jwtService;
+        this.locks = locks;
     }
 
     @Transactional(readOnly = true)
@@ -171,6 +173,7 @@ public class AccountLifecycleService {
     }
 
     private ResetOutcome deleteTenantBusinessData(UUID tenantId) {
+        locks.lock(tenantId);
         List<?> storedKeys = entityManager.createNativeQuery("""
                 select storage_key from import_files where tenant_id = :tenantId
                 union all
@@ -197,6 +200,17 @@ public class AccountLifecycleService {
 
     private List<String> deletionOrder() {
         return List.of(
+            "mutation_receipts",
+            "financial_adjustment_items",
+            "financial_adjustments",
+            "outstanding_snapshots",
+            "external_record_mappings",
+            "smart_import_effects",
+            "smart_import_commits",
+            "import_dry_run_items",
+            "import_dry_runs",
+            "legacy_import_raw_rows",
+            "smart_staged_cashbook_entries",
             "ai_messages",
             "delivery_challans",
             "payment_reminders",
@@ -220,7 +234,6 @@ public class AccountLifecycleService {
             "import_plans",
             "smart_staged_voucher_items",
             "smart_staged_stock_snapshots",
-            "smart_staged_cashbook_entries",
             "smart_staged_stock_ageing",
             "smart_staged_vouchers",
             "smart_staged_products",

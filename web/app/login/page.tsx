@@ -33,6 +33,7 @@ export default function LoginPage() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+    if (params.get("changed") === "1") setRegistrationMessage("Your account changed in another tab. Sign in to continue in the correct workspace.");
     if (params.get("expired") === "1") {
       setRegistrationMessage("Your session expired. Please sign in again.");
     }
@@ -123,6 +124,7 @@ export default function LoginPage() {
                 >
                   {resendVerification.isPending ? "Sending..." : "Resend verification email"}
                 </button>
+                {resendVerification.error ? <p role="alert" className="mt-2 text-coral">{resendVerification.error.message}</p> : null}
                 {resendMessage ? <p className="mt-2 text-ink/60">{resendMessage}</p> : null}
               </div>
             ) : null}

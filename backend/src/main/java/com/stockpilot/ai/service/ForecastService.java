@@ -19,63 +19,49 @@ import java.util.UUID;
 @Service
 public class ForecastService {
     private final Repositories.ProductRepository products;
-    private final Repositories.StockMovementRepository movements;
     private final Repositories.ForecastResultRepository forecasts;
     private final Repositories.ReorderSuggestionRepository suggestions;
     private final StockLedgerService stockLedger;
+    private final SalesHistoryService salesHistory;
+    private final TenantWriteLockService locks;
 
     public ForecastService(
         Repositories.ProductRepository products,
-        Repositories.StockMovementRepository movements,
         Repositories.ForecastResultRepository forecasts,
         Repositories.ReorderSuggestionRepository suggestions,
-        StockLedgerService stockLedger
+        StockLedgerService stockLedger, SalesHistoryService salesHistory, TenantWriteLockService locks
     ) {
         this.products = products;
-        this.movements = movements;
         this.forecasts = forecasts;
         this.suggestions = suggestions;
         this.stockLedger = stockLedger;
+        this.salesHistory = salesHistory;
+        this.locks = locks;
     }
 
     @Transactional
     public List<ApiDtos.ForecastResponse> run() {
         var tenantId = TenantContext.tenantId();
+        // Serialize complete generations, including the first run when no forecast rows exist to lock.
+        locks.lock(tenantId);
         forecasts.deleteByTenantId(tenantId);
         suggestions.deleteByTenantId(tenantId);
-        var since = LocalDate.now(ZoneOffset.UTC).minusDays(89);
-        var sales = movements.findByTenantIdAndMovementTypeAndMovementDateAfter(tenantId, DomainEnums.MovementType.SALE, since.atStartOfDay().toInstant(ZoneOffset.UTC));
-        var dailyByProduct = new LinkedHashMap<UUID, List<BigDecimal>>();
-        for (var product : products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)) {
-            var days = new ArrayList<BigDecimal>();
-            for (int i = 0; i < 90; i++) {
-                days.add(BigDecimal.ZERO);
-            }
-            dailyByProduct.put(product.id, days);
-        }
-        for (var sale : sales) {
-            var date = LocalDateTime.ofInstant(sale.movementDate, ZoneOffset.UTC).toLocalDate();
-            var index = (int) Duration.between(since.atStartOfDay(), date.atStartOfDay()).toDays();
-            if (index >= 0 && index < 90 && dailyByProduct.containsKey(sale.productId)) {
-                var days = dailyByProduct.get(sale.productId);
-                days.set(index, days.get(index).add(sale.baseQuantity.abs()));
-            }
-        }
+        forecasts.flush();
+        suggestions.flush();
+        var today = LocalDate.now(ZoneOffset.UTC);
+        var since = today.minusDays(89);
+        var history = salesHistory.history(tenantId);
 
         var responses = new ArrayList<ApiDtos.ForecastResponse>();
         for (var product : products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)) {
-            var daily = dailyByProduct.getOrDefault(product.id, List.of());
+            var daily = history.daily(product.id, null, since, 90);
             var avg = ForecastMath.averageDailyDemand(daily);
             var weighted = ForecastMath.weightedDailyDemand(daily);
             var demand = weighted.compareTo(BigDecimal.ZERO) > 0 ? weighted : avg;
             var current = stockLedger.currentStock(tenantId, product.id, null);
             var next7 = demand.multiply(BigDecimal.valueOf(7)).setScale(3, java.math.RoundingMode.HALF_UP);
             var next30 = demand.multiply(BigDecimal.valueOf(30)).setScale(3, java.math.RoundingMode.HALF_UP);
-            LocalDate stockout = null;
-            if (avg.compareTo(BigDecimal.ZERO) > 0 && current.compareTo(BigDecimal.ZERO) > 0) {
-                var daysToStockout = current.divide(avg, 0, java.math.RoundingMode.CEILING).longValue();
-                stockout = LocalDate.now(ZoneOffset.UTC).plusDays(daysToStockout);
-            }
+            var stockout = ForecastMath.stockoutDate(current, demand, today);
             var forecast = new ForecastResult();
             forecast.tenantId = tenantId;
             forecast.productId = product.id;
@@ -100,17 +86,19 @@ public class ForecastService {
                 suggestion.generatedAt = Instant.now();
                 suggestions.save(suggestion);
             }
-            responses.add(new ApiDtos.ForecastResponse(product.id, product.name, current, avg, next7, next30, stockout));
+            responses.add(new ApiDtos.ForecastResponse(product.id, product.name, current, avg, next7, next30, stockout, history.lastSale(product.id, null, today) != null));
         }
         return responses;
     }
 
     public List<ApiDtos.ForecastResponse> results() {
         var tenantId = TenantContext.tenantId();
+        var history = salesHistory.history(tenantId);
+        var today = LocalDate.now(ZoneOffset.UTC);
         return forecasts.findByTenantIdOrderByGeneratedAtDesc(tenantId).stream()
             .map(result -> {
                 var product = products.findByTenantIdAndId(tenantId, result.productId).orElse(null);
-                return new ApiDtos.ForecastResponse(result.productId, product == null ? "Unknown product" : product.name, result.currentStock, result.averageDailyDemand, result.next7DaysDemand, result.next30DaysDemand, result.stockoutDate);
+                return new ApiDtos.ForecastResponse(result.productId, product == null ? "Unknown product" : product.name, result.currentStock, result.averageDailyDemand, result.next7DaysDemand, result.next30DaysDemand, result.stockoutDate, history.lastSale(result.productId, null, today) != null);
             })
             .toList();
     }

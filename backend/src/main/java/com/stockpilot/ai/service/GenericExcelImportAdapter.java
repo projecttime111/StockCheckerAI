@@ -41,7 +41,7 @@ public class GenericExcelImportAdapter implements ErpImportAdapter {
                 var values = new LinkedHashMap<String, String>();
                 var blank = true;
                 for (int c = 0; c < headers.size(); c++) {
-                    var value = formatter.formatCellValue(row.getCell(c), evaluator).trim();
+                    var value = cellValue(row.getCell(c), formatter, evaluator);
                     if (!value.isBlank()) {
                         blank = false;
                     }
@@ -55,6 +55,19 @@ public class GenericExcelImportAdapter implements ErpImportAdapter {
         } catch (Exception ex) {
             throw new IllegalArgumentException("Could not parse Excel file: " + ex.getMessage(), ex);
         }
+    }
+
+    private String cellValue(org.apache.poi.ss.usermodel.Cell cell, DataFormatter formatter,
+                             org.apache.poi.ss.usermodel.FormulaEvaluator evaluator) {
+        if (cell == null) return "";
+        if (cell.getCellType() == org.apache.poi.ss.usermodel.CellType.FORMULA) evaluator.evaluateFormulaCell(cell);
+        var type = cell.getCellType() == org.apache.poi.ss.usermodel.CellType.FORMULA
+            ? cell.getCachedFormulaResultType() : cell.getCellType();
+        if (type == org.apache.poi.ss.usermodel.CellType.NUMERIC
+            && org.apache.poi.ss.usermodel.DateUtil.isCellDateFormatted(cell)) {
+            return cell.getLocalDateTimeCellValue().toLocalDate().toString();
+        }
+        return formatter.formatCellValue(cell, evaluator).trim();
     }
 
     @Override

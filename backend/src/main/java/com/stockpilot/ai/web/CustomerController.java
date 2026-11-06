@@ -31,20 +31,23 @@ public class CustomerController {
     private final Repositories.PaymentReminderRepository reminders;
     private final AuditService audit;
     private final OutstandingService outstanding;
+    private final com.stockpilot.ai.service.CustomerPaymentService paymentService;
 
-    public CustomerController(Repositories.CustomerRepository customers, Repositories.SalesInvoiceRepository invoices, Repositories.CustomerPaymentRepository payments, Repositories.PaymentReminderRepository reminders, AuditService audit, OutstandingService outstanding) {
+    public CustomerController(Repositories.CustomerRepository customers, Repositories.SalesInvoiceRepository invoices, Repositories.CustomerPaymentRepository payments, Repositories.PaymentReminderRepository reminders, AuditService audit, OutstandingService outstanding, com.stockpilot.ai.service.CustomerPaymentService paymentService) {
         this.customers = customers;
         this.invoices = invoices;
         this.payments = payments;
         this.reminders = reminders;
         this.audit = audit;
         this.outstanding = outstanding;
+        this.paymentService = paymentService;
     }
 
     @GetMapping
     @PreAuthorize("@permissionService.has('customers.view')")
-    public Page<ApiDtos.CustomerResponse> list(Pageable pageable) {
-        return customers.findByTenantId(TenantContext.tenantId(), pageable).map(this::response);
+    public Page<ApiDtos.CustomerResponse> list(@RequestParam(required = false) String query, Pageable pageable) {
+        return (query == null || query.isBlank() ? customers.findByTenantId(TenantContext.tenantId(), pageable)
+            : customers.findByTenantIdAndNameContainingIgnoreCase(TenantContext.tenantId(), query.trim(), pageable)).map(this::response);
     }
 
     @PostMapping
@@ -111,29 +114,20 @@ public class CustomerController {
         return reminderResponse(saved);
     }
 
+    @GetMapping("/summary")
+    @PreAuthorize("@permissionService.has('customers.view_outstanding')")
+    public Map<String, BigDecimal> summary() {
+        var tenantId = TenantContext.tenantId();
+        var total = customers.findByTenantIdOrderByNameAsc(tenantId).stream()
+            .map(customer -> outstanding.customerOutstanding(tenantId, customer.id)).reduce(BigDecimal.ZERO, BigDecimal::add);
+        return Map.of("outstandingReceivables", total);
+    }
+
     @PostMapping("/{id}/payments")
     @PreAuthorize("@permissionService.has('customers.update')")
-    public ApiDtos.CustomerPaymentResponse recordPayment(@PathVariable UUID id, @Valid @RequestBody ApiDtos.CustomerPaymentRequest request) {
-        var customer = customers.findByTenantIdAndId(TenantContext.tenantId(), id).orElseThrow(() -> ApiErrors.notFound("Customer not found"));
-        var payment = new CustomerPayment();
-        payment.tenantId = TenantContext.tenantId();
-        payment.customerId = customer.id;
-        payment.amount = request.amount();
-        payment.paymentDate = request.paymentDate();
-        payment.notes = paymentNotes(request);
-        var saved = payments.save(payment);
-        if (request.reminderId() != null) {
-            reminders.findByTenantIdAndId(TenantContext.tenantId(), request.reminderId()).ifPresent(reminder -> {
-                if (customer.id.equals(reminder.customerId)) {
-                    reminder.status = "PAID";
-                    reminder.completedAt = Instant.now();
-                    reminder.completedPaymentId = saved.id;
-                    reminders.save(reminder);
-                }
-            });
-        }
-        audit.logCurrent("CUSTOMER_PAYMENT_RECEIVED", "CustomerPayment", saved.id, Map.of("customerId", customer.id, "amount", saved.amount));
-        return new ApiDtos.CustomerPaymentResponse(saved.id, customer.id, saved.amount, saved.paymentDate, saved.notes);
+    public ApiDtos.CustomerPaymentResponse recordPayment(@PathVariable UUID id, @Valid @RequestBody ApiDtos.CustomerPaymentRequest request,
+        @RequestHeader(value = "Idempotency-Key", required = false) String key) {
+        return paymentService.record(id, request, key);
     }
 
     private ApiDtos.CustomerResponse response(Customer customer) {

@@ -2,9 +2,11 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { api, Page } from "@/lib/api";
+import { api } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
 import { Field, PrimaryButton, SecondaryButton, TextInput } from "@/components/FormControls";
+import { RecordPicker } from "@/components/RecordPicker";
+import { QueryFeedback } from "@/components/QueryFeedback";
 import { LoadingState } from "@/components/LoadingState";
 
 type ReturnReview = {
@@ -40,10 +42,6 @@ export function ReturnReviewPanel({ sessionId }: { sessionId: string }) {
     queryKey: ["smart-import-return-review", sessionId],
     enabled: !!sessionId,
     queryFn: () => api<ReturnReview[]>(`/api/import-sessions/${sessionId}/return-review`)
-  });
-  const products = useQuery({
-    queryKey: ["products", "return-review"],
-    queryFn: () => api<Page<Product>>("/api/products?size=200")
   });
   const warehouses = useQuery({
     queryKey: ["warehouses", "return-review"],
@@ -81,6 +79,7 @@ export function ReturnReviewPanel({ sessionId }: { sessionId: string }) {
 
   return (
     <div className="space-y-4">
+      <QueryFeedback queries={[warehouses]} />
       <p className="text-sm leading-6 text-ink/65">
         Credit and debit notes do not always move goods. Confirm only lines where inventory physically returned.
         Damaged or non-saleable items remain deferred from available stock.
@@ -114,12 +113,7 @@ export function ReturnReviewPanel({ sessionId }: { sessionId: string }) {
 
       {selected ? (
         <div className="grid gap-3 border-l-2 border-moss/40 pl-4 sm:grid-cols-2">
-          <Field label="Product">
-            <select className="focus-ring h-10 w-full rounded border border-ink/15 bg-white px-3 text-sm" value={productId} onChange={(event) => setProductId(event.target.value)}>
-              <option value="">Choose product</option>
-              {products.data?.content.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
-            </select>
-          </Field>
+          <RecordPicker<Product> path="/api/products" label="Product" value={productId} onChange={product => setProductId(product?.id ?? "")} />
           <Field label="Warehouse receiving/leaving stock">
             <select className="focus-ring h-10 w-full rounded border border-ink/15 bg-white px-3 text-sm" value={warehouseId} onChange={(event) => setWarehouseId(event.target.value)}>
               <option value="">Choose warehouse</option>

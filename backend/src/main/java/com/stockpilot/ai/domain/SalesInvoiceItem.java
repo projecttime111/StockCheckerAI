@@ -14,6 +14,7 @@ public class SalesInvoiceItem extends TenantOwnedEntity {
     public BigDecimal quantity = BigDecimal.ZERO;
     public UUID unitId;
     public BigDecimal rate = BigDecimal.ZERO;
+    @jakarta.persistence.Column(precision = 24, scale = 12)
     public BigDecimal costRate = BigDecimal.ZERO;
     public BigDecimal taxPercentage = BigDecimal.ZERO;
     public BigDecimal taxAmount = BigDecimal.ZERO;
