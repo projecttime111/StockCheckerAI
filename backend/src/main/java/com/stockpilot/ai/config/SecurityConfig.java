@@ -49,6 +49,8 @@ public class SecurityConfig {
                     "/api/auth/resend-verification",
                     "/api/auth/forgot-password",
                     "/api/auth/reset-password",
+                    "/api/auth/invitations/preview",
+                    "/api/auth/invitations/register",
                     "/actuator/health",
                     "/actuator/health/**",
                     "/actuator/info"
@@ -61,8 +63,10 @@ public class SecurityConfig {
                 auth
                     .requestMatchers("/api/portal/**").hasRole("CUSTOMER_USER")
                     .requestMatchers("/api/account/**").authenticated()
+                    .requestMatchers("/api/workspace/invitations/accept").authenticated()
                     .requestMatchers(HttpMethod.POST, "/api/tenants").authenticated()
-                    .requestMatchers("/api/auth/me", "/api/auth/me/permissions", "/api/auth/me/tenants").authenticated()
+                    .requestMatchers("/api/auth/me", "/api/auth/me/permissions", "/api/auth/me/tenants", "/api/auth/session",
+                        "/api/auth/platform", "/api/auth/workspaces/*/switch", "/api/auth/clerk/**", "/api/auth/refresh").authenticated()
                     .requestMatchers("/api/platform/**").hasAnyRole("PLATFORM_SUPER_ADMIN", "PLATFORM_SUPPORT", "PLATFORM_BILLING_ADMIN")
                     .requestMatchers("/api/**").hasAnyRole("OWNER", "ADMIN", "MANAGER", "STAFF", "WAREHOUSE_STAFF", "SALES_STAFF", "PURCHASE_MANAGER", "ACCOUNTANT", "VIEWER", "AUDITOR")
                     .anyRequest().authenticated();
@@ -76,7 +80,7 @@ public class SecurityConfig {
         var config = new CorsConfiguration();
         config.setAllowedOrigins(Arrays.stream(allowedOrigins.split(",")).map(String::trim).filter(s -> !s.isBlank()).toList());
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
-        config.setAllowedHeaders(List.of("Authorization", "Content-Type", "X-Requested-With", "X-Request-Id", "Idempotency-Key"));
+        config.setAllowedHeaders(List.of("Authorization", "Content-Type", "X-Requested-With", "X-Request-Id", "Idempotency-Key", "X-StockPilot-Mode"));
         config.setExposedHeaders(List.of("Location", "X-Request-Id"));
         config.setAllowCredentials(true);
         var source = new UrlBasedCorsConfigurationSource();

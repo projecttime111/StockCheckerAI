@@ -10,7 +10,8 @@ import { BusinessMode, BusinessModeSelector } from "@/components/BusinessModeSel
 import { Field, PrimaryButton, SecondaryButton, TextInput } from "@/components/FormControls";
 import { MutationFeedback, QueryFeedback } from "@/components/QueryFeedback";
 import { Panel } from "@/components/Panel";
-import { api, clearSession, getSessionRole, setSession, Warehouse } from "@/lib/api";
+import { useSession } from "@/lib/session";
+import { api, clearSession, CLERK_ENABLED, signOutSession, clearClerkOrganization, setSession, Warehouse } from "@/lib/api";
 
 type Tenant = { id: string; name: string; businessMode: string; currency: string; gstEnabled: boolean; allowNegativeStock: boolean; portalShowAllActiveProducts: boolean };
 const modeLabels: Record<string, string> = { RETAIL: "Retail", WHOLESALE: "Wholesale", HYBRID: "Hybrid" };
@@ -37,7 +38,7 @@ export default function SettingsPage() {
   const queryClient = useQueryClient();
   const tenant = useQuery({ queryKey: ["tenant"], queryFn: () => api<Tenant>("/api/tenants/current") });
   const warehouses = useQuery({ queryKey: ["warehouses"], queryFn: () => api<Warehouse[]>("/api/warehouses") });
-  const [role, setRole] = useState<string | null>(null);
+  const role = useSession().data?.role ?? null;
   const deleteImpact = useQuery({
     queryKey: ["delete-impact"],
     queryFn: () => api<DeleteImpact>("/api/tenants/current/delete-impact"),
@@ -47,9 +48,6 @@ export default function SettingsPage() {
   const [warehouse, setWarehouse] = useState({ name: "", code: "", address: "" });
   const [activeAction, setActiveAction] = useState<LifecycleAction | null>(null);
   const [confirmation, setConfirmation] = useState("");
-  useEffect(() => {
-    setRole(getSessionRole());
-  }, []);
   useEffect(() => {
     if (tenant.data) {
       setBusiness({
@@ -94,7 +92,7 @@ export default function SettingsPage() {
       }
       return api("/api/account", { ...request, method: "DELETE" });
     },
-    onSuccess: (result) => {
+    onSuccess: async (result) => {
       const completedAction = activeAction;
       setActiveAction(null);
       setConfirmation("");
@@ -104,14 +102,14 @@ export default function SettingsPage() {
         return;
       }
       if (completedAction === "workspace") {
+        if (CLERK_ENABLED) { await clearClerkOrganization(); window.location.assign("/workspace/select"); return; }
         const workspace = result as WorkspaceDeletion;
         clearSession();
         setSession(workspace.accessToken, workspace.role ?? undefined, []);
         router.push(workspace.onboardingRequired ? "/onboarding" : "/dashboard");
         return;
       }
-      clearSession();
-      router.push("/login");
+      void signOutSession();
     }
   });
 

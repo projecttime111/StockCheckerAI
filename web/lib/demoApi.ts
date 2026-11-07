@@ -586,6 +586,13 @@ async function demoResponse<T>(path: string, init: Init = {}): Promise<T> {
     return { accessToken: `demo-token-${role}-${workspaceId}`, tenantId: workspaceId, userId: account.userId, role, email: account.email, fullName: account.fullName } as T;
   }
 
+  if (path === "/api/auth/session") {
+    const account = currentDemoUser();
+    return { ...account, tenantId: demoTenant.id, platformRole: null, permissions: rolePermissions(account.role),
+      workspaces: [{tenantId: demoTenant.id, name: demoTenant.name, businessMode: demoTenant.businessMode, role: account.role, clerkOrganizationId: null}],
+      authProvider: "local", clerkOrganizationId: null, accessState: "WORKSPACE_READY", emailVerified: true, clerkLinked: false } as T;
+  }
+
   if (path === "/api/auth/me") {
     const account = currentDemoUser();
     return { userId: account.userId, email: account.email, fullName: account.fullName, tenantId: demoTenant.id, role: account.role } as T;

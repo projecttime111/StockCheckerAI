@@ -20,7 +20,6 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
-import java.util.Optional;
 
 @Service
 public class AuthService {
@@ -39,6 +38,8 @@ public class AuthService {
     private final Duration passwordResetTokenTtl;
     private final Duration emailCooldown;
     private final String appPublicUrl;
+    private final AuthSessionService sessions;
+    private final PlatformBootstrapService platformBootstrap;
 
     public AuthService(
         Repositories.UserRepository users,
@@ -55,7 +56,8 @@ public class AuthService {
         @Value("${app.auth.verification-token-hours:24}") long verificationTokenHours,
         @Value("${app.auth.password-reset-token-minutes:30}") long passwordResetTokenMinutes,
         @Value("${app.auth.email-cooldown-seconds:60}") long emailCooldownSeconds,
-        @Value("${app.public-url:http://localhost:3000}") String appPublicUrl
+        @Value("${app.public-url:http://localhost:3000}") String appPublicUrl,
+        AuthSessionService sessions, PlatformBootstrapService platformBootstrap
     ) {
         this.users = users;
         this.tenants = tenants;
@@ -72,6 +74,7 @@ public class AuthService {
         this.passwordResetTokenTtl = Duration.ofMinutes(passwordResetTokenMinutes);
         this.emailCooldown = Duration.ofSeconds(emailCooldownSeconds);
         this.appPublicUrl = trimTrailingSlash(appPublicUrl);
+        this.sessions = sessions; this.platformBootstrap = platformBootstrap;
     }
 
     @Transactional
@@ -125,23 +128,17 @@ public class AuthService {
             users.save(user);
             auditService.log(null, user.id, "EMAIL_VERIFICATION_BYPASSED", "UserAccount", user.id, Map.of("reason", "verification_disabled"));
         }
-        var membership = activeMembership(user.id);
-        if (membership.isEmpty()) {
-            auditService.log(null, user.id, "USER_LOGIN", "UserAccount", user.id, Map.of("workspaceRequired", true));
-            return new ApiDtos.AuthResponse(jwtService.issueAccountOnly(user.id, user.email, user.authVersion), null, user.id, null, user.email, user.fullName);
-        }
-        var activeMembership = membership.orElseThrow();
-        auditService.log(activeMembership.tenantId, user.id, "USER_LOGIN", "UserAccount", user.id, Map.of());
-        var token = jwtService.issue(user.id, activeMembership.tenantId, user.email, activeMembership.role, user.authVersion);
-        return new ApiDtos.AuthResponse(token, activeMembership.tenantId, user.id, activeMembership.role, user.email, user.fullName);
+        platformBootstrap.grantConfigured(user);
+        var response = sessions.defaultSession(user);
+        auditService.log(response.tenantId(), user.id, "USER_LOGIN", "UserAccount", user.id, Map.of());
+        return response;
     }
 
     @Transactional
     public ApiDtos.AuthResponse loginWithGoogle(ApiDtos.GoogleLoginRequest request) {
         var google = googleIdentityService.verify(request.idToken());
-        var user = users.findByGoogleSubject(google.subject())
-            .or(() -> users.findByEmailIgnoreCase(google.email()))
-            .orElseGet(() -> {
+        var existing = users.findByGoogleSubject(google.subject()).or(() -> users.findByEmailIgnoreCase(google.email()));
+        var user = existing.orElseGet(() -> {
                 var account = new UserAccount();
                 account.email = google.email();
                 account.fullName = google.name();
@@ -151,6 +148,7 @@ public class AuthService {
                 account.emailVerifiedAt = Instant.now();
                 return users.save(account);
             });
+        if (!user.active) throw ApiErrors.forbidden("This account is inactive");
         if (user.googleSubject == null || user.googleSubject.isBlank()) {
             user.googleSubject = google.subject();
         }
@@ -163,29 +161,14 @@ public class AuthService {
         user.fullName = (user.fullName == null || user.fullName.isBlank()) ? google.name() : user.fullName;
         users.save(user);
 
-        var membership = activeMembership(user.id);
-        if (membership.isEmpty()) {
-            auditService.log(null, user.id, "GOOGLE_LOGIN", "UserAccount", user.id, Map.of("workspaceRequired", true));
-            return new ApiDtos.AuthResponse(jwtService.issueAccountOnly(user.id, user.email, user.authVersion), null, user.id, null, user.email, user.fullName);
-        }
-        var activeMembership = membership.orElseThrow();
-        auditService.log(activeMembership.tenantId, user.id, "GOOGLE_LOGIN", "UserAccount", user.id, Map.of());
-        var token = jwtService.issue(user.id, activeMembership.tenantId, user.email, activeMembership.role, user.authVersion);
-        return new ApiDtos.AuthResponse(token, activeMembership.tenantId, user.id, activeMembership.role, user.email, user.fullName);
+        if (existing.isPresent()) platformBootstrap.grantConfigured(user);
+        var response = sessions.defaultSession(user);
+        auditService.log(response.tenantId(), user.id, "GOOGLE_LOGIN", "UserAccount", user.id, Map.of());
+        return response;
     }
 
     public ApiDtos.AuthResponse refresh(String email) {
-        var user = users.findByEmailIgnoreCase(email).orElseThrow();
-        if (!user.emailVerified) {
-            throw new ApiException(HttpStatus.UNAUTHORIZED, "EMAIL_NOT_VERIFIED", "Please verify your email before logging in.");
-        }
-        var membership = activeMembership(user.id);
-        if (membership.isEmpty()) {
-            return new ApiDtos.AuthResponse(jwtService.issueAccountOnly(user.id, user.email, user.authVersion), null, user.id, null, user.email, user.fullName);
-        }
-        var activeMembership = membership.orElseThrow();
-        var token = jwtService.issue(user.id, activeMembership.tenantId, user.email, activeMembership.role, user.authVersion);
-        return new ApiDtos.AuthResponse(token, activeMembership.tenantId, user.id, activeMembership.role, user.email, user.fullName);
+        return sessions.currentAuthResponse();
     }
 
     @Transactional
@@ -263,12 +246,6 @@ public class AuthService {
         user.verificationResendCount++;
         users.save(user);
         emailService.sendVerificationEmail(user.email, appPublicUrl + "/verify-email?token=" + rawToken);
-    }
-
-    private Optional<UserTenantMembership> activeMembership(java.util.UUID userId) {
-        return memberships.findByUserId(userId).stream()
-            .filter(membership -> tenants.findByIdAndStatus(membership.tenantId, DomainEnums.TenantStatus.ACTIVE).isPresent())
-            .findFirst();
     }
 
     private static String normalizeEmail(String email) {

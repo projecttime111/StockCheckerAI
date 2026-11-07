@@ -2,8 +2,8 @@
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { FormEvent, useState } from "react";
-import { api, clearSession } from "@/lib/api";
+import { FormEvent, useEffect, useState } from "react";
+import { api, clearSession, CLERK_ENABLED } from "@/lib/api";
 import { BusinessMode, BusinessModeSelector } from "@/components/BusinessModeSelector";
 import { Field, PrimaryButton, TextInput } from "@/components/FormControls";
 import { GoogleSignInButton } from "@/components/GoogleSignInButton";
@@ -11,6 +11,7 @@ import { GoogleSignInButton } from "@/components/GoogleSignInButton";
 type AuthResponse = { accessToken?: string; role?: string; emailVerificationRequired?: boolean };
 
 export default function RegisterPage() {
+  useEffect(() => { if (CLERK_ENABLED) window.location.replace("/sign-up"); }, []);
   const queryClient = useQueryClient();
   const [form, setForm] = useState({
     businessName: "",
@@ -37,6 +38,7 @@ export default function RegisterPage() {
     register.mutate();
   }
 
+  if (CLERK_ENABLED) return <main className="p-8" role="status">Opening secure sign-up…</main>;
   return (
     <main className="flex min-h-screen items-center justify-center bg-[#eef7f0] px-5 py-10">
       <form onSubmit={submit} className="w-full max-w-xl rounded border border-ink/10 bg-white p-6 shadow-soft">

@@ -4,7 +4,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { BarChart3 } from "lucide-react";
 import Link from "next/link";
 import { FormEvent, useEffect, useState } from "react";
-import { api, ApiClientError, clearSession, DEMO_MODE, loginDestination, setSession, setSessionPermissions } from "@/lib/api";
+import { api, ApiClientError, clearSession, CLERK_ENABLED, DEMO_MODE, loginDestination, invitationDestination, setSession, setSessionPermissions } from "@/lib/api";
 import { Field, PrimaryButton, TextInput } from "@/components/FormControls";
 import { GoogleSignInButton } from "@/components/GoogleSignInButton";
 
@@ -32,6 +32,7 @@ export default function LoginPage() {
   const [registrationMessage, setRegistrationMessage] = useState("");
 
   useEffect(() => {
+    if (CLERK_ENABLED) { window.location.replace("/sign-in" + window.location.search); return; }
     const params = new URLSearchParams(window.location.search);
     if (params.get("changed") === "1") setRegistrationMessage("Your account changed in another tab. Sign in to continue in the correct workspace.");
     if (params.get("expired") === "1") {
@@ -51,6 +52,9 @@ export default function LoginPage() {
       clearSession();
       queryClient.clear();
       setSession(data.accessToken, data.role ?? undefined);
+      const invitation = invitationDestination();
+      if (invitation) { window.location.assign(invitation); return; }
+      if (data.role?.startsWith("PLATFORM_")) { window.location.assign(loginDestination(data.role)); return; }
       if (!data.tenantId || !data.role) {
         window.location.assign("/onboarding");
         return;
@@ -77,6 +81,7 @@ export default function LoginPage() {
 
   const loginError = login.error instanceof ApiClientError ? login.error : null;
 
+  if (CLERK_ENABLED) return <main className="p-8" role="status">Opening secure sign in…</main>;
   return (
     <main className="grid min-h-screen bg-[#eef7f0] lg:grid-cols-[1fr_480px]">
       <section className="relative hidden overflow-hidden lg:block">

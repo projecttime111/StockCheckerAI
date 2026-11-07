@@ -2,7 +2,7 @@
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
-import { api, clearSession, DEMO_MODE, loginDestination, setSession, setSessionPermissions } from "@/lib/api";
+import { api, clearSession, DEMO_MODE, loginDestination, invitationDestination, setSession, setSessionPermissions } from "@/lib/api";
 
 type AuthResponse = {
   accessToken: string;
@@ -46,6 +46,9 @@ export function GoogleSignInButton({ label = "Continue with Google" }: { label?:
       clearSession();
       queryClient.clear();
       setSession(data.accessToken, data.role ?? undefined);
+      const invitation = invitationDestination();
+      if (invitation) { window.location.assign(invitation); return; }
+      if (data.role?.startsWith("PLATFORM_")) { window.location.assign(loginDestination(data.role)); return; }
       if (!data.tenantId || !data.role) {
         window.location.assign("/onboarding");
         return;

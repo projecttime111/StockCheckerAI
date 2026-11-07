@@ -108,7 +108,7 @@ public class AccountLifecycleService {
             .filter(candidate -> tenants.findByIdAndStatus(candidate.tenantId, DomainEnums.TenantStatus.ACTIVE).isPresent())
             .findFirst();
         var onboardingRequired = nextMembership.isEmpty();
-        var token = nextMembership
+        var token = "clerk".equals(TenantContext.authProvider()) ? null : nextMembership
             .map(activeMembership -> jwtService.issue(account.id, activeMembership.tenantId, account.email, activeMembership.role, account.authVersion))
             .orElseGet(() -> jwtService.issueAccountOnly(account.id, account.email, account.authVersion));
         scheduleFileCleanup(tenantId, actorUserId, outcome.storageKeys);
@@ -124,6 +124,7 @@ public class AccountLifecycleService {
 
     @Transactional
     public ApiDtos.AuthResponse createWorkspace(ApiDtos.WorkspaceCreateRequest request) {
+        if ("clerk".equals(TenantContext.authProvider())) throw ApiErrors.badRequest("Create or select a Clerk organization and use Clerk workspace onboarding");
         var userId = TenantContext.userId();
         var account = users.findAccountForLifecycle(userId).orElseThrow(() -> ApiErrors.notFound("User account not found"));
         var hasActiveWorkspace = memberships.findByUserId(userId).stream()
@@ -157,7 +158,7 @@ public class AccountLifecycleService {
         var userMemberships = memberships.findByUserId(userId);
         var ownsActiveWorkspace = userMemberships.stream().anyMatch(membership ->
             membership.role == DomainEnums.Role.OWNER
-                && tenants.findByIdAndStatus(membership.tenantId, DomainEnums.TenantStatus.ACTIVE).isPresent()
+                && tenants.findById(membership.tenantId).filter(tenant -> tenant.status != DomainEnums.TenantStatus.DELETED).isPresent()
         );
         if (ownsActiveWorkspace) {
             throw ApiErrors.conflict("Delete or transfer owned workspaces before deleting your account.");

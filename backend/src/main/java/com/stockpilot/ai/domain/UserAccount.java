@@ -12,6 +12,11 @@ public class UserAccount extends BaseAudit {
     public String passwordHash;
     public String fullName;
     public String googleSubject;
+    @jakarta.persistence.Column(unique = true, length = 128)
+    public String externalClerkId;
+    @jakarta.persistence.Enumerated(jakarta.persistence.EnumType.STRING)
+    @jakarta.persistence.Column(length = 32)
+    public DomainEnums.Role platformRole;
     public boolean active = true;
     public boolean emailVerified = true;
     public Instant emailVerifiedAt;

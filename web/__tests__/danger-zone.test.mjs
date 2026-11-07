@@ -21,7 +21,7 @@ test("workspace reset clears cached business data before redirect", () => {
 });
 
 test("workspace-less onboarding can create a workspace or delete the account", () => {
-  assert.match(onboarding, /api<AuthResponse>\("\/api\/tenants"/);
+  assert.match(onboarding, /api<AuthResponse>\(CLERK_ENABLED \? "\/api\/auth\/clerk\/workspace" : "\/api\/tenants"/);
   assert.match(onboarding, /DELETE MY ACCOUNT/);
   assert.match(onboarding, /\/api\/account/);
 });

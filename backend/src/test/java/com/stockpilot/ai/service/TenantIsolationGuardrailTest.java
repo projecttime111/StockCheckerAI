@@ -62,6 +62,21 @@ class TenantIsolationGuardrailTest {
         "service/TenantService.java", List.of("tenants.findById")
     );
 
+    // Exact call-site exceptions, not permission to read arbitrary IDs from these services:
+    // - Global app_users identity reads use only the authenticated account ID (including workspaceless invitations).
+    //   ClerkAuthIntegrationTest and WorkspaceTeamIntegrationTest cover cross-account linking/acceptance and denial.
+    // - Account deletion checks tenants reached only through the caller's OWNER memberships, including suspended
+    //   tenants, so account deletion cannot orphan an owned business (ClerkAuthIntegrationTest).
+    // - PlatformAdminAudit is a separate global operational audit, not tenant audit_logs. Its service requires a
+    //   tenantless session, current global DB role, and platform.audit.view; PlatformAdminIntegrationTest covers
+    //   business-user denial, platform-role separation, filtering, and tenant business-data isolation.
+    private static final Map<String, List<String>> VERIFIED_IDENTITY_AND_PLATFORM_CALLS = Map.of(
+        "service/AuthSessionService.java", List.of("users.findById(TenantContext.userId())"),
+        "service/WorkspaceInvitationService.java", List.of("users.findById(TenantContext.userId())"),
+        "service/AccountLifecycleService.java", List.of("tenants.findById(membership.tenantId)"),
+        "service/PlatformAdminService.java", List.of("audits.findAll(specification,PageRequest.of(")
+    );
+
     @Test
     void productionSourceDoesNotUseUnsafeUnscopedTenantOwnedAccess() throws IOException {
         assertThat(scanUnsafeRepositoryAccess(SOURCE_ROOT)).isEmpty();
@@ -92,6 +107,20 @@ class TenantIsolationGuardrailTest {
             """;
 
         assertThat(scanUnsafeRepositoryAccess("config/JwtAuthenticationFilter.java", source)).isEmpty();
+    }
+
+    @Test
+    void approvedIdentityReadsDoNotAllowClientSelectedUsersOrBusinessRecords() {
+        for (var path : List.of("service/AuthSessionService.java", "service/WorkspaceInvitationService.java")) {
+            assertThat(scanUnsafeRepositoryAccess(path, "users.findById(TenantContext.userId());")).isEmpty();
+            assertThat(scanUnsafeRepositoryAccess(path, "users.findById(request.userId());")).hasSize(1);
+            assertThat(scanUnsafeRepositoryAccess(path, "users.findById(TenantContext.userId()); users.findById(request.userId());")).hasSize(1);
+            assertThat(scanUnsafeRepositoryAccess(path, "users.findById(TenantContext.userId()); products.findById(id);"))
+                .singleElement().satisfies(violation -> assertThat(violation.message()).contains("products.findById"));
+        }
+        assertThat(scanUnsafeRepositoryAccess("service/AccountLifecycleService.java", "tenants.findById(request.tenantId());")).hasSize(1);
+        assertThat(scanUnsafeRepositoryAccess("service/PlatformAdminService.java", "audits.findAll(); products.findAll();")).hasSize(2);
+        assertThat(scanUnsafeRepositoryAccess("service/OtherService.java", "audits.findAll(specification,PageRequest.of(0,10));")).hasSize(1);
     }
 
     @Test
@@ -157,7 +186,7 @@ class TenantIsolationGuardrailTest {
             var matcher = UNSAFE_REPOSITORY_ACCESS.matcher(line);
             while (matcher.find()) {
                 var token = matcher.group(1) + "." + matcher.group(2);
-                if (!isAllowlisted(relativePath, token)) {
+                if (!isAllowlisted(relativePath, token, line.substring(matcher.start()))) {
                     violations.add(new Violation(relativePath, index + 1, "Unsafe unscoped repository access: " + token));
                 }
             }
@@ -218,12 +247,16 @@ class TenantIsolationGuardrailTest {
         return TENANT_OWNED_TABLES.stream().anyMatch(lower::contains);
     }
 
-    private boolean isAllowlisted(String relativePath, String token) {
+    private boolean isAllowlisted(String relativePath, String token, String callSource) {
         var normalized = relativePath.replace('\\', '/');
         return UNSCOPED_ACCESS_ALLOWLIST.entrySet().stream()
             .filter(entry -> normalized.endsWith(entry.getKey()))
             .flatMap(entry -> entry.getValue().stream())
-            .anyMatch(token::equals);
+            .anyMatch(token::equals)
+            || VERIFIED_IDENTITY_AND_PLATFORM_CALLS.entrySet().stream()
+                .filter(entry -> normalized.endsWith(entry.getKey()))
+                .flatMap(entry -> entry.getValue().stream())
+                .anyMatch(call -> call.startsWith(token + "(") && callSource.startsWith(call));
     }
 
     private Stream<Path> javaFiles(Path root) throws IOException {

@@ -2,7 +2,7 @@
 
 import { MutationCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactNode, useEffect, useState } from "react";
-import { ApiClientError, SESSION_CLEARED_EVENT, SESSION_CHANGED_EVENT, observeSessionChange } from "./api";
+import { ApiClientError, SESSION_CLEARED_EVENT, SESSION_CHANGED_EVENT, WORKSPACE_CHANGED_EVENT, observeSessionChange } from "./api";
 
 export function Providers({ children }: { children: ReactNode }) {
   const [client] = useState(() => {
@@ -25,10 +25,12 @@ export function Providers({ children }: { children: ReactNode }) {
       window.location.replace("/login?changed=1");
     };
     window.addEventListener(SESSION_CLEARED_EVENT, clear);
+    window.addEventListener(WORKSPACE_CHANGED_EVENT, clear);
     window.addEventListener(SESSION_CHANGED_EVENT, changed);
     window.addEventListener("storage", observeSessionChange);
     return () => {
       window.removeEventListener(SESSION_CLEARED_EVENT, clear);
+      window.removeEventListener(WORKSPACE_CHANGED_EVENT, clear);
       window.removeEventListener(SESSION_CHANGED_EVENT, changed);
       window.removeEventListener("storage", observeSessionChange);
     };

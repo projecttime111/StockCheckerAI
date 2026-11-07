@@ -4,6 +4,11 @@ import com.stockpilot.ai.config.TenantContext;
 import com.stockpilot.ai.repo.Repositories;
 import com.stockpilot.ai.service.AuthService;
 import com.stockpilot.ai.service.PermissionService;
+import com.stockpilot.ai.service.AuthSessionService;
+import com.stockpilot.ai.service.ClerkAccountService;
+import com.stockpilot.ai.service.ClerkOrganizationService;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 import com.stockpilot.ai.web.dto.ApiDtos;
 import jakarta.validation.Valid;
 import org.springframework.security.core.Authentication;
@@ -11,6 +16,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/auth")
@@ -18,11 +24,16 @@ public class AuthController {
     private final AuthService authService;
     private final Repositories.UserRepository users;
     private final PermissionService permissionService;
+    private final AuthSessionService sessions;
+    private final ClerkAccountService clerkAccounts;
+    private final ClerkOrganizationService clerkOrganizations;
 
-    public AuthController(AuthService authService, Repositories.UserRepository users, PermissionService permissionService) {
+    public AuthController(AuthService authService, Repositories.UserRepository users, PermissionService permissionService,
+        AuthSessionService sessions, ClerkAccountService clerkAccounts, ClerkOrganizationService clerkOrganizations) {
         this.authService = authService;
         this.users = users;
         this.permissionService = permissionService;
+        this.sessions = sessions; this.clerkAccounts = clerkAccounts; this.clerkOrganizations = clerkOrganizations;
     }
 
     @PostMapping("/register")
@@ -82,6 +93,33 @@ public class AuthController {
     @GetMapping("/me/tenants")
     public List<Map<String, Object>> tenants(Authentication authentication) {
         var user = users.findByEmailIgnoreCase(authentication.getName()).orElseThrow();
-        return permissionService.accessibleTenants(user.id);
+        return sessions.workspaces(user.id);
     }
+
+    @GetMapping("/session")
+    public Map<String, Object> session() { return sessions.currentSession(); }
+
+    @PostMapping("/platform")
+    public ApiDtos.AuthResponse platform() { return sessions.switchPlatform(); }
+
+    @PostMapping("/workspaces/{id}/switch")
+    public ApiDtos.AuthResponse switchWorkspace(@PathVariable UUID id) { return sessions.switchWorkspace(id); }
+
+    @PostMapping("/clerk/link")
+    public Map<String, Object> linkClerk(@Valid @RequestBody ClerkLinkRequest request) {
+        var user = clerkAccounts.link(request.clerkToken());
+        return Map.of("userId", user.id, "clerkLinked", true);
+    }
+
+    @PostMapping("/clerk/workspace")
+    public ApiDtos.AuthResponse createClerkWorkspace(@Valid @RequestBody ApiDtos.WorkspaceCreateRequest request) {
+        return clerkOrganizations.createWorkspace(request);
+    }
+
+    @PostMapping("/clerk/organization/link")
+    public Map<String, Object> linkOrganization(@Valid @RequestBody ClerkLinkRequest request) {
+        return clerkOrganizations.linkOrganization(request.clerkToken());
+    }
+
+    public record ClerkLinkRequest(@NotBlank @Size(max = 16384) String clerkToken) { }
 }

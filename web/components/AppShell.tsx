@@ -21,9 +21,10 @@ import {
   Users
 } from "lucide-react";
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
-import { ReactNode, useEffect, useState } from "react";
-import { api, clearSession, DEMO_MODE, getToken, getSessionPermissions, getSessionRole, setSessionPermissions } from "@/lib/api";
+import { usePathname } from "next/navigation";
+import { ReactNode } from "react";
+import { DEMO_MODE, signOutSession } from "@/lib/api";
+import { useSession } from "@/lib/session";
 
 type Role =
   | "OWNER"
@@ -43,8 +44,6 @@ type Role =
   | "PLATFORM_BILLING_ADMIN";
 
 type NavItem = { href: string; label: string; icon: typeof Home; roles: Role[]; permission?: string };
-type PermissionResponse = { role?: Role; permissions?: string[] };
-type TenantResponse = { id: string; name: string; businessMode: string };
 
 const businessRoles: Role[] = ["OWNER", "ADMIN", "MANAGER", "STAFF", "WAREHOUSE_STAFF", "SALES_STAFF", "PURCHASE_MANAGER", "ACCOUNTANT", "VIEWER", "AUDITOR"];
 const productRoles: Role[] = ["OWNER", "ADMIN", "MANAGER", "STAFF", "WAREHOUSE_STAFF", "SALES_STAFF", "PURCHASE_MANAGER", "VIEWER", "AUDITOR"];
@@ -85,12 +84,14 @@ const navGroups: { title: string; items: NavItem[] }[] = [
     ]
   },
   {
-    title: "Admin",
+    title: "Workspace management",
     items: [
       { href: "/imports", label: "Imports", icon: FileUp, roles: adminRoles, permission: "imports.view" },
       { href: "/integrations/tally", label: "Tally Hub", icon: ClipboardCheck, roles: adminRoles, permission: "integrations.tally.view" },
       { href: "/reports", label: "Reports", icon: FileText, roles: ["OWNER", "ADMIN", "MANAGER", "ACCOUNTANT", "VIEWER", "AUDITOR"], permission: "reports.view" },
       { href: "/audit-logs", label: "Audit Logs", icon: History, roles: ["OWNER", "ADMIN", "ACCOUNTANT", "AUDITOR"], permission: "audit.view" },
+      { href: "/team", label: "Team", icon: Users, roles: ownerAdmin, permission: "users.view" },
+      { href: "/billing", label: "Plan & usage", icon: ReceiptText, roles: ownerAdmin, permission: "billing.view" },
       { href: "/settings", label: "Settings", icon: Settings, roles: ownerAdmin, permission: "settings.view" }
     ]
   }
@@ -102,7 +103,7 @@ const portalNav = [
 
 const roleLabels: Record<Role, string> = {
   OWNER: "Owner panel",
-  ADMIN: "Admin panel",
+  ADMIN: "Business admin",
   MANAGER: "Manager panel",
   STAFF: "Staff operations",
   WAREHOUSE_STAFF: "Warehouse panel",
@@ -120,53 +121,18 @@ const roleLabels: Record<Role, string> = {
 
 export function AppShell({ children, title, actions }: { children: ReactNode; title: string; actions?: ReactNode }) {
   const pathname = usePathname();
-  const router = useRouter();
   const queryClient = useQueryClient();
-  const [role, setRole] = useState<Role | null>(null);
-  const [permissions, setPermissions] = useState<string[]>([]);
-  const [accessError, setAccessError] = useState<string | null>(null);
-  const [workspaceName, setWorkspaceName] = useState("Workspace");
-
-  useEffect(() => {
-    if (!DEMO_MODE && !getToken()) {
-      clearSession();
-      router.replace(`/login?next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
-      return;
-    }
-    const storedRole = getSessionRole() as Role | null;
-    setRole(storedRole);
-    setPermissions(getSessionPermissions());
-
-    let active = true;
-    api<PermissionResponse>("/api/auth/me/permissions")
-      .then((response) => {
-        if (!active) return;
-        if (response.role) {
-          setRole(response.role);
-        }
-        const nextPermissions = response.permissions ?? [];
-        setPermissions(nextPermissions);
-        setSessionPermissions(nextPermissions);
-      })
-      .catch(error => { if (active) setAccessError(error instanceof Error ? error.message : "Could not check workspace access"); });
-
-    api<TenantResponse>("/api/tenants/current")
-      .then((tenant) => {
-        if (!active) return;
-        setWorkspaceName(tenant.name || "Workspace");
-      })
-      .catch(() => undefined);
-
-    return () => {
-      active = false;
-    };
-  }, [router]);
+  const session = useSession();
+  const role = (session.data?.role ?? null) as Role | null;
+  const permissions = session.data?.permissions ?? [];
+  const accessError = session.error?.message;
+  const workspaceName = session.data?.workspaces.find(workspace => workspace.tenantId === session.data?.tenantId)?.name ?? "Workspace";
 
   const activeRole = role;
   const visibleGroups = activeRole === "CUSTOMER_USER"
     ? portalNav
     : navGroups
-        .map((group) => ({ ...group, items: group.items.filter((item) => canAccess(item, activeRole, permissions)) }))
+        .map((group) => ({ ...group, items: group.items.filter((item) => canAccess(item, activeRole, permissions) && (!DEMO_MODE || !["/team", "/billing"].includes(item.href))) }))
         .filter((group) => group.items.length > 0);
   const canUseAssistant = canUsePermission("ai.assistant.use", activeRole, permissions, ["OWNER", "ADMIN", "MANAGER", "STAFF"]);
 
@@ -175,7 +141,7 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
 
   return (
     <div className="min-h-screen bg-[#f7faf8]">
-      <aside className="fixed inset-y-0 left-0 z-20 hidden w-64 border-r border-ink/10 bg-white lg:block">
+      <aside className="fixed inset-y-0 left-0 z-20 hidden w-64 overflow-y-auto border-r border-ink/10 bg-white lg:block">
         <div className="flex h-16 items-center gap-3 border-b border-ink/10 px-5">
           <div className="flex h-10 w-10 items-center justify-center rounded bg-moss text-white">
             <BarChart3 size={21} />
@@ -220,6 +186,9 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
             </div>
             <div className="flex items-center gap-2">
               {permitted ? actions : null}
+              {!DEMO_MODE ? <Link className="rounded border border-ink/15 px-3 py-2 text-sm" href="/workspace/select">Switch workspace</Link> : null}
+              <Link className="rounded border border-ink/15 px-3 py-2 text-sm" href="/account/profile">My account</Link>
+              {session.data?.platformRole ? <Link className="text-sm font-semibold text-moss" href="/workspace/select">Platform admin</Link> : null}
               {activeRole !== "CUSTOMER_USER" && canUseAssistant ? (
                 <Link
                   className="focus-ring inline-flex items-center gap-2 rounded bg-moss px-3 py-2 text-sm font-semibold text-white"
@@ -232,9 +201,8 @@ export function AppShell({ children, title, actions }: { children: ReactNode; ti
               <button
                 className="focus-ring rounded border border-ink/15 px-3 py-2 text-sm font-medium text-ink/70 hover:bg-ink/[0.04]"
                 onClick={() => {
-                  clearSession();
                   queryClient.clear();
-                  router.push("/login");
+                  void signOutSession();
                 }}
               >
                 Sign out

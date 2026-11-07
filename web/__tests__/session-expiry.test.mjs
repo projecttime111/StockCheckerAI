@@ -86,3 +86,71 @@ test("F10 login destination permits local routes but rejects external and login-
   }
   assert.equal(api.loginDestination("CUSTOMER_USER", "?next=/dashboard"), "/portal");
 });
+
+test("platform and invitation destinations preserve separate entry points", () => {
+  const api = client();
+  assert.equal(api.loginDestination("PLATFORM_SUPER_ADMIN", "?next=/products"), "/admin");
+  assert.equal(api.loginDestination("PLATFORM_SUPPORT", "?next=/admin/imports"), "/admin/imports");
+  assert.equal(api.loginDestination("OWNER", "?next=/admin"), "/dashboard");
+  for (const next of ["/sign-in", "/sign-up", "/auth/complete"]) assert.equal(api.loginDestination("OWNER", `?next=${next}`), "/dashboard");
+  assert.equal(api.invitationDestination("?next=%2Fteam%2Faccept%3Ftoken%3Dinvite-token"), "/team/accept?token=invite-token");
+  for (const next of ["//other.test/team/accept?token=x", "/team/accept", "/products?token=x", "/\\other.test/team/accept?token=x"]) assert.equal(api.invitationDestination(`?next=${encodeURIComponent(next)}`), null);
+});
+
+test("Clerk retrieves a fresh token for each request without using stored local credentials", async () => {
+  const api = client({ NEXT_PUBLIC_CLERK_ENABLED: "true" });
+  let generation = 0; const seen = [];
+  api.configureClerkSession({ identity: "clerk:user:orgA", getToken: async () => `jwt-${++generation}`, signOut: async () => {} });
+  api.respond(async (url, init) => { seen.push([init.headers.get("Authorization"), init.headers.get("X-StockPilot-Mode")]); return new Response("{}"); });
+  await api.api("/api/products"); await api.api("/api/products");
+  assert.deepEqual(seen, [["Bearer jwt-1", "workspace"], ["Bearer jwt-2", "workspace"]]);
+  assert.equal(api.values.get("stockpilot.token"), "old-token");
+});
+
+test("Clerk late response from a previous organization is discarded without forcing a new login", async () => {
+  const api = client({ NEXT_PUBLIC_CLERK_ENABLED: "true" });
+  api.configureClerkSession({ identity: "clerk:user:orgA", getToken: async () => "orgA-jwt", signOut: async () => {} });
+  api.respond(async () => { api.configureClerkSession({ identity: "clerk:user:orgB", getToken: async () => "orgB-jwt", signOut: async () => {} }); return new Response('{"products":["private A"]}'); });
+  await assert.rejects(api.api("/api/products"), { status: 409, code: "SESSION_CHANGED" });
+  assert.equal(api.getToken(), "clerk:user:orgB");
+  assert.ok(api.events.every(event => event === "stockpilot:workspace-changed"));
+  assert.deepEqual(api.redirects, []);
+});
+
+test("Clerk does not send a request if the organization switches while fetching its token", async () => {
+  const api = client({ NEXT_PUBLIC_CLERK_ENABLED: "true" }); let called = false;
+  api.configureClerkSession({ identity: "clerk:user:orgA", getToken: async () => {
+    api.configureClerkSession({ identity: "clerk:user:orgB", getToken: async () => "orgB-jwt", signOut: async () => {} }); return "orgA-jwt";
+  }, signOut: async () => {} });
+  api.respond(async () => { called = true; return new Response("{}"); });
+  await assert.rejects(api.api("/api/products"), { status: 409 });
+  assert.equal(called, false);
+});
+
+test("platform calls explicitly select platform mode and dual-proof linking retains its local bearer", async () => {
+  const api = client({ NEXT_PUBLIC_CLERK_ENABLED: "true" }); const seen = []; let tokens = 0;
+  api.configureClerkSession({ identity: "clerk:user:orgA", getToken: async () => { tokens++; return "clerk-jwt"; }, signOut: async () => {} });
+  api.respond(async (url, init) => { seen.push([init.headers.get("Authorization"), init.headers.get("X-StockPilot-Mode")]); return new Response("{}"); });
+  await api.api("/api/platform/overview");
+  await api.api("/api/auth/clerk/link", { method: "POST", headers: { Authorization: "Bearer local-proof", "X-StockPilot-Mode": "auto" }, body: '{"clerkToken":"clerk-proof"}' });
+  assert.deepEqual(seen, [["Bearer clerk-jwt", "platform"], ["Bearer local-proof", "auto"]]);
+  assert.equal(tokens, 1);
+});
+
+test("Clerk sign-in timeout is bounded and provider failures do not clear unrelated local credentials", async () => {
+  const api = client({ NEXT_PUBLIC_CLERK_ENABLED: "true" }); let called = false;
+  api.configureClerkSession({ identity: "clerk:user:orgA", getToken: () => new Promise(() => {}), signOut: async () => {} });
+  api.respond(async () => { called = true; return new Response("{}"); });
+  await assert.rejects(api.api("/api/products", { timeoutMs: 5 }), { status: 408, code: "AUTH_TIMEOUT" });
+  assert.equal(called, false); assert.equal(api.values.get("stockpilot.token"), "old-token");
+  assert.deepEqual(api.redirects, []);
+});
+
+test("public invitation preview and registration never attach the signed-in bearer", async () => {
+  const api = client({ NEXT_PUBLIC_CLERK_ENABLED: "true" }); let calls = 0;
+  api.configureClerkSession({ identity: "clerk:user:orgA", getToken: async () => { throw new Error("Should not fetch token"); }, signOut: async () => {} });
+  api.respond(async (url, init) => { calls++; assert.equal(init.headers.get("Authorization"), null); return new Response("{}"); });
+  await api.api("/api/auth/invitations/preview", { method: "POST", body: "{}" });
+  await api.api("/api/auth/invitations/register", { method: "POST", body: "{}" });
+  assert.equal(calls, 2);
+});

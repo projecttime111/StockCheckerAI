@@ -1,6 +1,10 @@
 import type { Metadata } from "next";
 import { ModeBanner } from "@/components/ModeBanner";
 import { Providers } from "@/lib/query";
+import { ClerkProvider } from "@clerk/nextjs";
+import { IdentityProvider } from "@/components/IdentityProvider";
+import { WorkspaceBoundary } from "@/components/WorkspaceBoundary";
+import { CLERK_ENABLED } from "@/lib/api";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -9,11 +13,13 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  if (CLERK_ENABLED && !process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY) throw new Error("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY is required when Clerk is enabled");
+  const content = <Providers><IdentityProvider><WorkspaceBoundary>{children}</WorkspaceBoundary></IdentityProvider></Providers>;
   return (
     <html lang="en">
       <body>
         <ModeBanner />
-        <Providers>{children}</Providers>
+        {CLERK_ENABLED ? <ClerkProvider signInUrl="/sign-in" signUpUrl="/sign-up" signInFallbackRedirectUrl="/auth/complete" signUpFallbackRedirectUrl="/auth/complete">{content}</ClerkProvider> : content}
       </body>
     </html>
   );

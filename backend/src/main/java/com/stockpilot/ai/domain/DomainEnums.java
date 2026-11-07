@@ -9,7 +9,7 @@ public final class DomainEnums {
     }
 
     public enum TenantStatus {
-        ACTIVE, DELETED
+        ACTIVE, SUSPENDED, DELETED
     }
 
     public enum Role {

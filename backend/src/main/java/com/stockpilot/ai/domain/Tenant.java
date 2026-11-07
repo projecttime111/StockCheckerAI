@@ -11,6 +11,8 @@ import java.time.Instant;
 @Table(name = "tenants")
 public class Tenant extends BaseAudit {
     public String name;
+    @jakarta.persistence.Column(unique = true, length = 128)
+    public String clerkOrganizationId;
     @Enumerated(EnumType.STRING)
     public DomainEnums.BusinessMode businessMode = DomainEnums.BusinessMode.RETAIL;
     public String currency = "INR";

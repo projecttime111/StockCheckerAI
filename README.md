@@ -101,6 +101,8 @@ MinIO console: `http://localhost:9001`
 
 For a click-by-click demo path across web and mobile, see `LOCAL_TESTING_GUIDE.md`.
 
+For the platform administration panel, workspace invitations, and optional Clerk authentication, see [Platform and Clerk setup](docs/PLATFORM_AND_CLERK_SETUP.md). Clerk is disabled by default; existing local authentication remains available.
+
 ## Run Backend
 Use Java 21. Prefer the Maven wrapper so the project does not depend on a global Maven install:
 

@@ -23,6 +23,7 @@ import java.util.UUID;
 @Profile("!test")
 @ConditionalOnProperty(name = "app.demo.seed-enabled", havingValue = "true", matchIfMissing = false)
 public class DemoDataSeeder implements CommandLineRunner {
+    private static final int HISTORY_DAYS = 90;
     private final Repositories.UserRepository users;
     private final Repositories.TenantRepository tenants;
     private final Repositories.MembershipRepository memberships;
@@ -186,15 +187,19 @@ public class DemoDataSeeder implements CommandLineRunner {
             var product = productList.get(i);
             var qty = BigDecimal.valueOf(i == 0 ? 450 : 180 + (i * 25L));
             stockLedger.createMovement(tenant.id, product.id, main.id, DomainEnums.MovementType.OPENING_BALANCE, qty, unit.id, product.defaultPurchasePrice, "DEMO_SEED", UUID.randomUUID(), start.atStartOfDay().toInstant(ZoneOffset.UTC), "Demo opening balance");
-            stockLedger.createMovement(tenant.id, product.id, retail.id, DomainEnums.MovementType.OPENING_BALANCE, BigDecimal.valueOf(60 + (i * 5L)), unit.id, product.defaultPurchasePrice, "DEMO_SEED", UUID.randomUUID(), start.atStartOfDay().toInstant(ZoneOffset.UTC), "Demo retail counter opening balance");
+            // Purchases replenish only Main Godown. Fund the counter's entire sales
+            // history up front, retaining the intended stock for the current demo.
+            var retailClosingStock = BigDecimal.valueOf(60 + (i * 5L));
+            var retailOpeningStock = retailClosingStock.add(retailSalesDuringHistory(i));
+            stockLedger.createMovement(tenant.id, product.id, retail.id, DomainEnums.MovementType.OPENING_BALANCE, retailOpeningStock, unit.id, product.defaultPurchasePrice, "DEMO_SEED", UUID.randomUUID(), start.atStartOfDay().toInstant(ZoneOffset.UTC), "Demo retail counter opening balance");
         }
 
-        for (int day = 90; day >= 0; day--) {
+        for (int day = HISTORY_DAYS; day >= 0; day--) {
             var date = LocalDate.now(ZoneOffset.UTC).minusDays(day);
             if (day % 18 == 0) {
                 createPurchase(tenant.id, main.id, suppliersList.get(day / 18 % suppliersList.size()).id, productList, unit.id, date);
             }
-            createSale(tenant.id, day % 3 == 0 ? retail.id : main.id, customersList.get(day % customersList.size()).id, productList, unit.id, date, day);
+            createSale(tenant.id, retailSaleDay(day) ? retail.id : main.id, customersList.get(day % customersList.size()).id, productList, unit.id, date, day);
         }
 
         var payment = new CustomerPayment();
@@ -581,11 +586,11 @@ public class DemoDataSeeder implements CommandLineRunner {
         BigDecimal subtotal = BigDecimal.ZERO;
         BigDecimal tax = BigDecimal.ZERO;
         for (int i = 0; i < Math.min(8, productList.size()); i++) {
-            if (i == 7 && day % 4 != 0) {
+            var qty = saleQuantity(i, day);
+            if (qty.signum() == 0) {
                 continue;
             }
             var product = productList.get(i);
-            var qty = BigDecimal.valueOf(1 + ((day + i) % (i < 3 ? 8 : 4)));
             var lineSubtotal = qty.multiply(product.defaultSalesPrice);
             var lineTax = lineSubtotal.multiply(product.gstPercentage).divide(BigDecimal.valueOf(100));
             var item = new SalesInvoiceItem();
@@ -608,6 +613,21 @@ public class DemoDataSeeder implements CommandLineRunner {
         invoice.taxAmount = tax;
         invoice.totalAmount = subtotal.add(tax);
         salesInvoices.save(invoice);
+    }
+
+    private static boolean retailSaleDay(int day) { return day % 3 == 0; }
+
+    private static BigDecimal saleQuantity(int productIndex, int day) {
+        if (productIndex >= 8 || (productIndex == 7 && day % 4 != 0)) return BigDecimal.ZERO;
+        return BigDecimal.valueOf(1 + ((day + productIndex) % (productIndex < 3 ? 8 : 4)));
+    }
+
+    private static BigDecimal retailSalesDuringHistory(int productIndex) {
+        var total = BigDecimal.ZERO;
+        for (int day = HISTORY_DAYS; day >= 0; day--) {
+            if (retailSaleDay(day)) total = total.add(saleQuantity(productIndex, day));
+        }
+        return total;
     }
 
     private record ProductSeed(String sku, String name, String category, String brand, String barcode, String cost, String price, String reorderPoint, String safetyStock) {

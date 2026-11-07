@@ -39,4 +39,9 @@ public class ResendEmailService implements EmailService {
             .retrieve()
             .toBodilessEntity();
     }
+
+    @Override
+    public void sendWorkspaceInvitation(String email, String workspaceName, String invitationLink) {
+        send(email, "Join your StockPilot AI workspace", "You have been invited to " + workspaceName + ". Accept your invitation: " + invitationLink);
+    }
 }

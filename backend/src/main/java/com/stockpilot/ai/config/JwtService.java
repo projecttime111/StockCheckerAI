@@ -70,6 +70,14 @@ public class JwtService {
             .compact();
     }
 
+    public String issuePlatform(UUID userId, String email, DomainEnums.Role platformRole, long authVersion) {
+        if (!com.stockpilot.ai.service.AuthRoles.isPlatform(platformRole)) throw new IllegalArgumentException("A global platform grant is required");
+        var now = Instant.now();
+        return Jwts.builder().subject(email).claim("uid", userId.toString()).claim("mode", "platform")
+            .claim("av", authVersion).issuedAt(Date.from(now))
+            .expiration(Date.from(now.plusSeconds(accessTokenMinutes * 60))).signWith(key).compact();
+    }
+
     public Claims parse(String token) {
         return Jwts.parser().verifyWith(key).build().parseSignedClaims(token).getPayload();
     }

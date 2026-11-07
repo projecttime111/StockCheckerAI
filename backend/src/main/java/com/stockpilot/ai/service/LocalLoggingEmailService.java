@@ -15,4 +15,9 @@ public class LocalLoggingEmailService implements EmailService {
     public void sendPasswordResetEmail(String email, String resetLink) {
         log.warn("LOCAL EMAIL ONLY - password reset email for {}: {}", email, resetLink);
     }
+
+    @Override
+    public void sendWorkspaceInvitation(String email, String workspaceName, String invitationLink) {
+        log.warn("LOCAL EMAIL ONLY - workspace invitation for {} to {}: {}", email, workspaceName, invitationLink);
+    }
 }
