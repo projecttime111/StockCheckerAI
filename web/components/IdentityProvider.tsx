@@ -18,6 +18,21 @@ function ClerkSessionBridge({ children }: { children: ReactNode }) {
     setReadyIdentity(identity);
     return () => configureClerkSession(null);
   }, [identity, isLoaded, getToken, signOut, setActive]);
-  if (!isLoaded || readyIdentity !== identity || !clerkSessionReady(identity)) return <div className="p-8 text-sm" role="status">Preparing your secure session…</div>;
+  if (!isLoaded || readyIdentity !== identity || !clerkSessionReady(identity)) return <SessionLoading key={identity} />;
   return <>{children}</>;
+}
+
+function SessionLoading() {
+  const [delayed, setDelayed] = useState(false);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDelayed(true), 15_000);
+    return () => window.clearTimeout(timer);
+  }, []);
+  return <main className="flex min-h-screen items-center justify-center bg-[#eef7f0] p-5">
+    <div className="w-full max-w-md space-y-4 rounded-2xl bg-white p-8 shadow-sm">
+      <h1 className="text-xl font-semibold">Connecting to StockPilot</h1>
+      <p role="status" className="text-sm">{delayed ? "Sign-in is taking longer than expected. Check your connection and retry." : "Preparing your secure session…"}</p>
+      {delayed && <button type="button" className="rounded bg-moss px-4 py-2 text-white" onClick={() => window.location.reload()}>Retry sign-in</button>}
+    </div>
+  </main>;
 }
