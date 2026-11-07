@@ -3,6 +3,7 @@
 import { MutationCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactNode, useEffect, useState } from "react";
 import { ApiClientError, SESSION_CLEARED_EVENT, SESSION_CHANGED_EVENT, WORKSPACE_CHANGED_EVENT, observeSessionChange } from "./api";
+import { RequestProgress } from "@/components/RequestProgress";
 
 export function Providers({ children }: { children: ReactNode }) {
   const [client] = useState(() => {
@@ -36,5 +37,5 @@ export function Providers({ children }: { children: ReactNode }) {
     };
   }, [client]);
 
-  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+  return <QueryClientProvider client={client}><RequestProgress />{children}</QueryClientProvider>;
 }

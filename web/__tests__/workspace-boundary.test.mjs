@@ -15,6 +15,7 @@ const module = { exports: {} };
 const source = ts.transpileModule(readFileSync(new URL("../components/WorkspaceBoundary.tsx", import.meta.url), "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true, target: ts.ScriptTarget.ES2022 } }).outputText;
 new Function("require", "module", "exports", source)(name => {
   if (name === "@/lib/api") return { getToken: () => signedIn ? "identity" : null, signOutSession: async () => {} };
+  if (name === "@/components/LoadingState") return { LoadingState: ({ title }) => React.createElement("div", { role: "status" }, title) };
   if (name === "@/lib/session") return { useSession: () => ({ ...session, refetch: () => { retries++; } }) };
   if (name === "next/navigation") return { usePathname: () => pathname, useRouter: () => router };
   if (name === "next/link") return { __esModule: true, default: ({ children, ...props }) => React.createElement("a", props, children) };

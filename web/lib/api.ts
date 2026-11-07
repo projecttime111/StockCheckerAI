@@ -6,8 +6,18 @@ export const SESSION_CLEARED_EVENT = "stockpilot:session-cleared";
 export const SESSION_CHANGED_EVENT = "stockpilot:session-changed";
 export const WORKSPACE_CHANGED_EVENT = "stockpilot:workspace-changed";
 let sessionTokenSnapshot: string | null | undefined;
+let observedSession: string | null | undefined;
+let sessionRevision = 0;
 type ClerkBridge = { identity: string | null; getToken: () => Promise<string | null>; signOut: () => Promise<void>; clearOrganization?: () => Promise<void> };
 let clerkBridge: ClerkBridge | null = null;
+let requestActivity = { pending: 0, writes: 0 };
+const activityListeners = new Set<() => void>();
+export function getRequestActivity() { return requestActivity; }
+export function subscribeRequestActivity(listener: () => void) { activityListeners.add(listener); return () => { activityListeners.delete(listener); }; }
+function trackRequest(write: boolean, change: 1 | -1) {
+  requestActivity = { pending: requestActivity.pending + change, writes: requestActivity.writes + (write ? change : 0) };
+  activityListeners.forEach(listener => listener());
+}
 export function configureClerkSession(bridge: ClerkBridge | null) {
   const previous = clerkBridge?.identity;
   clerkBridge = bridge;
@@ -88,6 +98,13 @@ export function getToken() {
   if (typeof window === "undefined") return null;
   if (CLERK_ENABLED) return clerkBridge?.identity ?? null;
   return window.localStorage.getItem("stockpilot.token");
+}
+
+// Query keys must change with the account without containing a bearer token.
+export function getSessionIdentity() {
+  const identity = getToken();
+  if (observedSession !== identity) { observedSession = identity; sessionRevision++; }
+  return identity ? (CLERK_ENABLED ? identity : `local:${sessionRevision}`) : null;
 }
 
 export function getSessionRole() {
@@ -194,12 +211,20 @@ function isPublicAuth(path: string) {
 }
 
 async function request(path: string, init: ApiOptions, asText: boolean): Promise<unknown> {
+  const write = !["GET", "HEAD"].includes((init.method ?? "GET").toUpperCase());
+  trackRequest(write, 1);
+  try { return await performRequest(path, init, asText); }
+  finally { trackRequest(write, -1); }
+}
+
+async function performRequest(path: string, init: ApiOptions, asText: boolean): Promise<unknown> {
   assertSessionUnchanged(path);
   const publicAuth = isPublicAuth(path);
   const identity = getToken();
   const headers = new Headers(init.headers);
   const token = publicAuth || headers.has("Authorization") ? null : CLERK_ENABLED ? await getClerkSessionToken(Math.min(init.timeoutMs ?? 10_000, 10_000)) : identity;
   if (!publicAuth && identity !== getToken()) throw new ApiClientError("Workspace changed. Please retry from the selected workspace.", 409, "SESSION_CHANGED");
+  if (CLERK_ENABLED && !publicAuth && !headers.has("Authorization") && !token) throw new ApiClientError("Your sign-in session has expired. Please sign in again.", 401, "SESSION_EXPIRED");
   if (!(init.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
   }
@@ -221,7 +246,7 @@ async function request(path: string, init: ApiOptions, asText: boolean): Promise
   try {
   const response = await fetch(`${API_URL}${path}`, { ...options, headers, signal: controller.signal });
   if (!response.ok) {
-    const body = await response.json().catch(() => ({ message: response.statusText }));
+    const body = await response.json().catch(() => ({ message: response.status >= 500 ? "The service is starting or temporarily unavailable. Please try again shortly." : response.statusText }));
     if (response.status === 401 && token && getToken() === identity && !CLERK_ENABLED) {
       clearSession();
       if (window.location.pathname !== "/login") {

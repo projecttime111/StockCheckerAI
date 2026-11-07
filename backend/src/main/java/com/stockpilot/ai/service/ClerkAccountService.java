@@ -22,17 +22,28 @@ public class ClerkAccountService {
     private final ClerkJwtVerifier verifier;
     private final PasswordEncoder passwords;
     private final AuditService audit;
+    private final ClerkMigrationPolicy migration;
+    private final PlatformBootstrapService platformBootstrap;
     public ClerkAccountService(AuthIdentityRepository identities, Repositories.UserRepository users,
-        ClerkBackendClient clerk, ClerkJwtVerifier verifier, PasswordEncoder passwords, AuditService audit) {
+        ClerkBackendClient clerk, ClerkJwtVerifier verifier, PasswordEncoder passwords, AuditService audit,
+        ClerkMigrationPolicy migration, PlatformBootstrapService platformBootstrap) {
         this.identities = identities; this.users = users; this.clerk = clerk; this.verifier = verifier;
         this.passwords = passwords; this.audit = audit;
+        this.migration = migration; this.platformBootstrap = platformBootstrap;
     }
     @Transactional
     public UserAccount resolve(ClerkJwtVerifier.VerifiedClerkIdentity identity) {
         var linked = identities.findByExternalClerkId(identity.subject());
-        if (linked.isPresent()) return requireActive(linked.get());
+        if (linked.isPresent()) {
+            var account = requireActive(linked.get());
+            // Ordinary requests keep their existing fast path; only a configured bootstrap candidate needs a fresh profile.
+            if (platformBootstrap.needsGrant(account)) account = platformBootstrap.grantVerifiedClerk(account, clerk.verifiedProfile(identity.subject()));
+            return requireActive(account);
+        }
         var profile = clerk.verifiedProfile(identity.subject());
         if (users.existsByEmailIgnoreCase(profile.email())) {
+            if (!migration.enabled()) throw new ApiException(HttpStatus.CONFLICT, "CLERK_ACCOUNT_EXISTS",
+                "An existing StockPilot account already uses this email. Contact support to restore access; account migration is currently unavailable.");
             throw new ApiException(HttpStatus.CONFLICT, "CLERK_ACCOUNT_LINK_REQUIRED", "Sign in with your existing StockPilot account and explicitly link Clerk before continuing.");
         }
         var account = new UserAccount(); account.externalClerkId = identity.subject();
@@ -41,10 +52,11 @@ public class ClerkAccountService {
         account.emailVerified = true; account.emailVerifiedAt = Instant.now();
         users.saveAndFlush(account);
         audit.log(null, account.id, "CLERK_ACCOUNT_CREATED", "UserAccount", account.id, Map.of());
-        return account;
+        return platformBootstrap.grantVerifiedClerk(account, profile);
     }
     @Transactional
     public UserAccount link(String clerkToken) {
+        migration.requireEnabled();
         if (!"local".equals(TenantContext.authProvider())) throw ApiErrors.forbidden("Sign in with your existing StockPilot credentials before linking Clerk");
         var identity = verifyLinkProof(clerkToken);
         var profile = clerk.verifiedProfile(identity.subject());
@@ -57,6 +69,7 @@ public class ClerkAccountService {
         audit.log(null, account.id, "CLERK_ACCOUNT_LINKED", "UserAccount", account.id, Map.of());
         return account;
     }
+    public void requireMigrationEnabled() { migration.requireEnabled(); }
     public ClerkJwtVerifier.VerifiedClerkIdentity verifyLinkProof(String token) {
         try { return verifier.verify(token); }
         catch (ApiException ex) { throw ex; }

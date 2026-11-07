@@ -29,6 +29,23 @@ test("cross-tab account change blocks the next write before it can use another t
 test("a stalled write has a deadline and warns that completion is unknown", async () => {
   const api = client((_url, init) => new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")))));
   await assert.rejects(api.api("/api/imports/batch/commit", { method: "POST", timeoutMs: 10 }), error => error.code === "REQUEST_TIMEOUT" && /may still have completed/.test(error.message));
+  assert.deepEqual(api.getRequestActivity(), { pending: 0, writes: 0 });
+});
+
+test("request activity remains busy until all concurrent requests finish, including rejected writes", async () => {
+  const finish = [], snapshots = [];
+  const api = client(() => new Promise(resolve => finish.push(resolve)));
+  const unsubscribe = api.subscribeRequestActivity(() => snapshots.push(api.getRequestActivity()));
+  const read = api.api("/api/products");
+  const write = api.api("/api/products", { method: "POST", body: "{}" });
+  assert.deepEqual(api.getRequestActivity(), { pending: 2, writes: 1 });
+  finish[0](new Response("{}")); await read;
+  assert.deepEqual(api.getRequestActivity(), { pending: 1, writes: 1 });
+  finish[1](new Response('{"message":"Validation failed"}', { status: 400 }));
+  await assert.rejects(write, { status: 400 });
+  assert.deepEqual(api.getRequestActivity(), { pending: 0, writes: 0 });
+  assert.deepEqual(snapshots.map(value => value.pending), [1, 2, 1, 0]);
+  unsubscribe();
 });
 
 test("a successful response from an earlier account is discarded after its body finishes", async () => {

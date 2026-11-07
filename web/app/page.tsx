@@ -1,5 +1,35 @@
-import { redirect } from "next/navigation";
+import Link from "next/link";
+import { ArrowRight, ArrowUpRight, Boxes, ChartNoAxesCombined, Check, FileSpreadsheet, Import, Layers3, ShieldCheck, Users, Warehouse } from "lucide-react";
+import { Brand } from "@/components/marketing/Brand";
+import { DashboardPreview } from "@/components/marketing/DashboardPreview";
+import { CLERK_ENABLED } from "@/lib/api";
+
+const capabilities = [
+  { icon: Boxes, title: "Know what’s in stock.", description: "Track products, stock movements, and warehouse balances in one place. Spot low stock before your next order.", label: "Inventory & warehouses", className: "sp-feature-inventory" },
+  { icon: FileSpreadsheet, title: "Start with the data you have.", description: "Bring in Tally exports or Excel files. Map your columns, review validation issues, then commit the data you’re ready to use.", label: "Imports with a review step", className: "sp-feature-imports" },
+  { icon: ChartNoAxesCombined, title: "Plan with a clearer picture.", description: "Explore demand forecasts, reorder suggestions, and slow-moving stock using the sales history available in your workspace.", label: "Forecasts & stock insights", className: "sp-feature-forecast" },
+  { icon: Users, title: "Keep your people in sync.", description: "Invite your team, assign roles, and give each person the access they need to work across inventory, sales, and purchases.", label: "Teams & daily operations", className: "sp-feature-team" }
+];
 
 export default function Home() {
-  redirect("/login");
+  const signIn = CLERK_ENABLED ? "/sign-in" : "/login";
+  const signUp = CLERK_ENABLED ? "/sign-up" : "/register";
+  return <div className="sp-site">
+    <a className="sp-skip-link" href="#main-content">Skip to content</a>
+    <header className="sp-header"><div className="sp-container sp-nav"><Brand /><nav aria-label="Main navigation"><a href="#features" className="sp-nav-text">Features</a><a href="#how-it-works" className="sp-nav-text">How it works</a><Link href={signIn} className="sp-nav-signin focus-ring">Sign in</Link><Link href={signUp} className="sp-button sp-button-dark sp-nav-cta">Get started <ArrowUpRight size={15} /></Link></nav></div></header>
+    <main id="main-content">
+      <section className="sp-hero sp-container" aria-labelledby="hero-heading">
+        <div className="sp-hero-copy sp-reveal"><p className="sp-eyebrow"><span /> Inventory clarity. Everyday confidence.</p><h1 id="hero-heading">Less guesswork.<br />More <span>stock sense.</span></h1><p className="sp-hero-description">Know what you have, what’s moving, and what comes next. One clear workspace for your inventory, your team, and your growing business.</p><div className="sp-hero-actions"><Link href={signUp} className="sp-button sp-button-dark">Create your workspace <ArrowRight size={18} /></Link><a href="#product-preview" className="sp-button sp-button-light">Take a closer look <ArrowDownIcon /></a></div><p className="sp-hero-note"><Check size={15} /> For retailers, distributors, and the teams behind them.</p></div>
+        <div className="sp-hero-decoration" aria-hidden="true"><div className="sp-orbit sp-orbit-one" /><div className="sp-orbit sp-orbit-two" /><div className="sp-floating-label sp-floating-top"><Warehouse size={16} /><span>Every location.<br /><strong>One clear view.</strong></span></div><div className="sp-floating-cube"><Layers3 size={64} strokeWidth={1.1} /></div><div className="sp-floating-label sp-floating-bottom"><ChartNoAxesCombined size={17} /><span>See the pattern.<br /><strong>Plan the next move.</strong></span></div></div>
+      </section>
+      <section id="product-preview" className="sp-container sp-product-section" aria-label="Product preview"><DashboardPreview /></section>
+      <section className="sp-workflow-strip sp-container" aria-label="Connected business workflows"><p>From the tools you use.<br /><strong>To the clarity you need.</strong></p><div><FileSpreadsheet size={21} /><span>Tally exports</span></div><div><Import size={21} /><span>Excel imports</span></div><div><Warehouse size={21} /><span>Every warehouse</span></div><div><Users size={21} /><span>Your whole team</span></div></section>
+      <section id="features" className="sp-features sp-container" aria-labelledby="features-heading"><div className="sp-section-heading"><div><p className="sp-eyebrow">A place for the whole picture</p><h2 id="features-heading">From stock on the shelf<br />to your <span>next smart move.</span></h2></div><p>The everyday details and the bigger picture, together. Spend less time piecing things together and more time running your business.</p></div><div className="sp-feature-grid">{capabilities.map(({ icon: Icon, ...feature }) => <article key={feature.title} className={`sp-feature-card ${feature.className}`}><div className="sp-feature-top"><span className="sp-feature-icon"><Icon size={24} strokeWidth={1.6} /></span><span>{feature.label}</span></div><h3>{feature.title}</h3><p>{feature.description}</p></article>)}</div></section>
+      <section id="how-it-works" className="sp-how-section" aria-labelledby="steps-heading"><div className="sp-container"><div className="sp-section-heading"><div><p className="sp-eyebrow">A simple way to start</p><h2 id="steps-heading">Your next chapter.<br /><span>Three simple steps.</span></h2></div><p>Keep your accounting system. Give your inventory a workspace of its own.</p></div><ol className="sp-step-grid">{[{ title: "Make it your workspace", text: "Create your account, set up your business, and bring your team on board." }, { title: "Bring your data together", text: "Add your products or import existing records. Review the details before they enter your workspace." }, { title: "Find your next move", text: "Track daily stock, explore demand, and decide what needs your attention next." }].map((step, index) => <li key={step.title}><span className="sp-step-number">0{index + 1}</span><h3>{step.title}</h3><p>{step.text}</p></li>)}</ol><div className="sp-accounting-note"><ShieldCheck size={20} /><p><strong>Your accounting stays where it belongs.</strong> StockPilot complements your existing tools; it does not replace Tally’s accounting and compliance workflows.</p></div></div></section>
+      <section className="sp-container sp-cta-section"><div className="sp-final-cta"><span className="sp-eyebrow sp-eyebrow-light">Make room for clarity</span><h2>A better view of your stock.<br />A clearer start to your day.</h2><p>Your next decision starts with knowing where you stand.</p><Link href={signUp} className="sp-button sp-button-cream">Get started with StockPilot <ArrowRight size={18} /></Link><div className="sp-cta-signin">Already have an account? <Link href={signIn}>Sign in <ArrowUpRight size={13} /></Link></div></div></section>
+    </main>
+    <footer className="sp-footer sp-container"><div><Brand /><p>Inventory intelligence for the everyday.</p></div><nav aria-label="Footer navigation"><a href="#features">Features</a><a href="#how-it-works">How it works</a><Link href={signIn}>Sign in</Link></nav><span>© {new Date().getFullYear()} StockPilot AI</span></footer>
+  </div>;
 }
+
+function ArrowDownIcon() { return <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 4v16m-6-6 6 6 6-6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>; }

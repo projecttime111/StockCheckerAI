@@ -154,3 +154,24 @@ test("public invitation preview and registration never attach the signed-in bear
   await api.api("/api/auth/invitations/register", { method: "POST", body: "{}" });
   assert.equal(calls, 2);
 });
+
+test("an expired Clerk session fails visibly without sending an anonymous business request", async () => {
+  const api = client({ NEXT_PUBLIC_CLERK_ENABLED: "true" }); let requests = 0;
+  api.configureClerkSession({ identity: "clerk:user:personal", getToken: async () => null, signOut: async () => {} });
+  api.respond(async () => { requests++; return new Response("{}"); });
+  await assert.rejects(api.api("/api/auth/session"), { status: 401, code: "SESSION_EXPIRED" });
+  assert.equal(requests, 0);
+  assert.deepEqual(api.getRequestActivity(), { pending: 0, writes: 0 });
+});
+
+test("local cache identities change across accounts without exposing bearer tokens in query keys", () => {
+  const api = client();
+  const first = api.getSessionIdentity();
+  assert.equal(first, api.getSessionIdentity());
+  assert.doesNotMatch(first, /old-token/);
+  api.setSession("second-private-token");
+  assert.notEqual(api.getSessionIdentity(), first);
+  assert.doesNotMatch(api.getSessionIdentity(), /second-private-token/);
+  api.clearSession();
+  assert.equal(api.getSessionIdentity(), null);
+});

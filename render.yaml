@@ -43,11 +43,15 @@ services:
       - key: APP_AUTH_REQUIRE_EMAIL_VERIFICATION
         value: "true"
       - key: APP_CLERK_ENABLED
+        # Keep the operator's deployed value when syncing an existing Blueprint.
+        sync: false
+      - key: APP_CLERK_LEGACY_MIGRATION_ENABLED
         value: "false"
       # Optional: before enabling Clerk, add CLERK_ISSUER, CLERK_AUTHORIZED_PARTIES,
       # and the private CLERK_SECRET_KEY in Render's environment settings.
       # CLERK_JWT_PUBLIC_KEY is optional. Do not place secret values in this blueprint.
-      # APP_PLATFORM_ADMIN_EMAILS may bootstrap explicitly trusted, verified accounts.
+      # APP_PLATFORM_ADMIN_EMAILS bootstraps exact trusted verified Clerk emails or existing local accounts.
+      # Remove the bootstrap allowlist after the grant has been saved.
       # See docs/PLATFORM_AND_CLERK_SETUP.md for activation and rollback.
       - key: APP_DEMO_SEED_ENABLED
         value: "false"

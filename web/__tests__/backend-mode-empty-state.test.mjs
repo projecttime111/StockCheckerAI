@@ -17,8 +17,9 @@ test("backend mode keeps demo API behind the env flag", () => {
   assert.match(login, /\{DEMO_MODE \? \(/);
   assert.match(login, /Account created successfully\. Sign in with your new credentials\./);
   assert.match(login, /params\.get\("email"\)/);
-  assert.match(home, /redirect\("\/login"\)/);
-  assert.doesNotMatch(home, /redirect\("\/"\)/);
+  assert.match(home, /CLERK_ENABLED \? "\/sign-in" : "\/login"/);
+  assert.match(home, /CLERK_ENABLED \? "\/sign-up" : "\/register"/);
+  assert.doesNotMatch(home, /redirect\(/);
 });
 
 test("production backend mode rejects a missing or insecure API URL", () => {

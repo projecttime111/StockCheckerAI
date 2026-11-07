@@ -3,13 +3,41 @@
 import { SignIn, SignUp, useAuth } from "@clerk/nextjs";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ComponentProps } from "react";
+import { ArrowRight, LoaderCircle, ShieldCheck } from "lucide-react";
 import { CLERK_ENABLED, signOutSession } from "@/lib/api";
+import { AuthShell } from "@/components/marketing/AuthShell";
 
 const RECOVERY_DELAY_MS = 15_000;
+const appearance: ComponentProps<typeof SignIn>["appearance"] = {
+  variables: {
+    colorPrimary: "#195840",
+    colorBackground: "#ffffff",
+    colorForeground: "#162c23",
+    colorMutedForeground: "#67756c",
+    colorInput: "#ffffff",
+    colorInputForeground: "#162c23",
+    colorDanger: "#b83e32",
+    borderRadius: "0.75rem",
+    fontFamily: "inherit",
+    fontSize: "0.9375rem"
+  },
+  elements: {
+    rootBox: "sp-clerk-root",
+    cardBox: "sp-clerk-card-box",
+    card: "sp-clerk-card",
+    headerTitle: "sp-clerk-title",
+    headerSubtitle: "sp-clerk-subtitle",
+    socialButtonsBlockButton: "sp-clerk-social",
+    formButtonPrimary: "sp-clerk-primary",
+    formFieldInput: "sp-clerk-input",
+    footerActionLink: "sp-clerk-link",
+    footer: "sp-clerk-footer"
+  }
+};
 
 export function ClerkEntry({ signup = false }: { signup?: boolean }) {
-  if (!CLERK_ENABLED) return <main className="p-10"><Link className="underline" href={signup ? "/register" : "/login"}>Continue to {signup ? "registration" : "sign in"}</Link></main>;
+  if (!CLERK_ENABLED) return <AuthShell signup={signup}><div className="sp-auth-state"><span className="sp-auth-state-icon"><ShieldCheck size={25} /></span><h2>{signup ? "Your next chapter starts here." : "Welcome back."}</h2><p>{signup ? "Create your account and bring your business into focus." : "Sign in to pick up where you left off."}</p><Link className="sp-button sp-button-dark mt-6" href={signup ? "/register" : "/login"}>Continue to {signup ? "registration" : "sign in"}<ArrowRight size={17} /></Link></div></AuthShell>;
   return <EnabledClerkEntry signup={signup} />;
 }
 
@@ -41,15 +69,18 @@ function EnabledClerkEntry({ signup }: { signup: boolean }) {
     return () => clearTimeout(timer);
   }, [active]);
 
-  return <main className="flex min-h-screen items-center justify-center bg-[#eef7f0] p-5">
-    {active ? <div className="w-full max-w-md rounded-xl border border-ink/10 bg-white p-6 shadow-soft">
-      <h1 className="text-xl font-semibold">You’re signed in</h1>
-      <p role="status" className="mt-3 text-sm text-ink/60">Opening your workspace…</p>
+  return <AuthShell signup={signup}>
+    {active ? <div className="sp-auth-state">
+      <span className="sp-auth-state-icon"><LoaderCircle size={26} className="sp-loading-spinner" aria-hidden="true" /></span>
+      <h2>You’re signed in</h2>
+      <p role="status" aria-live="polite">Opening your workspace…</p>
+      <div className="sp-loading-track" aria-hidden="true"><span /></div>
       {stalled || navigationError ? <EntryRecovery destination={destination ?? "/auth/complete"} /> : null}
     </div> : !isLoaded || !destination ? <EntryFallback signup={signup} /> : signup
-      ? <SignUp routing="path" path="/sign-up" signInUrl="/sign-in" forceRedirectUrl={destination} fallback={<EntryFallback signup />} />
-      : <SignIn routing="path" path="/sign-in" signUpUrl="/sign-up" forceRedirectUrl={destination} fallback={<EntryFallback />} />}
-  </main>;
+      ? <SignUp routing="path" path="/sign-up" signInUrl="/sign-in" forceRedirectUrl={destination} appearance={appearance} fallback={<EntryFallback signup />} />
+      : <SignIn routing="path" path="/sign-in" signUpUrl="/sign-up" forceRedirectUrl={destination} appearance={appearance} fallback={<EntryFallback />} />}
+    {!active ? <p className="sp-auth-account-switch">{signup ? "Already have an account?" : "New to StockPilot?"} <Link href={signup ? "/sign-in" : "/sign-up"}>{signup ? "Sign in" : "Create an account"}<ArrowRight size={14} /></Link></p> : null}
+  </AuthShell>;
 }
 
 function EntryFallback({ signup = false }: { signup?: boolean }) {
@@ -58,9 +89,11 @@ function EntryFallback({ signup = false }: { signup?: boolean }) {
     const timer = setTimeout(() => setSlow(true), RECOVERY_DELAY_MS);
     return () => clearTimeout(timer);
   }, []);
-  return <div className="w-full max-w-md rounded-xl border border-ink/10 bg-white p-6 shadow-soft">
-    <h1 className="text-xl font-semibold">{signup ? "Create your account" : "Sign in to StockPilot"}</h1>
-    <p role="status" className="mt-3 text-sm text-ink/60">{slow ? "The secure sign-in form is taking longer than expected. Check your connection and reload to try again." : "Loading the secure sign-in form…"}</p>
+  return <div className="sp-auth-state">
+    <span className="sp-auth-state-icon"><LoaderCircle size={26} className="sp-loading-spinner" aria-hidden="true" /></span>
+    <h2>{signup ? "Create your account" : "Sign in to StockPilot"}</h2>
+    <p role="status" aria-live="polite">{slow ? "The secure sign-in form is taking longer than expected. Check your connection and reload to try again." : "Loading the secure sign-in form…"}</p>
+    <div className="sp-auth-skeleton" aria-hidden="true"><span /><span /><span /></div>
     {slow ? <button type="button" className="focus-ring mt-4 rounded border border-ink/15 px-3 py-2 text-sm font-semibold text-moss" onClick={() => window.location.reload()}>Reload sign-in form</button> : null}
   </div>;
 }

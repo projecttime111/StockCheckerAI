@@ -13,20 +13,23 @@ const require = createRequire(import.meta.url), React = require("react");
 const getToken = async () => "session-token";
 const clerk = { signOut: async () => {}, setActive: async () => {} };
 let auth = { isLoaded: false, userId: null, orgId: null, getToken }, bridge = null;
-let hookCalls = 0;
+let hookCalls = 0, pathname = "/sign-in";
+const configurations = [];
 const childIdentities = [], timers = new Map();
 let timerId = 0;
 window.setTimeout = (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id; };
 window.clearTimeout = id => { timers.delete(id); };
 const api = {
   CLERK_ENABLED: true,
-  configureClerkSession: value => { bridge = value; },
+  configureClerkSession: value => { bridge = value; configurations.push(value); },
   clerkSessionReady: identity => bridge !== null && bridge.identity === identity,
 };
 const module = { exports: {} };
 const source = ts.transpileModule(readFileSync(new URL("../components/IdentityProvider.tsx", import.meta.url), "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true, target: ts.ScriptTarget.ES2022 } }).outputText;
 new Function("require", "module", "exports", source)(name => {
   if (name === "@/lib/api") return api;
+  if (name === "next/navigation") return { usePathname: () => pathname };
+  if (name === "@/components/LoadingState") return { LoadingState: ({ title, description }) => React.createElement("div", { role: "status" }, title, description) };
   if (name === "@clerk/nextjs") return { useAuth: () => { hookCalls++; return auth; }, useClerk: () => clerk };
   return require(name);
 }, module, module.exports);
@@ -37,7 +40,7 @@ afterEach(() => {
   cleanup();
   auth = { isLoaded: false, userId: null, orgId: null, getToken };
   api.CLERK_ENABLED = true;
-  bridge = null; hookCalls = 0; childIdentities.length = 0; timers.clear();
+  bridge = null; hookCalls = 0; childIdentities.length = 0; timers.clear(); pathname = "/sign-in"; configurations.length = 0;
 });
 after(() => dom.window.close());
 
@@ -90,4 +93,27 @@ test("local authentication does not invoke Clerk hooks or require a Clerk provid
   assert.ok(ui.getByText("Application content"));
   assert.equal(hookCalls, 0);
   assert.equal(bridge, null);
+});
+
+test("SDK callback refresh does not clear active queries or detach the current identity", async () => {
+  auth = { ...auth, isLoaded: true, userId: "user-one" };
+  const ui = render(content());
+  const previousBridge = bridge, previousConfigurations = configurations.length;
+  auth = { ...auth, getToken: async () => "refreshed-token" };
+  ui.rerender(content());
+  assert.equal(bridge, previousBridge);
+  assert.equal(configurations.length, previousConfigurations);
+  assert.equal(await bridge.getToken(), "refreshed-token");
+  assert.ok(ui.getByText("Application content"));
+});
+
+test("public homepage renders while Clerk is unavailable, but private navigation still waits", () => {
+  pathname = "/";
+  const ui = render(content());
+  assert.ok(ui.getByText("Application content"));
+  assert.equal(bridge, null);
+  pathname = "/dashboard";
+  ui.rerender(content());
+  assert.equal(ui.queryByText("Application content"), null);
+  assert.match(ui.getByRole("status").textContent, /Preparing your secure session/);
 });

@@ -46,6 +46,7 @@ public class ClerkOrganizationService {
     }
     @Transactional
     public Map<String, Object> linkOrganization(String clerkToken) {
+        accounts.requireMigrationEnabled();
         if (!"local".equals(TenantContext.authProvider()) || TenantContext.role() != DomainEnums.Role.OWNER) {
             throw ApiErrors.forbidden("Sign in locally as the business owner to link an existing workspace");
         }

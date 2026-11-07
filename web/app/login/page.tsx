@@ -7,6 +7,8 @@ import { FormEvent, useEffect, useState } from "react";
 import { api, ApiClientError, clearSession, CLERK_ENABLED, DEMO_MODE, loginDestination, invitationDestination, setSession, setSessionPermissions } from "@/lib/api";
 import { Field, PrimaryButton, TextInput } from "@/components/FormControls";
 import { GoogleSignInButton } from "@/components/GoogleSignInButton";
+import { AccountFrame } from "@/components/AccountFrame";
+import { LoadingState } from "@/components/LoadingState";
 
 type AuthResponse = { accessToken: string; tenantId: string | null; role: string | null };
 type PermissionResponse = { permissions: string[] };
@@ -81,7 +83,7 @@ export default function LoginPage() {
 
   const loginError = login.error instanceof ApiClientError ? login.error : null;
 
-  if (CLERK_ENABLED) return <main className="p-8" role="status">Opening secure sign in…</main>;
+  if (CLERK_ENABLED) return <AccountFrame title="Welcome back"><LoadingState title="Opening secure sign-in…" description="You’ll be ready to choose your business in a moment." /><Link className="text-sm font-medium text-moss underline" href="/sign-in">Continue to sign in</Link></AccountFrame>;
   return (
     <main className="grid min-h-screen bg-[#eef7f0] lg:grid-cols-[1fr_480px]">
       <section className="relative hidden overflow-hidden lg:block">

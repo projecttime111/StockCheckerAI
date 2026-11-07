@@ -1,11 +1,12 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
 import { Activity, ArrowUpRight, Building2, CircleHelp, FileClock, LayoutDashboard, LogOut, ShieldCheck, Upload } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { createContext, ReactNode, useContext, useEffect, useState } from "react";
-import { api, signOutSession } from "@/lib/api";
+import { signOutSession } from "@/lib/api";
+import { useSession } from "@/lib/session";
+import { LoadingState } from "@/components/LoadingState";
 import { isPlatformSession, PlatformSession } from "@/lib/platform";
 import { QueryFeedback } from "@/components/QueryFeedback";
 
@@ -27,7 +28,7 @@ export function usePlatformAccess() {
 export function PlatformShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const session = useQuery({ queryKey: ["session", "platform"], queryFn: () => api<PlatformSession>("/api/auth/session", { headers: { "X-StockPilot-Mode": "platform" } }), staleTime: 0, refetchOnMount: "always", retry: false });
+  const session = useSession("platform");
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
   const verified = session.isFetchedAfterMount && !session.error && isPlatformSession(session.data);
@@ -42,7 +43,7 @@ export function PlatformShell({ children }: { children: ReactNode }) {
     try { await signOutSession(); } catch (error) { setSignOutError(error instanceof Error ? error.message : "Sign out failed. Please try again."); setSigningOut(false); }
   }
 
-  if (!session.isFetchedAfterMount || session.isPending) return <main className="flex min-h-screen items-center justify-center bg-slate-50 p-6"><p role="status" className="text-sm text-ink/60">Verifying platform access…</p></main>;
+  if (!session.isFetchedAfterMount || session.isPending) return <main className="flex min-h-screen items-center justify-center bg-slate-50 p-6"><LoadingState title="Verifying platform access…" description="Checking your administrator permissions." /></main>;
   if (session.error) return <main className="mx-auto max-w-lg px-5 py-20"><h1 className="mb-4 text-2xl font-semibold">Platform access</h1><QueryFeedback queries={[session]} /><div className="flex flex-wrap gap-4"><Link className="text-sm font-semibold text-moss underline" href="/workspace/select">Choose a workspace</Link><Link className="text-sm font-semibold text-moss underline" href="/login">Return to sign in</Link></div></main>;
   if (!verified) return <main className="mx-auto max-w-lg px-5 py-20"><ShieldCheck className="mb-5 text-moss" size={32} /><h1 className="text-2xl font-semibold">Platform access required</h1><p role="alert" className="mt-3 text-sm leading-6 text-ink/60">This area is for StockPilot platform staff. Business owner and workspace admin accounts cannot access it.</p><Link className="mt-6 inline-block font-semibold text-moss underline" href="/workspace/select">Return to your workspace</Link></main>;
 

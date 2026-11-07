@@ -7,11 +7,13 @@ import { api, clearSession, CLERK_ENABLED } from "@/lib/api";
 import { BusinessMode, BusinessModeSelector } from "@/components/BusinessModeSelector";
 import { Field, PrimaryButton, TextInput } from "@/components/FormControls";
 import { GoogleSignInButton } from "@/components/GoogleSignInButton";
+import { AccountFrame } from "@/components/AccountFrame";
+import { LoadingState } from "@/components/LoadingState";
 
 type AuthResponse = { accessToken?: string; role?: string; emailVerificationRequired?: boolean };
 
 export default function RegisterPage() {
-  useEffect(() => { if (CLERK_ENABLED) window.location.replace("/sign-up"); }, []);
+  useEffect(() => { if (CLERK_ENABLED) window.location.replace("/sign-up" + window.location.search); }, []);
   const queryClient = useQueryClient();
   const [form, setForm] = useState({
     businessName: "",
@@ -38,7 +40,7 @@ export default function RegisterPage() {
     register.mutate();
   }
 
-  if (CLERK_ENABLED) return <main className="p-8" role="status">Opening secure sign-up…</main>;
+  if (CLERK_ENABLED) return <AccountFrame title="Create your StockPilot account"><LoadingState title="Opening secure registration…" description="Create your login, then set up your business workspace." /><Link className="text-sm font-medium text-moss underline" href="/sign-up">Continue to registration</Link></AccountFrame>;
   return (
     <main className="flex min-h-screen items-center justify-center bg-[#eef7f0] px-5 py-10">
       <form onSubmit={submit} className="w-full max-w-xl rounded border border-ink/10 bg-white p-6 shadow-soft">

@@ -16,8 +16,9 @@ const redirects = [], timers = new Map();
 const router = { replace: value => redirects.push(value) };
 const location = { origin: "https://stockpilot.example", search: "", reload: () => { reloads++; } };
 const api = { CLERK_ENABLED: true, signOutSession: async () => { signOuts++; if (signOutFailure) throw new Error("Offline"); } };
+function load(path) {
 const module = { exports: {} };
-const source = ts.transpileModule(readFileSync(new URL("../components/ClerkEntry.tsx", import.meta.url), "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true, target: ts.ScriptTarget.ES2022 } }).outputText;
+const source = ts.transpileModule(readFileSync(new URL(`../${path}`, import.meta.url), "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true, target: ts.ScriptTarget.ES2022 } }).outputText;
 new Function("require", "module", "exports", "window", "setTimeout", "clearTimeout", source)(name => {
   if (name === "@clerk/nextjs") return {
     useAuth: () => { authCalls++; return auth; },
@@ -25,11 +26,15 @@ new Function("require", "module", "exports", "window", "setTimeout", "clearTimeo
     SignUp: props => { signUpMounts++; latestFormProps = props; return renderForm ? React.createElement("div", null, "Clerk sign-up form") : props.fallback; }
   };
   if (name === "@/lib/api") return api;
+  if (name === "@/components/marketing/AuthShell") return load("components/marketing/AuthShell.tsx");
+  if (name === "./Brand") return load("components/marketing/Brand.tsx");
   if (name === "next/navigation") return { useRouter: () => router };
   if (name === "next/link") return { __esModule: true, default: ({ children, ...props }) => React.createElement("a", props, children) };
   return require(name);
 }, module, module.exports, { location }, (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id; }, id => timers.delete(id));
-const { ClerkEntry, clerkEntryDestination } = module.exports;
+return module.exports;
+}
+const { ClerkEntry, clerkEntryDestination } = load("components/ClerkEntry.tsx");
 function mount(props = {}, strict = false) { const node = React.createElement(ClerkEntry, props); return render(strict ? React.createElement(React.StrictMode, null, node) : node); }
 async function elapse() { await act(async () => { const callbacks = [...timers.values()]; timers.clear(); callbacks.forEach(timer => { assert.equal(timer.delay, 15000); timer.callback(); }); }); }
 afterEach(() => { cleanup(); auth = { isLoaded: true, isSignedIn: false, sessionId: null }; authCalls = 0; signInMounts = 0; signUpMounts = 0; reloads = 0; signOuts = 0; renderForm = true; signOutFailure = false; latestFormProps = undefined; redirects.length = 0; timers.clear(); location.search = ""; api.CLERK_ENABLED = true; });
@@ -101,4 +106,17 @@ test("Clerk completion redirect preserves one safe nested next and rejects recur
   }
   assert.equal(clerkEntryDestination(redirect("/products", "https://attacker.example/auth/complete"), origin), "/auth/complete");
   assert.equal(clerkEntryDestination(redirect("/products", origin + "/sign-in"), origin), "/auth/complete");
+});
+
+test("branded Clerk forms keep native routing, safe redirects, and an explicit account-switch link", () => {
+  for (const signup of [false, true]) {
+    const ui = mount({ signup });
+    assert.equal(latestFormProps.routing, "path");
+    assert.equal(latestFormProps.path, signup ? "/sign-up" : "/sign-in");
+    assert.equal(latestFormProps.forceRedirectUrl, "/auth/complete");
+    assert.equal(latestFormProps.appearance.variables.colorPrimary, "#195840");
+    assert.equal(ui.getByRole("link", { name: signup ? "Sign in" : "Create an account" }).getAttribute("href"), signup ? "/sign-in" : "/sign-up");
+    assert.equal(ui.getByRole("link", { name: "Back to home" }).getAttribute("href"), "/");
+    cleanup();
+  }
 });

@@ -24,7 +24,7 @@ function load(path) {
   const module = { exports: {} };
   const source = ts.transpileModule(readFileSync(filename, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true, target: ts.ScriptTarget.ES2022 } }).outputText;
   const localRequire = name => {
-    if (name === "@/lib/api") return { api: (...args) => request(...args), signOutSession: async () => redirects.push("/login") };
+    if (name === "@/lib/api" || (name === "./api" && filename.endsWith("session.tsx"))) return { api: (...args) => request(...args), getSessionIdentity: () => "test-identity", SESSION_CHANGED_EVENT: "stockpilot:session-changed", SESSION_CLEARED_EVENT: "stockpilot:session-cleared", WORKSPACE_CHANGED_EVENT: "stockpilot:workspace-changed", signOutSession: async () => redirects.push("/login") };
     if (name === "next/link") return { __esModule: true, default: ({ children, ...props }) => React.createElement("a", props, children) };
     if (name === "next/navigation") return { usePathname: () => pathname, useRouter: () => router };
     if (name.startsWith("@/")) return load(resolve(root, name.slice(2)));

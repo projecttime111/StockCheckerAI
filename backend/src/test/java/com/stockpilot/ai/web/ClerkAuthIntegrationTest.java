@@ -23,7 +23,7 @@ import static org.mockito.Mockito.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-@SpringBootTest(properties = "app.platform-admin-emails=explicit-platform-admin@example.com")
+@SpringBootTest(properties = {"app.platform-admin-emails=explicit-platform-admin@example.com", "app.clerk.legacy-migration-enabled=true"})
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
 class ClerkAuthIntegrationTest {

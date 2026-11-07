@@ -15,7 +15,7 @@ const { QueryClient, QueryClientProvider } = require("@tanstack/react-query");
 const root = fileURLToPath(new URL("..", import.meta.url));
 let request, signedIn = true;
 const modules = new Map(), clients = [], redirects = [], sessions = [];
-const apiModule = { api: (...args) => request(...args), getToken: () => signedIn ? "session-token" : null, DEMO_MODE: false, CLERK_ENABLED: false, clearSession: () => sessions.push("cleared"), setSession: (...args) => sessions.push(args) };
+const apiModule = { api: (...args) => request(...args), getToken: () => signedIn ? "session-token" : null, getSessionIdentity: () => signedIn ? "session-identity" : null, SESSION_CLEARED_EVENT: "stockpilot:session-cleared", SESSION_CHANGED_EVENT: "stockpilot:session-changed", WORKSPACE_CHANGED_EVENT: "stockpilot:workspace-changed", DEMO_MODE: false, CLERK_ENABLED: false, clearSession: () => sessions.push("cleared"), setSession: (...args) => sessions.push(args) };
 function load(path) {
   let filename = path;
   if (!existsSync(filename)) filename += existsSync(path + ".tsx") ? ".tsx" : ".ts";
@@ -31,7 +31,7 @@ function load(path) {
     if (name.startsWith("./")) return load(resolve(dirname(filename), name));
     return require(name);
   };
-  new Function("require", "module", "exports", "window", source)(localRequire, module, module.exports, { location: { assign: path => redirects.push(path) } });
+  new Function("require", "module", "exports", "window", source)(localRequire, module, module.exports, { location: { assign: path => redirects.push(path) }, addEventListener: dom.window.addEventListener.bind(dom.window), removeEventListener: dom.window.removeEventListener.bind(dom.window) });
   modules.set(filename, module.exports); return module.exports;
 }
 const Team = load(resolve(root, "app/team/page")).default;
@@ -175,7 +175,7 @@ test("Clerk mode blocks legacy local invitation registration and acceptance", as
   apiModule.CLERK_ENABLED = true;
   request = async path => path === "/api/auth/session" ? { ...access, email: preview.email, authProvider: "clerk" } : { ...preview, accountExists: false, clerkManaged: false };
   const ui = mount(InvitationAcceptance, { token: "legacy-invite" });
-  await ui.findByText(/Ask the workspace owner to connect the business to an organization and send a new invitation/);
+  await ui.findByText(/Ask the business owner to send you a new invitation from the Team page/);
   assert.equal(ui.queryByRole("button", { name: "Accept invitation" }), null);
   assert.equal(ui.queryByRole("button", { name: "Create account and join" }), null);
   assert.equal(ui.queryByLabelText("Password"), null);
