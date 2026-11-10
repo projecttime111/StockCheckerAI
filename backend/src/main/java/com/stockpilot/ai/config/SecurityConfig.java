@@ -52,7 +52,8 @@ public class SecurityConfig {
                     "/api/auth/invitations/preview",
                     "/api/auth/invitations/register",
                     "/actuator/health",
-                    "/actuator/health/**",
+                    "/actuator/health/liveness",
+                    "/actuator/health/readiness",
                     "/actuator/info"
                 ).permitAll();
                 if (swaggerPublicEnabled) {
@@ -61,6 +62,7 @@ public class SecurityConfig {
                     auth.requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").hasAnyRole("OWNER", "ADMIN");
                 }
                 auth
+                    .requestMatchers("/actuator/health/**").hasAnyRole("PLATFORM_SUPER_ADMIN", "PLATFORM_SUPPORT")
                     .requestMatchers("/api/portal/**").hasRole("CUSTOMER_USER")
                     .requestMatchers("/api/account/**").authenticated()
                     .requestMatchers("/api/workspace/invitations/accept").authenticated()

@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { ServiceStatusIndicator } from "@/components/ServiceStatusIndicator";
 import { ModeBanner } from "@/components/ModeBanner";
 import { Providers } from "@/lib/query";
 import { ClerkProvider } from "@clerk/nextjs";
@@ -18,6 +19,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body>
+        <ServiceStatusIndicator />
         <ModeBanner />
         {CLERK_ENABLED ? <ClerkProvider signInUrl="/sign-in" signUpUrl="/sign-up" signInFallbackRedirectUrl="/auth/complete" signUpFallbackRedirectUrl="/auth/complete">{content}</ClerkProvider> : content}
       </body>

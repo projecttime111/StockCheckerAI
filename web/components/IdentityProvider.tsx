@@ -25,7 +25,7 @@ function ClerkSessionBridge({ children }: { children: ReactNode }) {
   }, [identity, isLoaded]);
   // The public homepage must work even if Clerk is still loading or unreachable.
   // Keep the bridge mounted in the background so navigating to sign-in is ready.
-  if (pathname === "/") return <>{children}</>;
+  if (pathname === "/" || pathname === "/status") return <>{children}</>;
   if (!isLoaded || readyIdentity !== identity || !clerkSessionReady(identity)) return <SessionLoading key={identity} />;
   return <>{children}</>;
 }

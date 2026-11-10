@@ -65,8 +65,16 @@ management:
         include: health,info,metrics
   endpoint:
     health:
+      show-details: never
+      show-components: never
       probes:
         enabled: true
+      group:
+        liveness:
+          # Process availability must not depend on a sleeping database or identity provider.
+          include: livenessState
+          show-details: never
+          show-components: never
   health:
     # Redis and RabbitMQ are optional when running the API directly in local development.
     redis:

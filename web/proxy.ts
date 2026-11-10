@@ -6,6 +6,8 @@ const withClerk = clerkMiddleware(async (auth, request) => {
   if (protectedRoute(request) || request.nextUrl.pathname === "/team") await auth.protect();
 });
 export default function proxy(request: NextRequest, event: NextFetchEvent) {
+  // Availability must remain visible when Clerk or the API cannot be reached.
+  if (request.nextUrl.pathname === "/api/health" || request.nextUrl.pathname === "/status") return NextResponse.next();
   if (process.env.NEXT_PUBLIC_CLERK_ENABLED !== "true" || process.env.NEXT_PUBLIC_DEMO_MODE === "true") return NextResponse.next();
   return withClerk(request, event);
 }

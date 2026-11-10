@@ -42,6 +42,13 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
         throws ServletException, IOException {
         try {
+            // This public process probe must remain usable when a saved token, Clerk, or the
+            // database is unavailable. No business route bypasses authentication here.
+            if (("GET".equals(request.getMethod()) || "HEAD".equals(request.getMethod()))
+                && (request.getContextPath() + "/actuator/health/liveness").equals(request.getRequestURI())) {
+                chain.doFilter(request, response);
+                return;
+            }
             var header = request.getHeader("Authorization");
             if (header != null && header.startsWith("Bearer ")) {
                 try { authenticate(header.substring(7), request.getHeader("X-StockPilot-Mode")); }

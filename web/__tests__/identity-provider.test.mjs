@@ -117,3 +117,15 @@ test("public homepage renders while Clerk is unavailable, but private navigation
   assert.equal(ui.queryByText("Application content"), null);
   assert.match(ui.getByRole("status").textContent, /Preparing your secure session/);
 });
+
+test("public service status remains available while Clerk has not loaded", () => {
+  pathname = "/status";
+  const ui = render(content());
+  assert.ok(ui.getByText("Application content"));
+  assert.equal(bridge, null);
+  assert.equal(ui.queryByText("Preparing your secure session"), null);
+  pathname = "/admin/system";
+  ui.rerender(content());
+  assert.equal(ui.queryByText("Application content"), null);
+  assert.match(ui.getByRole("status").textContent, /Preparing your secure session/);
+});
