@@ -71,6 +71,8 @@ public class SmartImportCommitExecutor {
     private final InvoiceIdentityService invoiceIdentity;
     private final EntityManager entityManager;
 
+    private final SourceDocumentRevisionService sourceRevisions;
+
     public SmartImportCommitExecutor(
         Repositories.ImportSessionRepository sessions,
         Repositories.ImportSessionFileRepository files,
@@ -114,8 +116,9 @@ public class SmartImportCommitExecutor {
         RetailCounterSaleService retailSales,
         SmartImportSnapshotDateService snapshotDates,
         InvoiceIdentityService invoiceIdentity,
-        EntityManager entityManager
+        EntityManager entityManager, SourceDocumentRevisionService sourceRevisions
     ) {
+        this.sourceRevisions = sourceRevisions;
         this.sessions = sessions;
         this.files = files;
         this.dryRuns = dryRuns;
@@ -375,6 +378,7 @@ public class SmartImportCommitExecutor {
                 product.hsnCode = blankToNull(row.hsn);
                 product.gstPercentage = nvl(row.gstPercent);
                 product.defaultPurchasePrice = nvl(row.purchasePrice);
+                product.defaultSalesPrice = nvl(row.salesPrice);
                 product.rawMetadata = new LinkedHashMap<>(row.rawMetadataJson == null ? Map.of() : row.rawMetadataJson);
                 product = products.save(product);
                 createBarcodeIfPresent(tenantId, product.id, row.barcode);
@@ -1233,11 +1237,13 @@ public class SmartImportCommitExecutor {
         Map<String, ImportDryRunItem> stockDryRunItems, CommitCounts counts, Map<UUID, String> fileHashes,
         Map<String, UnitOfMeasure> unitIndex, Map<String, Warehouse> warehouseIndex, Map<String, Product> productIndex
     ) {
+        if (sourceRevisions.applyIfReviewed(voucher,commit)) { counts.inc("sourceDocumentsRevised"); return; }
         var customer = resolveVoucherCustomer(tenantId, voucher);
         if (customer == null) throw ApiErrors.badRequest("Customer is unresolved for sales voucher " + nullSafe(voucher.voucherNumber));
         voucher.matchedPartyId = customer.id;
         var existing = existingSalesInvoice(tenantId, voucher, customer.id);
         if (existing != null) {
+            if (!"UNCHANGED".equals(sourceRevisions.assess(voucher).outcome())) throw ApiErrors.conflict("Invoice content changed; run a new revision review");
             counts.inc("duplicateSalesVouchersSkipped");
             effect(commit, voucher.sessionFileId, voucher.sourceRowNumber, DomainEnums.SmartImportEffectEntityType.SALES_INVOICE,
                 existing.id, DomainEnums.SmartImportEffectAction.SKIPPED, Map.of(), linked("reason", "DUPLICATE_VOUCHER"), false);
@@ -1265,6 +1271,8 @@ public class SmartImportCommitExecutor {
             var item = new SalesInvoiceItem();
             own(item, tenantId);
             item.salesInvoiceId = invoice.id;
+            var lineWarehouse = resolveStockMovementWarehouse(tenantId, sourceItem, warehouseIndex);
+            item.warehouseId = lineWarehouse == null ? warehouse.id : lineWarehouse.id;
             item.productId = product.id;
             item.quantity = quantity;
             item.unitId = unit.id;
@@ -1295,6 +1303,7 @@ public class SmartImportCommitExecutor {
         invoice.totalAmount = financialTotal(subtotal, voucher);
         invoice.financialMetadata = financialMetadata(voucher);
         salesInvoices.save(invoice);
+        sourceRevisions.recordCreated(voucher,invoice);
         counts.inc("salesInvoicesCreated");
         effect(commit, voucher.sessionFileId, voucher.sourceRowNumber, DomainEnums.SmartImportEffectEntityType.SALES_INVOICE,
             invoice.id, DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
@@ -1311,11 +1320,13 @@ public class SmartImportCommitExecutor {
         Map<String, ImportDryRunItem> stockDryRunItems, CommitCounts counts, Map<UUID, String> fileHashes,
         Map<String, UnitOfMeasure> unitIndex, Map<String, Warehouse> warehouseIndex, Map<String, Product> productIndex
     ) {
+        if (sourceRevisions.applyIfReviewed(voucher,commit)) { counts.inc("sourceDocumentsRevised"); return; }
         var supplier = resolveVoucherSupplier(tenantId, voucher);
         if (supplier == null) throw ApiErrors.badRequest("Supplier is unresolved for purchase voucher " + nullSafe(voucher.voucherNumber));
         voucher.matchedPartyId = supplier.id;
         var existing = existingPurchaseInvoice(tenantId, voucher, supplier.id);
         if (existing != null) {
+            if (!"UNCHANGED".equals(sourceRevisions.assess(voucher).outcome())) throw ApiErrors.conflict("Invoice content changed; run a new revision review");
             counts.inc("duplicatePurchaseVouchersSkipped");
             effect(commit, voucher.sessionFileId, voucher.sourceRowNumber, DomainEnums.SmartImportEffectEntityType.PURCHASE_INVOICE,
                 existing.id, DomainEnums.SmartImportEffectAction.SKIPPED, Map.of(), linked("reason", "DUPLICATE_VOUCHER"), false);
@@ -1371,6 +1382,7 @@ public class SmartImportCommitExecutor {
         invoice.totalAmount = financialTotal(subtotal, voucher);
         invoice.financialMetadata = financialMetadata(voucher);
         purchaseInvoices.save(invoice);
+        sourceRevisions.recordCreated(voucher,invoice);
         counts.inc("purchaseInvoicesCreated");
         effect(commit, voucher.sessionFileId, voucher.sourceRowNumber, DomainEnums.SmartImportEffectEntityType.PURCHASE_INVOICE,
             invoice.id, DomainEnums.SmartImportEffectAction.CREATED, Map.of(), linked(
@@ -2090,6 +2102,10 @@ public class SmartImportCommitExecutor {
         }
         if (nvl(product.gstPercentage).signum() == 0 && nvl(row.gstPercent).signum() > 0) {
             product.gstPercentage = row.gstPercent;
+            changed = true;
+        }
+        if (nvl(product.defaultSalesPrice).signum() == 0 && nvl(row.salesPrice).signum() > 0) {
+            product.defaultSalesPrice = row.salesPrice;
             changed = true;
         }
         if (nvl(product.defaultPurchasePrice).signum() == 0 && nvl(row.purchasePrice).signum() > 0) {

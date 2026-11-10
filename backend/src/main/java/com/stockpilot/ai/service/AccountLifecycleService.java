@@ -201,6 +201,10 @@ public class AccountLifecycleService {
 
     private List<String> deletionOrder() {
         return List.of(
+            "import_jobs",
+            "analytics_coverage",
+            "ai_chat_runs",
+            "source_document_revisions",
             "mutation_receipts",
             "financial_adjustment_items",
             "financial_adjustments",

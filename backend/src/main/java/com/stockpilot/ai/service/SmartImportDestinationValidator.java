@@ -30,8 +30,13 @@ public class SmartImportDestinationValidator {
         var result=new ArrayList<Violation>();
         for(var row:products.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId,sessionId))
             add(result,row.sessionFileId,row.sourceRowNumber,fields("Product Name",row.rawName,"SKU",row.sku,
-                "Unit",row.unitCode,"HSN",row.hsn,"Barcode",row.barcode,"Purchase Price",row.purchasePrice,
+                "Unit",row.unitCode,"HSN",row.hsn,"Barcode",row.barcode,"Purchase Price",row.purchasePrice,"Sales Price",row.salesPrice,
                 "Category",row.categoryName,"Brand",row.brandName));
+        for(var row:products.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId,sessionId)) {
+            var error=row.rawMetadataJson.get("GST Mapping Error");
+            if(error!=null && !error.toString().isBlank()) result.add(new Violation(row.sessionFileId,row.sourceRowNumber,"GST %",error.toString()));
+            if(row.gstPercent!=null && (row.gstPercent.signum()<0 || row.gstPercent.compareTo(BigDecimal.valueOf(100))>0)) result.add(new Violation(row.sessionFileId,row.sourceRowNumber,"GST %","GST must be between 0 and 100"));
+        }
         for(var row:parties.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId,sessionId))
             add(result,row.sessionFileId,row.sourceRowNumber,fields("Party Name",row.rawName,"Opening Balance",row.openingBalance));
         for(var row:warehouses.findByTenantIdAndImportSessionIdOrderBySourceRowNumberAsc(tenantId,sessionId))
@@ -42,6 +47,10 @@ public class SmartImportDestinationValidator {
         for(var row:vouchers.findByTenantIdAndImportSessionIdOrderByVoucherDateAscSourceRowNumberAsc(tenantId,sessionId)) {
             if(Boolean.parseBoolean(String.valueOf(row.rawMetadataJson.getOrDefault("excludedFromCommit",false)))) {
                 excluded.add(row.id); continue;
+            }
+            for(var bound:Map.of("Source System",80,"Source Company",500,"Source Record ID",500,"Source Revision",200).entrySet()) {
+                var value=row.rawMetadataJson.get(bound.getKey());
+                if(value!=null && value.toString().length()>bound.getValue()) result.add(new Violation(row.sessionFileId,row.sourceRowNumber,bound.getKey(),bound.getKey()+" exceeds "+bound.getValue()+" characters"));
             }
             add(result,row.sessionFileId,row.sourceRowNumber,fields("Voucher Number",row.voucherNumber,
                 "Party Name",row.partyName,"Total Amount",row.totalAmount));

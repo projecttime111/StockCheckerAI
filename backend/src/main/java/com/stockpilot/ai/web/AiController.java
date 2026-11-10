@@ -14,10 +14,12 @@ import java.util.Map;
 public class AiController {
     private final AiAssistantService assistant;
     private final ProfitInsightService profit;
+    private final com.stockpilot.ai.service.AiConversationService conversations;
 
-    public AiController(AiAssistantService assistant, ProfitInsightService profit) {
+    public AiController(AiAssistantService assistant, ProfitInsightService profit, com.stockpilot.ai.service.AiConversationService conversations) {
         this.assistant = assistant;
         this.profit = profit;
+        this.conversations = conversations;
     }
 
     @PostMapping("/assistant/chat")
@@ -25,6 +27,25 @@ public class AiController {
     public ApiDtos.ChatResponse chat(@Valid @RequestBody ApiDtos.ChatRequest request) {
         return assistant.chat(request);
     }
+
+    @GetMapping("/conversations")
+    @PreAuthorize("@permissionService.has('ai.assistant.use')")
+    public org.springframework.data.domain.Page<ApiDtos.AiConversationResponse> conversations(
+        @RequestParam(defaultValue="0") int page, @RequestParam(defaultValue="20") int size) {
+        return conversations.list(page, size);
+    }
+
+    @GetMapping("/conversations/{id}/messages")
+    @PreAuthorize("@permissionService.has('ai.assistant.use')")
+    public org.springframework.data.domain.Page<ApiDtos.AiMessageResponse> messages(@PathVariable java.util.UUID id,
+        @RequestParam(defaultValue="0") int page, @RequestParam(defaultValue="50") int size) {
+        return conversations.history(id, page, size);
+    }
+
+    @DeleteMapping("/conversations/{id}")
+    @PreAuthorize("@permissionService.has('ai.assistant.use')")
+    @ResponseStatus(org.springframework.http.HttpStatus.NO_CONTENT)
+    public void deleteConversation(@PathVariable java.util.UUID id) { conversations.delete(id); }
 
     @PostMapping("/assistant/profit-drop")
     @PreAuthorize("@permissionService.has('insights.profit.view')")

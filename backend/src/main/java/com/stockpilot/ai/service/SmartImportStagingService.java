@@ -18,6 +18,7 @@ import java.util.stream.Collectors;
 
 @Service
 public class SmartImportStagingService {
+    private final ImportExecutionGuard executionGuard;
     private static final BigDecimal ZERO = BigDecimal.ZERO;
     private static final int PREVIEW_LIMIT = 100;
 
@@ -58,6 +59,8 @@ public class SmartImportStagingService {
     private final SmartImportCashbookMatchingService cashbookMatching;
     private final InvoiceIdentityService invoiceIdentity;
 
+    private final SourceDocumentRevisionService sourceRevisions;
+
     public SmartImportStagingService(
         Repositories.ImportSessionRepository sessions,
         Repositories.ImportSessionFileRepository files,
@@ -94,8 +97,10 @@ public class SmartImportStagingService {
         AuditService audit,
         RetailCounterSaleService retailSales,
         SmartImportCashbookMatchingService cashbookMatching,
-        InvoiceIdentityService invoiceIdentity
+        InvoiceIdentityService invoiceIdentity, SourceDocumentRevisionService sourceRevisions, ImportExecutionGuard executionGuard
     ) {
+        this.executionGuard = executionGuard;
+        this.sourceRevisions = sourceRevisions;
         this.sessions = sessions;
         this.files = files;
         this.plans = plans;
@@ -141,6 +146,7 @@ public class SmartImportStagingService {
 
     @Transactional
     public Map<String, Object> rebuild(UUID sessionId) {
+        executionGuard.lockAndAuthorize("STAGE", sessionId);
         retailSales.lockCashbook(TenantContext.tenantId());
         var session = session(sessionId);
         ensureMutable(session);
@@ -668,7 +674,7 @@ public class SmartImportStagingService {
             voucher.partyName = blankToNull(partyName);
             voucher.normalizedPartyName = normalizeName(partyName);
             voucher.totalAmount = ZERO;
-            voucher.externalId = blankToNull(lookup(row, "Tally GUID", "GUID", "MASTERID", "Master ID"));
+            voucher.externalId = blankToNull(lookup(row, "Source Record ID", "Tally GUID", "GUID", "External ID", "Record ID", "MASTERID", "Master ID"));
             voucher.rawMetadataJson = metadata(row);
             voucher.fingerprint = fingerprint(session.tenantId, voucher);
             stagedVouchers.save(voucher);
@@ -986,6 +992,7 @@ public class SmartImportStagingService {
         product.hsn = blankToNull(lookup(row, "HSN", "HSN Code", "HSNCODE"));
         product.gstPercent = decimal(lookup(row, "GST %", "GST Percentage", "Tax Rate"));
         product.purchasePrice = decimal(lookup(row, "Purchase Price", "Opening Rate", "Rate"));
+        product.salesPrice = decimal(lookup(row, "Sales Price", "Selling Price", "MRP"));
         product.externalId = SmartImportProductIdentity.fromSource(type, row);
         product.rawMetadataJson = metadata(row);
         stagedProducts.save(product);
@@ -1337,7 +1344,7 @@ public class SmartImportStagingService {
                     ? DomainEnums.SmartVoucherStockImpactSuggestion.APPLY_AFTER_SNAPSHOT_DATE
                     : DomainEnums.SmartVoucherStockImpactSuggestion.CREATE_INVOICES_ONLY;
             var identity = normalize(row.voucherType) + "|" + normalize(row.voucherNumber) + "|" + row.voucherDate + "|" + normalizeName(row.partyName);
-            var contents = row.totalAmount + "|" + voucherItems.getOrDefault(row.id, List.of()).stream()
+            var contents = Objects.toString(row.rawMetadataJson.get("Source Company"), "") + "|" + row.totalAmount + "|" + voucherItems.getOrDefault(row.id, List.of()).stream()
                 .map(item -> normalizeName(item.productName) + "|" + normalizeUnit(item.unitCode) + "|"
                     + nvl(item.quantity).stripTrailingZeros() + "|" + nvl(item.rate).stripTrailingZeros() + "|"
                     + nvl(item.amount).stripTrailingZeros() + "|" + normalizeName(item.warehouseName))
@@ -1366,6 +1373,19 @@ public class SmartImportStagingService {
                 ? DomainEnums.SmartReviewStatus.PENDING : DomainEnums.SmartReviewStatus.AUTO_RESOLVED;
         }
         stagedVoucherItems.saveAll(items);
+        // Assess complete matched line contents after product/warehouse matching, not header totals alone.
+        for (var voucher : vouchers) {
+            if (!sourceRevisions.supported(voucher) || excludedVoucher(voucher)) continue;
+            var revision = sourceRevisions.assess(voucher);
+            if ("UNCHANGED".equals(revision.outcome())) {
+                voucher.matchStatus=DomainEnums.SmartMatchStatus.SKIP_DUPLICATE;
+                voucher.reviewStatus=DomainEnums.SmartReviewStatus.AUTO_RESOLVED;
+            } else if (!"NEW".equals(revision.outcome())) {
+                voucher.matchStatus=DomainEnums.SmartMatchStatus.AMBIGUOUS_REVIEW;
+                voucher.reviewStatus=DomainEnums.SmartReviewStatus.PENDING;
+            }
+        }
+        stagedVouchers.saveAll(vouchers);
     }
 
     private void updateVoucherMatch(UUID tenantId, SmartStagedVoucher row, SmartStagedParty party, boolean repeatedInSession) {
@@ -1490,6 +1510,14 @@ public class SmartImportStagingService {
             if (excludedVoucher(row)) continue;
             if (stockJournalVoucherIds.contains(row.id)) {
                 // Stock journals are inventory documents; party identity is not part of transfer validation.
+                continue;
+            }
+            if (sourceRevisions.needsReview(row)) {
+                var revision=sourceRevisions.assess(row);
+                generated.add(reviewIssue(session,row.sessionFileId,row.sourceRowNumber,DomainEnums.ImportPlanIssueSeverity.REVIEW_REQUIRED,
+                    "SOURCE_DOCUMENT_REVISION", "Source document changed or was cancelled: " + nullSafe(row.voucherNumber),
+                    revision.eligible()?"Review the complete source revision, then run a new dry run.":revision.blockingReason(),List.of(),
+                    Map.of("resolutionKey","SOURCE_REVISION:"+row.id,"entityType","VOUCHER","stagingId",row.id.toString(),"revisionPreview",sourceRevisions.view(row))));
                 continue;
             }
             if (row.matchStatus == DomainEnums.SmartMatchStatus.AMBIGUOUS_REVIEW) {

@@ -238,8 +238,11 @@ Add only when needed:
 | `UPLOAD_MAX_FILE_SIZE` | Default `150MB` |
 | `UPLOAD_MAX_REQUEST_SIZE` | Default `160MB` |
 | `IMPORT_MAX_UPLOAD_SIZE` | Defaults to upload max size |
-| `LLM_ENDPOINT` | Optional provider endpoint; blank keeps local behavior |
-| `LLM_API_KEY` | Optional provider key; blank keeps local behavior |
+| `APP_AI_ENABLED` | Defaults to `false`; use the local analytics assistant until a hosted provider is configured |
+| `APP_AI_PROVIDER` | Hosted adapter currently supports `gemini` |
+| `APP_AI_MODEL` | Provider model ID; required only when hosted AI is enabled |
+| `GEMINI_API_KEY` | Private backend key; required only when hosted AI is enabled |
+| `APP_IMPORT_JOBS_ENABLED` | Defaults to `true`; enables the database-backed import worker |
 | `LOG_LEVEL_ROOT` | Default `INFO`; keep this level in production |
 | `LOG_LEVEL_APP` | Default `INFO`; temporarily use `DEBUG` only while investigating |
 | `SENTRY_ENABLED` | Default `false`; set `true` only after adding a backend Sentry DSN |

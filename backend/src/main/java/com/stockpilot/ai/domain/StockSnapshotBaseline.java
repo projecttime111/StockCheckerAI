@@ -14,6 +14,7 @@ public class StockSnapshotBaseline extends TenantOwnedEntity {
     public UUID warehouseId;
     public UUID adjustmentWarehouseId;
     public LocalDate snapshotDate;
+    @jakarta.persistence.Column(precision=14, scale=3)
     public BigDecimal importedQuantity = BigDecimal.ZERO;
     public UUID adjustmentMovementId;
     public UUID sourceImportSessionId;

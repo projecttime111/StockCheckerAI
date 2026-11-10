@@ -22,6 +22,7 @@ import java.util.stream.Collectors;
 
 @Service
 public class SmartImportDryRunService {
+    private final ImportExecutionGuard executionGuard;
     private static final Logger log = LoggerFactory.getLogger(SmartImportDryRunService.class);
     private static final BigDecimal ZERO = BigDecimal.ZERO;
     private static final List<String> SUMMARY_KEYS = List.of(
@@ -100,6 +101,8 @@ public class SmartImportDryRunService {
     private final EntityManager entityManager;
     private final SmartImportCashbookMatchingService cashbookMatching;
 
+    private final SourceDocumentRevisionService sourceRevisions;
+
     public SmartImportDryRunService(
         Repositories.ImportSessionRepository sessions,
         Repositories.ImportSessionFileRepository files,
@@ -129,15 +132,17 @@ public class SmartImportDryRunService {
         StockLedgerService stockLedger,
         AuditService audit,
         SmartImportDestinationValidator destinationValidator,
-        SmartImportFingerprintService fingerprints,
+        SmartImportFingerprintService fingerprints, SourceDocumentRevisionService sourceRevisions,
         SmartImportSnapshotDateService snapshotDates,
         SmartImportSnapshotEligibilityService snapshotEligibility,
         SmartImportReturnService returnService,
         SmartImportTransferService transferService,
         RetailCounterSaleService retailSales,
         EntityManager entityManager,
-        SmartImportCashbookMatchingService cashbookMatching
+        SmartImportCashbookMatchingService cashbookMatching, ImportExecutionGuard executionGuard
     ) {
+        this.executionGuard = executionGuard;
+        this.sourceRevisions = sourceRevisions;
         this.sessions = sessions;
         this.files = files;
         this.plans = plans;
@@ -178,6 +183,7 @@ public class SmartImportDryRunService {
 
     @Transactional
     public Map<String, Object> run(UUID sessionId, SmartImportDtos.DryRunRequest request) {
+        executionGuard.lockAndAuthorize("DRY_RUN", sessionId);
         var session = session(sessionId);
         var plan = plans.findByTenantIdAndImportSessionId(session.tenantId, session.id)
             .orElseThrow(() -> ApiErrors.badRequest("Stage the Smart Import session before running a dry run"));
@@ -514,6 +520,17 @@ public class SmartImportDryRunService {
                     case FINANCIAL_ONLY -> context.counters.inc("financialOnlyNotes");
                     case AMBIGUOUS_RETURN -> context.counters.inc("ambiguousReturnNotes");
                     default -> { }
+                }
+            }
+            if (sourceRevisions.supported(voucher)) {
+                var revision=sourceRevisions.assess(voucher);
+                if (!Set.of("NEW","UNCHANGED").contains(revision.outcome())) {
+                    var revisionAction=revision.approved()?DomainEnums.ImportDryRunAction.UPDATE
+                        :revision.eligible()?DomainEnums.ImportDryRunAction.REVIEW_REQUIRED:DomainEnums.ImportDryRunAction.BLOCKED;
+                    context.items.add(item(context,invoiceType,revisionAction,voucher.sessionFileId,voucher.sourceRowNumber,
+                        revision.invoiceId(),sourceRevisions.view(voucher),revision.approved()?"REVIEWED_SOURCE_REVISION":null,
+                        revision.approved()?null:revision.eligible()?null:"SOURCE_REVISION_BLOCKED"));
+                    continue;
                 }
             }
             var duplicate = voucher.matchStatus == DomainEnums.SmartMatchStatus.SKIP_DUPLICATE;

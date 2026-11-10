@@ -1382,7 +1382,7 @@ class SmartImportSessionIntegrationTest {
     }
 
     @Test
-    void dryRunDetectsVoucherAlreadyPresentInTenant() throws Exception {
+    void dryRunRequiresReconciliationWhenExistingInvoiceHasNoMatchingLines() throws Exception {
         var registration = register("smart-dry-run-voucher-duplicate");
         var token = registration.get("accessToken").asText();
         var tenantId = UUID.fromString(registration.get("tenantId").asText());
@@ -1406,12 +1406,12 @@ class SmartImportSessionIntegrationTest {
         var dryRun = postJson(token, "/api/import-sessions/" + sessionId + "/dry-run",
             "{\"stockImpactMode\":\"CREATE_INVOICES_ONLY\"}");
 
-        assertThat(dryRun.get("summary").get("duplicateVouchersSkipped").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("duplicateVouchersSkipped").asInt()).isZero();
         assertThat(dryRun.get("summary").get("salesInvoicesPreviewed").asInt()).isZero();
-        assertThat(dryRun.get("summary").get("blockingErrors").asInt()).isZero();
-        assertThat(dryRun.get("summary").get("reviewRequiredCount").asInt()).isZero();
-        var committed = postJson(token, "/api/import-sessions/" + sessionId + "/commit", commitBody(dryRun.get("id").asText()));
-        assertThat(committed.get("summary").get("duplicateSalesVouchersSkipped").asInt()).isEqualTo(1);
+        assertThat(dryRun.get("summary").get("blockingErrors").asInt()).isPositive();
+        mvc.perform(post("/api/import-sessions/" + sessionId + "/commit")
+            .header("Authorization", "Bearer " + token).contentType(MediaType.APPLICATION_JSON)
+            .content(commitBody(dryRun.get("id").asText()))).andExpect(status().isBadRequest());
     }
 
     @Test

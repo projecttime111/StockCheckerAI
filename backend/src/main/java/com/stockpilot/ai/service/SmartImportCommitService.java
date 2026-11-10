@@ -26,6 +26,7 @@ import java.util.stream.Collectors;
 
 @Service
 public class SmartImportCommitService {
+    private final ImportExecutionGuard executionGuard;
     private static final Logger log = LoggerFactory.getLogger(SmartImportCommitService.class);
     public static final String CONFIRMATION = "COMMIT IMPORT PLAN";
 
@@ -62,8 +63,9 @@ public class SmartImportCommitService {
         AuditService audit,
         SmartImportDestinationValidator destinationValidator,
         TenantWriteLockService executionLock,
-        org.springframework.transaction.PlatformTransactionManager transactionManager
+        org.springframework.transaction.PlatformTransactionManager transactionManager, ImportExecutionGuard executionGuard
     ) {
+        this.executionGuard = executionGuard;
         this.sessions = sessions;
         this.dryRuns = dryRuns;
         this.dryRunItems = dryRunItems;
@@ -96,7 +98,7 @@ public class SmartImportCommitService {
     }
 
     private Map<String, Object> commitLocked(UUID tenantId, UUID sessionId, SmartImportDtos.CommitRequest request) {
-        executionLock.lock(tenantId);
+        executionGuard.lockAndAuthorize("COMMIT", sessionId);
         var session = session(tenantId, sessionId);
         var existing = commits.findByTenantIdAndImportSessionId(tenantId, sessionId).orElse(null);
         if (existing != null && existing.status == DomainEnums.SmartImportCommitStatus.COMMITTED) {

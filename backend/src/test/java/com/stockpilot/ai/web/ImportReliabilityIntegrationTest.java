@@ -87,6 +87,8 @@ class ImportReliabilityIntegrationTest {
             var preview=postJson(token,"/api/import-sessions/"+session+"/dry-run","{\"stockImpactMode\":\"CREATE_INVOICES_ONLY\"}");
             var result=postJson(token,"/api/import-sessions/"+session+"/commit",commitBody(preview));
             assertThat(result.path("status").asText()).as(result.toPrettyString()).isEqualTo("COMMITTED");
+            var reconciliation=getJson(token,"/api/import-sessions/"+session+"/reconciliation");
+            assertThat(reconciliation.path("status").asText()).as(reconciliation.toString()).isEqualTo("MATCHED");
             var tenant=UUID.fromString(owner.path("tenantId").asText());
             assertThat(invoices.findByTenantId(tenant)).singleElement().satisfies(invoice -> {
                 assertThat(invoice.totalAmount).isEqualByComparingTo("30");

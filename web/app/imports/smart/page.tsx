@@ -20,7 +20,8 @@ import {
   Trash2
 } from "lucide-react";
 import Link from "next/link";
-import { DragEvent, useEffect, useMemo, useState } from "react";
+import { DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { AnalyticsReadiness } from "@/components/AnalyticsReadiness";
 import { AppShell } from "@/components/AppShell";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/ErrorState";
@@ -32,9 +33,15 @@ import { ReturnReviewPanel } from "@/components/ReturnReviewPanel";
 import { TransferReviewPanel } from "@/components/TransferReviewPanel";
 import { VoucherRateReviewForm, VoucherRateAction } from "@/components/VoucherRateReviewForm";
 import { SmartImportSnapshotDates, SavedSnapshotDates, SnapshotDates, snapshotDatesFromSummary, snapshotDatesValid, snapshotDatesMatch } from "@/components/SmartImportSnapshotDates";
-import { useAccess, useMoney, useWorkspaceCurrency } from "@/lib/business";
+import { refreshBusiness, useAccess, useMoney, useWorkspaceCurrency } from "@/lib/business";
+import { QueryFeedback } from "@/components/QueryFeedback";
 import { Pagination } from "@/components/Pagination";
-import { api, Page } from "@/lib/api";
+import { api, DEMO_MODE, Page } from "@/lib/api";
+
+import { useImportJobs } from "@/lib/importJobs";
+import { ImportReconciliation } from "@/components/ImportReconciliation";
+import { DocumentRevisionReview } from "@/components/DocumentRevisionReview";
+import { ImportJobProgress } from "@/components/ImportJobProgress";
 
 type SessionStatus = "CREATED" | "FILES_UPLOADED" | "CLASSIFIED" | "PLAN_READY" | "STAGED" | "NEEDS_REVIEW" | "COMMITTING" | "COMMITTED" | "FAILED" | "CANCELLED";
 type Strategy = "SNAPSHOT_FIRST" | "TRANSACTION_HISTORY" | "HYBRID_RECONCILIATION" | "UNKNOWN";
@@ -456,9 +463,42 @@ export default function SmartImportsPage() {
   const [negativeStockPolicy, setNegativeStockPolicy] = useState<NegativeStockPolicy>("BLOCK");
   const [dryRunItemType, setDryRunItemType] = useState("");
   const [dryRunIssue, setDryRunIssue] = useState("");
+  const [dryRunItemPage, setDryRunItemPage] = useState(0);
   const [commitConfirmation, setCommitConfirmation] = useState("");
   const [pendingCommitSessionId, setPendingCommitSessionId] = useState<string | null>(null);
+  const [jobChainError, setJobChainError] = useState("");
+  const continuedClassifications = useRef(new Set<string>());
   const [dateDraft, setDateDraft] = useState<{ sessionId: string; value: SnapshotDates } | null>(null);
+
+  const jobs = useImportJobs(sessionId, async (job) => {
+    setJobChainError("");
+    if (job.operation === "STAGE") setActiveTab("staging");
+    if (job.operation === "DRY_RUN") {
+      if (job.result) queryClient.setQueryData(["smart-import-dry-run", sessionId], job.result);
+      setDryRunItemPage(0); setDateDraft(null); setCommitConfirmation(""); setActiveTab("dry-run");
+    }
+    if (job.operation === "COMMIT") {
+      if (job.result) queryClient.setQueryData(["smart-import-commit", sessionId], job.result);
+      setActiveTab("commit"); await refreshBusiness(queryClient);
+    }
+    await refresh(sessionId);
+  }, can("imports.validate"));
+  useEffect(() => {
+    const latest = jobs.latest;
+    if (latest?.operation !== "CLASSIFY" || latest.status !== "SUCCEEDED" || !can("imports.validate") || continuedClassifications.current.has(latest.id)) return;
+    continuedClassifications.current.add(latest.id);
+    void jobs.start("STAGE").catch(error => setJobChainError(error instanceof Error ? error.message : "Could not start staging."));
+  }, [jobs.latest, jobs.start, can]);
+  useEffect(() => {
+    const saved = new URLSearchParams(window.location.search).get("session");
+    if (saved && /^[0-9a-f-]{36}$/i.test(saved)) setSessionId(saved);
+  }, []);
+  useEffect(() => {
+    if (!sessionId) return;
+    const url = new URL(window.location.href); url.searchParams.set("session", sessionId);
+    window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+    setSelectedFiles([]); setCommitConfirmation(""); setJobChainError("");
+  }, [sessionId]);
 
   const sessions = useQuery({
     queryKey: ["smart-import-sessions", sessionPage],
@@ -477,15 +517,15 @@ export default function SmartImportsPage() {
   });
   const dryRun = useQuery({
     queryKey: ["smart-import-dry-run", sessionId],
-    enabled: !!sessionId,
+    enabled: !!sessionId && can("imports.validate"),
     queryFn: () => api<DryRunResponse>(`/api/import-sessions/${sessionId}/dry-run`),
     retry: false
   });
   const dryRunItems = useQuery({
-    queryKey: ["smart-import-dry-run-items", sessionId, dryRunItemType, dryRunIssue],
-    enabled: !!sessionId && !!dryRun.data?.available,
+    queryKey: ["smart-import-dry-run-items", sessionId, dryRunItemType, dryRunIssue, dryRunItemPage],
+    enabled: !!sessionId && can("imports.validate") && !!dryRun.data?.available,
     queryFn: () => {
-      const params = new URLSearchParams({ size: "100" });
+      const params = new URLSearchParams({ size: "100", page: String(dryRunItemPage) });
       if (dryRunItemType) params.set("itemType", dryRunItemType);
       if (dryRunIssue) params.set("issue", dryRunIssue);
       return api<Page<DryRunItem>>(`/api/import-sessions/${sessionId}/dry-run/items?${params}`);
@@ -499,7 +539,7 @@ export default function SmartImportsPage() {
   const datesMatchPreview = snapshotDatesMatch(snapshotDates, dryRun.data?.summary);
   const commitResult = useQuery({
     queryKey: ["smart-import-commit", sessionId],
-    enabled: !!sessionId,
+    enabled: !!sessionId && can("imports.commit"),
     queryFn: () => api<CommitResponse>(`/api/import-sessions/${sessionId}/commit-result`),
     refetchInterval: (query) => pendingCommitSessionId === sessionId || query.state.data?.status === "COMMITTING" ? 3000 : false,
     refetchIntervalInBackground: true,
@@ -518,6 +558,9 @@ export default function SmartImportsPage() {
       queryClient.invalidateQueries({ queryKey: ["smart-import-dry-run", id] }),
       queryClient.invalidateQueries({ queryKey: ["smart-import-dry-run-items", id] }),
       queryClient.invalidateQueries({ queryKey: ["smart-import-transfer-review", id] }),
+      queryClient.invalidateQueries({ queryKey: ["smart-import-return-review", id] }),
+      queryClient.invalidateQueries({ queryKey: ["smart-import-document-revisions", id] }),
+      queryClient.invalidateQueries({ queryKey: ["smart-import-reconciliation", id] }),
       queryClient.invalidateQueries({ queryKey: ["smart-import-cashbook-review", id] }),
       queryClient.invalidateQueries({ queryKey: ["smart-import-commit", id] })
     ]);
@@ -554,6 +597,7 @@ export default function SmartImportsPage() {
   const analyze = useMutation({
     mutationFn: async () => {
       if (!sessionId) throw new Error("Select a smart import session");
+      if (!DEMO_MODE) return jobs.start("CLASSIFY");
       await api(`/api/import-sessions/${sessionId}/classify`, { method: "POST" });
       await api(`/api/import-sessions/${sessionId}/plan`, { method: "POST" });
       return api<StagingWorkspace>(`/api/import-sessions/${sessionId}/stage`, { method: "POST" });
@@ -565,7 +609,7 @@ export default function SmartImportsPage() {
   });
 
   const rebuild = useMutation({
-    mutationFn: () => api<StagingWorkspace>(`/api/import-sessions/${sessionId}/rebuild`, { method: "POST" }),
+    mutationFn: async () => DEMO_MODE ? api<StagingWorkspace>(`/api/import-sessions/${sessionId}/rebuild`, { method: "POST" }) : jobs.start("STAGE"),
     onSuccess: async () => refresh(sessionId)
   });
 
@@ -622,12 +666,10 @@ export default function SmartImportsPage() {
   });
 
   const runDryRun = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!sessionId) throw new Error("Select and stage a smart import session");
       if (!datesValid) throw new Error("Enter and confirm the required snapshot dates");
-      return api<DryRunResponse>(`/api/import-sessions/${sessionId}/dry-run`, {
-        method: "POST",
-        body: JSON.stringify({
+      const payload = {
           strategy: dryRunStrategy === "UNKNOWN" ? undefined : dryRunStrategy,
           stockImpactMode,
           returnStockImpactMode,
@@ -637,10 +679,12 @@ export default function SmartImportsPage() {
           snapshotDateConfirmed: snapshotDates.snapshotDateConfirmed,
           outstandingSnapshotDate: snapshotDates.outstandingSnapshotDate || undefined,
           outstandingSnapshotDateConfirmed: snapshotDates.outstandingSnapshotDateConfirmed
-        })
-      });
+      };
+      return DEMO_MODE ? api<DryRunResponse>(`/api/import-sessions/${sessionId}/dry-run`, { method: "POST", body: JSON.stringify(payload) }) : jobs.start("DRY_RUN", payload);
     },
     onSuccess: async (saved) => {
+      setDryRunItemPage(0);
+      if ("operation" in saved) return;
       const savedSessionId = saved.importSessionId ?? sessionId;
       queryClient.setQueryData(["smart-import-dry-run", savedSessionId], saved);
       if (savedSessionId === sessionId) {
@@ -653,9 +697,10 @@ export default function SmartImportsPage() {
   });
 
   const commitFoundation = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!sessionId || !dryRun.data?.id) throw new Error("Run a completed dry run before committing");
       if (!datesMatchPreview) throw new Error("Run a new dry run with the confirmed snapshot dates before committing");
+      if (!DEMO_MODE) return jobs.start("COMMIT", { dryRunId: dryRun.data.id, confirmation: commitConfirmation });
       return api<CommitResponse>(`/api/import-sessions/${sessionId}/commit`, {
         method: "POST",
         body: JSON.stringify({ dryRunId: dryRun.data.id, confirmation: commitConfirmation })
@@ -666,6 +711,7 @@ export default function SmartImportsPage() {
       return { sessionId };
     },
     onSuccess: async (saved, _variables, context) => {
+      if ("operation" in saved) { setActiveTab("commit"); return; }
       const savedSessionId = context.sessionId;
       queryClient.setQueryData(["smart-import-commit", savedSessionId], saved);
       setActiveTab("commit");
@@ -684,7 +730,7 @@ export default function SmartImportsPage() {
       if (context) await queryClient.invalidateQueries({ queryKey: ["smart-import-commit", context.sessionId] });
     }
   });
-  const commitRunning = pendingCommitSessionId === sessionId || commitResult.data?.status === "COMMITTING";
+  const commitRunning = jobs.busy || pendingCommitSessionId === sessionId || commitResult.data?.status === "COMMITTING";
 
   const details = current.data;
   const workspace = staging.data;
@@ -709,6 +755,9 @@ export default function SmartImportsPage() {
   }, [reviewItems]);
 
   useEffect(() => {
+    setDryRunItemPage(0);
+    setDryRunItemType("");
+    setDryRunIssue("");
     setDryRunStrategy(strategy);
     setStockImpactMode(defaultStockImpactMode());
     setStockJournalImpactMode("DEFER_STOCK_JOURNALS");
@@ -772,17 +821,23 @@ export default function SmartImportsPage() {
           </Panel>
 
           {details && details.status !== "CANCELLED" ? (
-            <SecondaryButton className="w-full gap-2 text-coral" onClick={() => cancel.mutate()} disabled={!can("imports.upload") || cancel.isPending}>
+            <SecondaryButton className="w-full gap-2 text-coral" onClick={() => cancel.mutate()} disabled={jobs.busy || !can("imports.upload") || cancel.isPending}>
               <Ban size={16} /> Cancel session
             </SecondaryButton>
           ) : null}
         </aside>
 
-        <main className="min-w-0 space-y-4">
+        <div className="min-w-0 space-y-4">
+          {!DEMO_MODE && sessionId && can("imports.validate") ? <ImportJobProgress job={jobs.active ?? jobs.latest} error={jobs.error} loading={jobs.isLoading} refetch={jobs.refetch} /> : null}
+          {jobChainError ? <p role="alert" className="rounded border border-coral/25 bg-coral/5 p-4 text-sm">{jobChainError} Refresh job status, then use Rebuild staging to continue.</p> : null}
+          <fieldset className="min-w-0 space-y-4 disabled:opacity-70" disabled={jobs.busy}>
+          <AnalyticsReadiness allowCoverage />
+          {sessionId && can("imports.validate") ? <ImportReconciliation key={`reconcile-${sessionId}`} sessionId={sessionId} /> : null}
           {!sessionId ? <EmptyState label="Create a smart import session to begin." /> : null}
           {current.isLoading ? <LoadingState label="Loading import session" /> : null}
           {current.error ? <ErrorState error={current.error} /> : null}
           {mutationError ? <ErrorState error={mutationError} /> : null}
+          {[staging, dryRun, commitResult].some(query => query.error) ? <QueryFeedback queries={[staging, dryRun, commitResult].filter(query => query.error)} /> : null}
 
           {details ? (
             <>
@@ -802,7 +857,7 @@ export default function SmartImportsPage() {
 
               <nav className="overflow-x-auto border-b border-ink/15" aria-label="Smart import workspace">
                 <div className="flex min-w-max gap-1">
-                  {TABS.map((tab) => {
+                  {TABS.filter(tab => tab.id !== "dry-run" && tab.id !== "commit" || can(tab.id === "commit" ? "imports.commit" : "imports.validate")).map((tab) => {
                     const Icon = tab.icon;
                     const count = tab.id === "review" && openReviewCount > 0 ? openReviewCount : null;
                     return (
@@ -1091,12 +1146,13 @@ export default function SmartImportsPage() {
                   <fieldset disabled={!can("imports.commit")}><CashbookReviewPanel sessionId={sessionId} currency={currency} /></fieldset>
                 </Panel>
                 </section>
-                <Panel title="Physical Return Review" action={<Boxes size={18} className="text-moss" />}>
-                  <fieldset disabled={!can("imports.commit")}><ReturnReviewPanel sessionId={sessionId} /></fieldset>
+                <DocumentRevisionReview key={`revisions-${sessionId}`} sessionId={sessionId} />
+                {can("imports.validate") ? <><Panel title="Physical Return Review" action={<Boxes size={18} className="text-moss" />}>
+                  <ReturnReviewPanel sessionId={sessionId} />
                 </Panel>
                 <Panel title="Stock Journal and Transfer Review" action={<Boxes size={18} className="text-moss" />}>
-                  <fieldset disabled={!can("imports.commit")}><TransferReviewPanel sessionId={sessionId} /></fieldset>
-                </Panel>
+                  <TransferReviewPanel sessionId={sessionId} />
+                </Panel></> : <p className="text-xs text-ink/55">Import validation permission is required to review physical returns and warehouse transfers.</p>}
                 </div>
               ) : null}
 
@@ -1183,7 +1239,7 @@ export default function SmartImportsPage() {
                       </Panel>
                       <Panel title="Dry-run Items">
                         <div className="mb-4 flex flex-wrap gap-3">
-                          <select className="focus-ring h-9 rounded border border-ink/15 bg-white px-3 text-sm" value={dryRunItemType} onChange={(event) => setDryRunItemType(event.target.value)} aria-label="Filter dry-run items by type">
+                          <select className="focus-ring h-9 rounded border border-ink/15 bg-white px-3 text-sm" value={dryRunItemType} onChange={(event) => { setDryRunItemType(event.target.value); setDryRunItemPage(0); }} aria-label="Filter dry-run items by type">
                             <option value="">All record types</option>
                             <option value="PRODUCT">Products</option>
                             <option value="CUSTOMER">Customers</option>
@@ -1199,7 +1255,7 @@ export default function SmartImportsPage() {
                             <option value="OUTSTANDING_SNAPSHOT">Outstanding snapshots</option>
                             <option value="STOCK_AGEING">Stock ageing</option>
                           </select>
-                          <select className="focus-ring h-9 rounded border border-ink/15 bg-white px-3 text-sm" value={dryRunIssue} onChange={(event) => setDryRunIssue(event.target.value)} aria-label="Filter dry-run items by issue">
+                          <select className="focus-ring h-9 rounded border border-ink/15 bg-white px-3 text-sm" value={dryRunIssue} onChange={(event) => { setDryRunIssue(event.target.value); setDryRunItemPage(0); }} aria-label="Filter dry-run items by issue">
                             <option value="">All severities</option>
                             <option value="ERROR">Blocking errors</option>
                             <option value="WARNING">Warnings</option>
@@ -1207,7 +1263,7 @@ export default function SmartImportsPage() {
                           </select>
                         </div>
                         {dryRunItems.isLoading ? <LoadingState label="Loading dry-run items..." /> : null}
-                        {dryRunItems.data?.content.length ? <DryRunItemsTable rows={dryRunItems.data.content} /> : !dryRunItems.isLoading ? <EmptyState label="No dry-run items match these filters." /> : null}
+                        {dryRunItems.error ? <QueryFeedback queries={[dryRunItems]} /> : dryRunItems.data ? <><DryRunItemsTable rows={dryRunItems.data.content} />{!dryRunItems.data.content.length ? <EmptyState label="No dry-run items match these filters." /> : null}<Pagination data={dryRunItems.data} page={dryRunItemPage} onChange={setDryRunItemPage} /></> : null}
                       </Panel>
                     </>
                   ) : (
@@ -1306,7 +1362,8 @@ export default function SmartImportsPage() {
               ) : null}
             </>
           ) : null}
-        </main>
+          </fieldset>
+        </div>
       </div>
     </AppShell>
   );

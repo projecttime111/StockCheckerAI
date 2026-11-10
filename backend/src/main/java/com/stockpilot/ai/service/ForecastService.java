@@ -49,12 +49,13 @@ public class ForecastService {
         forecasts.flush();
         suggestions.flush();
         var today = LocalDate.now(ZoneOffset.UTC);
-        var since = today.minusDays(89);
-        var history = salesHistory.history(tenantId);
+        var history = salesHistory.demandHistory(tenantId,today);
+        var since=history.windowStart(today,90);
+        int observationDays=history.observationDays(today,90);
 
         var responses = new ArrayList<ApiDtos.ForecastResponse>();
         for (var product : products.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId)) {
-            var daily = history.daily(product.id, null, since, 90);
+            var daily = history.daily(product.id, null, since, observationDays);
             var avg = ForecastMath.averageDailyDemand(daily);
             var weighted = ForecastMath.weightedDailyDemand(daily);
             var demand = weighted.compareTo(BigDecimal.ZERO) > 0 ? weighted : avg;
@@ -72,6 +73,7 @@ public class ForecastService {
             forecast.currentStock = current;
             forecast.stockoutDate = stockout;
             forecast.generatedAt = Instant.now();
+            forecast.coverageDays=observationDays; forecast.coverageConfirmed=history.coverageConfirmed();
             forecasts.save(forecast);
 
             var reorderPoint = ForecastMath.reorderPoint(demand, product.leadTimeDays, product.safetyStock);
@@ -82,23 +84,25 @@ public class ForecastService {
                 suggestion.productId = product.id;
                 suggestion.reorderPoint = reorderPoint;
                 suggestion.suggestedQuantity = suggested;
-                suggestion.reason = "Demand forecast uses last 90 days sales. Current stock " + current + ", reorder point " + reorderPoint + ".";
+                suggestion.reason = "Demand forecast uses " + observationDays + " observed days through " + history.windowEnd(today)
+                    + (history.coverageConfirmed() ? "; history coverage confirmed." : "; provisional because history coverage is unconfirmed.")
+                    + " Current stock " + current + ", reorder point " + reorderPoint + ".";
                 suggestion.generatedAt = Instant.now();
                 suggestions.save(suggestion);
             }
-            responses.add(new ApiDtos.ForecastResponse(product.id, product.name, current, avg, next7, next30, stockout, history.lastSale(product.id, null, today) != null));
+            responses.add(new ApiDtos.ForecastResponse(product.id, product.name, current, avg, next7, next30, stockout, history.lastSale(product.id, null, today) != null,observationDays,history.coverageConfirmed(),forecast.generatedAt));
         }
         return responses;
     }
 
     public List<ApiDtos.ForecastResponse> results() {
         var tenantId = TenantContext.tenantId();
-        var history = salesHistory.history(tenantId);
         var today = LocalDate.now(ZoneOffset.UTC);
+        var history = salesHistory.demandHistory(tenantId,today);
         return forecasts.findByTenantIdOrderByGeneratedAtDesc(tenantId).stream()
             .map(result -> {
                 var product = products.findByTenantIdAndId(tenantId, result.productId).orElse(null);
-                return new ApiDtos.ForecastResponse(result.productId, product == null ? "Unknown product" : product.name, result.currentStock, result.averageDailyDemand, result.next7DaysDemand, result.next30DaysDemand, result.stockoutDate, history.lastSale(result.productId, null, today) != null);
+                return new ApiDtos.ForecastResponse(result.productId, product == null ? "Unknown product" : product.name, result.currentStock, result.averageDailyDemand, result.next7DaysDemand, result.next30DaysDemand, result.stockoutDate, history.lastSale(result.productId, null, today) != null,result.coverageDays,result.coverageConfirmed,result.generatedAt);
             })
             .toList();
     }

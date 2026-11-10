@@ -47,11 +47,24 @@ public class TallyXmlImportAdapter extends GenericXmlImportAdapter {
             try (var sanitized = sanitizingReader(request.inputStream())) {
                 var reader = inputFactory.createXMLEventReader(sanitized);
                 String pendingDisplayName = null;
+                String sourceCompany = "";
+                java.time.LocalDate reportDate=java.time.LocalDate.now(java.time.ZoneOffset.UTC);
                 while (reader.hasNext()) {
                     var event = reader.nextEvent();
                     if (!event.isStartElement()) continue;
                     var entityName = event.asStartElement().getName().getLocalPart().toUpperCase(Locale.ROOT);
+                    if ("COMPANY".equals(entityName)) {
+                        var attribute=event.asStartElement().getAttributeByName(new javax.xml.namespace.QName("NAME"));
+                        if(attribute!=null) sourceCompany=attribute.getValue();
+                    }
+                    if ("SVCURRENTCOMPANY".equals(entityName)) { sourceCompany=reader.getElementText(); continue; }
+                    if (Set.of("SVTODATE","ASSONDATE","REPORTDATE").contains(entityName)) {
+                        var rawDate=reader.getElementText();var parsedDate=ImportDates.parse(rawDate);
+                        if(parsedDate==null&&!rawDate.isBlank()) throw new IllegalArgumentException("Invalid source report date: "+rawDate);
+                        if(parsedDate!=null) reportDate=parsedDate; continue;
+                    }
                     if (!STREAMED_ENTITIES.contains(entityName)) continue;
+                    int firstRow = rows.size();
 
                     var fragment = new StringWriter();
                     var writer = outputFactory.createXMLEventWriter(fragment);
@@ -67,7 +80,7 @@ public class TallyXmlImportAdapter extends GenericXmlImportAdapter {
 
                     var element = parseFragment(fragment.toString());
                     switch (entityName) {
-                        case "STOCKITEM" -> addStockItemRow(element, rows);
+                        case "STOCKITEM" -> addStockItemRow(element, rows, reportDate);
                         case "LEDGER" -> addLedgerRow(element, rows);
                         case "VOUCHER" -> addVoucherRows(element, rows);
                         case "DSPACCNAME" -> pendingDisplayName = text(element, "DSPDISPNAME");
@@ -76,6 +89,12 @@ public class TallyXmlImportAdapter extends GenericXmlImportAdapter {
                             pendingDisplayName = null;
                         }
                         default -> { }
+                    }
+                    for(int rowIndex=firstRow;rowIndex<rows.size();rowIndex++) {
+                        var row=rows.get(rowIndex); row.put("Source Company",sourceCompany);
+                        row.put("Source System","TALLY");
+                        row.put("Source Revision",textIgnoreCase(element,"ALTERID"));
+                        row.put("Source Line ID",Integer.toString(rowIndex-firstRow+1));
                     }
                 }
                 reader.close();
@@ -303,17 +322,16 @@ public class TallyXmlImportAdapter extends GenericXmlImportAdapter {
         }
     }
 
-    private void addStockItemRow(Element item, List<Map<String, String>> rows) {
+    private void addStockItemRow(Element item, List<Map<String, String>> rows, java.time.LocalDate reportDate) {
         var row = new LinkedHashMap<String, String>();
         row.put("Item Name", item.getAttribute("NAME"));
         row.put("Unit", text(item, "BASEUNITS"));
         row.put("Category", text(item, "PARENT"));
         row.put("Opening Stock", numberPrefix(text(item, "OPENINGBALANCE")));
         row.put("Purchase Price", numberPrefix(text(item, "OPENINGRATE")));
-        row.put("Sales Price", numberPrefix(text(item, "RATEOFVAT")));
+        TallyMasterRates.apply(item, row, reportDate);
         row.put("HSN", text(item, "HSNCODE"));
         row.put("HSN Code", text(item, "HSNCODE"));
-        row.put("GST %", text(item, "RATEDETAILS.LIST"));
         row.put("Tally GUID", firstNonBlank(item.getAttribute("GUID"), textIgnoreCase(item, "GUID"), textIgnoreCase(item, "MASTERID")));
         row.put("Source Entity", "STOCKITEM");
         rows.add(row);
@@ -453,8 +471,10 @@ public class TallyXmlImportAdapter extends GenericXmlImportAdapter {
 
     private String cancelled(Element voucher) {
         var action = voucher.getAttribute("ACTION");
-        var isCancelled = firstNonBlank(text(voucher, "ISCANCELLED"), text(voucher, "ISDELETED"), action);
-        return isCancelled == null ? "" : isCancelled;
+        for(var status:List.of(text(voucher,"ISCANCELLED"),text(voucher,"ISDELETED"),action)) {
+            if(Set.of("YES","TRUE","1","CANCEL","CANCELLED","DELETE","DELETED").contains(status.trim().toUpperCase(Locale.ROOT))) return "YES";
+        }
+        return "NO";
     }
 
     private Element parentElement(Element element, String tagName) {

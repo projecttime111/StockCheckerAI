@@ -98,8 +98,16 @@ app:
   storage:
     local-root: ${LOCAL_STORAGE_ROOT:uploads}
   ai:
-    llm-endpoint: ${LLM_ENDPOINT:}
-    llm-api-key: ${LLM_API_KEY:}
+    enabled: ${APP_AI_ENABLED:false}
+    provider: ${APP_AI_PROVIDER:gemini}
+    model: ${APP_AI_MODEL:}
+    gemini-api-key: ${GEMINI_API_KEY:}
+    timeout-seconds: ${APP_AI_TIMEOUT_SECONDS:20}
+    user-requests-per-minute: ${APP_AI_USER_REQUESTS_PER_MINUTE:10}
+    tenant-requests-per-minute: ${APP_AI_TENANT_REQUESTS_PER_MINUTE:60}
+  import-jobs:
+    enabled: ${APP_IMPORT_JOBS_ENABLED:true}
+    poll-ms: ${APP_IMPORT_JOBS_POLL_MS:1500}
   demo:
     seed-enabled: ${APP_DEMO_SEED_ENABLED:false}
   swagger:

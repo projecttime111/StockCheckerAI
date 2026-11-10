@@ -70,11 +70,14 @@ class TenantIsolationGuardrailTest {
     // - PlatformAdminAudit is a separate global operational audit, not tenant audit_logs. Its service requires a
     //   tenantless session, current global DB role, and platform.audit.view; PlatformAdminIntegrationTest covers
     //   business-user denial, platform-role separation, filtering, and tenant business-data isolation.
+    // - Durable import workers reauthorize the server-recorded requesting account before establishing context;
+    //   the persisted job tenant and current membership/operation permission are independently checked.
     private static final Map<String, List<String>> VERIFIED_IDENTITY_AND_PLATFORM_CALLS = Map.of(
         "service/AuthSessionService.java", List.of("users.findById(TenantContext.userId())"),
         "service/WorkspaceInvitationService.java", List.of("users.findById(TenantContext.userId())"),
         "service/AccountLifecycleService.java", List.of("tenants.findById(membership.tenantId)"),
-        "service/PlatformAdminService.java", List.of("audits.findAll(specification,PageRequest.of(")
+        "service/PlatformAdminService.java", List.of("audits.findAll(specification,PageRequest.of("),
+        "service/ImportJobService.java", List.of("users.findById(job.requestedBy)")
     );
 
     @Test
@@ -111,6 +114,9 @@ class TenantIsolationGuardrailTest {
 
     @Test
     void approvedIdentityReadsDoNotAllowClientSelectedUsersOrBusinessRecords() {
+        assertThat(scanUnsafeRepositoryAccess("service/ImportJobService.java", "users.findById(job.requestedBy);")).isEmpty();
+        assertThat(scanUnsafeRepositoryAccess("service/ImportJobService.java", "users.findById(request.userId());")).hasSize(1);
+        assertThat(scanUnsafeRepositoryAccess("service/ImportJobService.java", "products.findById(job.requestedBy);")).hasSize(1);
         for (var path : List.of("service/AuthSessionService.java", "service/WorkspaceInvitationService.java")) {
             assertThat(scanUnsafeRepositoryAccess(path, "users.findById(TenantContext.userId());")).isEmpty();
             assertThat(scanUnsafeRepositoryAccess(path, "users.findById(request.userId());")).hasSize(1);

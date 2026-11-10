@@ -30,6 +30,7 @@ public class SmartStagedProduct extends TenantOwnedEntity {
     public String hsn;
     public BigDecimal gstPercent;
     public BigDecimal purchasePrice;
+    public BigDecimal salesPrice;
     public String externalId;
     @JdbcTypeCode(SqlTypes.JSON)
     public Map<String, Object> rawMetadataJson = new LinkedHashMap<>();

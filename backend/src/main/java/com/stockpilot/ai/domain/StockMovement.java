@@ -17,8 +17,10 @@ public class StockMovement extends TenantOwnedEntity {
     public UUID batchId;
     @Enumerated(EnumType.STRING)
     public DomainEnums.MovementType movementType;
+    @jakarta.persistence.Column(precision=14, scale=3)
     public BigDecimal quantity = BigDecimal.ZERO;
     public UUID unitId;
+    @jakarta.persistence.Column(precision=14, scale=3)
     public BigDecimal baseQuantity = BigDecimal.ZERO;
     @jakarta.persistence.Column(precision = 24, scale = 12)
     public BigDecimal rate = BigDecimal.ZERO;

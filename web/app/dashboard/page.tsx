@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Bot, Boxes, ClipboardCheck, IndianRupee, Package, Settings, Store, TrendingUp, Truck, Wallet } from "lucide-react";
 import Link from "next/link";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { AnalyticsReadiness } from "@/components/AnalyticsReadiness";
 import { AppShell } from "@/components/AppShell";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/ErrorState";
@@ -66,6 +67,7 @@ export default function DashboardPage() {
 
   return (
     <AppShell title="Dashboard">
+      <div className="mb-5"><AnalyticsReadiness /></div>
       {summary.isLoading ? <LoadingState /> : summary.error ? <ErrorState error={summary.error} /> : (
         <div className="space-y-6">
           <QueryFeedback queries={[salesTrend, profitTrend, lowStock, deadStock, actions, topProducts, slowMoving, profitDrop, tenant]} />

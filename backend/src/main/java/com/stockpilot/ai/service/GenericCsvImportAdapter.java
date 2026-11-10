@@ -61,7 +61,7 @@ public class GenericCsvImportAdapter implements ErpImportAdapter {
     }
 
     // Parse logical records, retaining newlines and doubled quotes within quoted fields.
-    private static List<List<String>> readRecords(java.io.Reader source) throws java.io.IOException {
+    static List<List<String>> readRecords(java.io.Reader source) throws java.io.IOException {
         var reader = new java.io.PushbackReader(source, 1);
         var records = new ArrayList<List<String>>();
         var fields = new ArrayList<String>();

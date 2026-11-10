@@ -6,7 +6,7 @@ import { api } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
 import { Field, PrimaryButton, SecondaryButton, TextInput } from "@/components/FormControls";
 import { RecordPicker } from "@/components/RecordPicker";
-import { QueryFeedback } from "@/components/QueryFeedback";
+import { MutationFeedback, QueryFeedback } from "@/components/QueryFeedback";
 import { LoadingState } from "@/components/LoadingState";
 
 type ReturnReview = {
@@ -73,13 +73,15 @@ export function ReturnReviewPanel({ sessionId }: { sessionId: string }) {
   });
 
   if (reviews.isLoading) return <LoadingState label="Loading return review items..." />;
+  if (reviews.error) return <QueryFeedback queries={[reviews]} />;
   if (!reviews.data?.length) {
-    return <EmptyState label="No ambiguous physical returns. Reliable inventory returns were classified automatically." />;
+    return <div className="space-y-3"><MutationFeedback mutation={resolve} success="Return review decision saved." /><EmptyState label="No ambiguous physical returns. Reliable inventory returns were classified automatically." /></div>;
   }
 
   return (
     <div className="space-y-4">
       <QueryFeedback queries={[warehouses]} />
+      <MutationFeedback mutation={resolve} success="Return review decision saved. Refresh the dry run before committing." />
       <p className="text-sm leading-6 text-ink/65">
         Credit and debit notes do not always move goods. Confirm only lines where inventory physically returned.
         Damaged or non-saleable items remain deferred from available stock.

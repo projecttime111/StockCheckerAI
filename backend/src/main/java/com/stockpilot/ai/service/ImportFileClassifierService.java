@@ -125,18 +125,13 @@ public class ImportFileClassifierService {
     private DetectionResult classifyDelimited(InputStream input, String format) throws IOException {
         var evidence = new Evidence(format);
         try (var reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
-            String line;
-            String headerLine = null;
-            while ((line = reader.readLine()) != null) {
-                if (headerLine == null && !line.isBlank()) {
-                    headerLine = stripBom(line);
-                    evidence.headers.addAll(parseHeaders(headerLine));
-                    continue;
-                }
-                if (!line.isBlank()) {
-                    evidence.rowCount++;
-                    evidence.scanDelimitedDates(line);
-                }
+            var records=GenericCsvImportAdapter.readRecords(reader);
+            if(records.isEmpty()) return resultFromEvidence(evidence);
+            var headers=records.getFirst().stream().map(ImportFileClassifierService::normalizeHeader).toList();
+            headers.stream().filter(value->!value.isBlank()).forEach(evidence.headers::add);
+            for(int index=1;index<records.size();index++) {
+                var values=records.get(index); if(values.stream().allMatch(String::isBlank)) continue;
+                evidence.rowCount++; evidence.acceptTabularRow(headers,values);
             }
         }
         return resultFromEvidence(evidence);
@@ -146,36 +141,21 @@ public class ImportFileClassifierService {
         var evidence = new Evidence("EXCEL");
         var formatter = new DataFormatter(Locale.ENGLISH);
         try (var workbook = WorkbookFactory.create(input)) {
-            if (workbook.getNumberOfSheets() == 0) {
-                return unknown("The workbook does not contain any sheets.", "EXCEL");
-            }
+            if (workbook.getNumberOfSheets() == 0) return unknown("The workbook does not contain any sheets.", "EXCEL");
+            var evaluator=workbook.getCreationHelper().createFormulaEvaluator();
             var sheet = workbook.getSheetAt(0);
-            var headerFound = false;
+            List<String> headers=null;
             for (var row : sheet) {
-                var nonBlank = false;
-                var values = new ArrayList<String>();
-                for (var cell : row) {
-                    var value = formatter.formatCellValue(cell).trim();
-                    values.add(value);
-                    nonBlank = nonBlank || !value.isBlank();
-                    if (headerFound && cell.getCellType() == CellType.NUMERIC && DateUtil.isCellDateFormatted(cell)) {
-                        evidence.dates.add(cell.getDateCellValue().toInstant().atZone(ZoneId.systemDefault()).toLocalDate());
-                    }
-                }
-                if (!nonBlank) {
-                    continue;
-                }
-                if (!headerFound) {
-                    values.stream().map(ImportFileClassifierService::normalizeHeader).filter(value -> !value.isBlank()).forEach(evidence.headers::add);
-                    headerFound = true;
-                } else {
-                    evidence.rowCount++;
-                    values.forEach(value -> parseDate(value).ifPresent(evidence.dates::add));
-                }
+                var values=new ArrayList<String>();
+                for(int column=0;column<Math.max(row.getLastCellNum(),headers==null?0:headers.size());column++)
+                    values.add(GenericExcelImportAdapter.cellValue(row.getCell(column),formatter,evaluator));
+                if(values.stream().allMatch(String::isBlank)) continue;
+                if(headers==null) {
+                    headers=values.stream().map(ImportFileClassifierService::normalizeHeader).toList();
+                    headers.stream().filter(value->!value.isBlank()).forEach(evidence.headers::add);
+                } else { evidence.rowCount++; evidence.acceptTabularRow(headers,values); }
             }
-        } catch (RuntimeException ex) {
-            throw new IOException("Workbook could not be classified: " + safeMessage(ex), ex);
-        }
+        } catch (RuntimeException ex) { throw new IOException("Workbook could not be classified: " + safeMessage(ex), ex); }
         return resultFromEvidence(evidence);
     }
 
@@ -221,6 +201,10 @@ public class ImportFileClassifierService {
         var ledgerCount = evidence.elementCounts.getOrDefault("LEDGER", 0);
         var voucherKinds = evidence.voucherTypeCounts.keySet();
 
+        if (evidence.uncertainTabularTypes) {
+            return buildResult(DomainEnums.DetectedFileType.UNKNOWN,confidence("0.45"),
+                "The voucher-type column contains missing or unsupported values; review those rows before posting.",evidence);
+        }
         if (has(tags, "DSPACCNAME") && (has(tags, "DSPSTKINFO") || has(tags, "DSPCLQTY"))) {
             type = DomainEnums.DetectedFileType.STOCK_SNAPSHOT;
             confidence = confidence("0.99");
@@ -501,6 +485,7 @@ public class ImportFileClassifierService {
         private final List<LocalDate> voucherDates = new ArrayList<>();
         private final Map<String, Integer> voucherTypeCounts = new LinkedHashMap<>();
         private int rowCount;
+        private boolean uncertainTabularTypes;
         private String companyName;
         private boolean tally;
         private String outstandingPartyType;
@@ -517,6 +502,28 @@ public class ImportFileClassifierService {
             } else if (normalizedFileName.contains("CREDITOR") || normalizedFileName.contains("PAYABLE")) {
                 outstandingPartyType = "SUPPLIER";
             }
+        }
+
+        private void acceptTabularRow(List<String> columnHeaders,List<String> row) {
+            var document=columnHeaders.stream().map(ImportFileClassifierService::normalize)
+                .anyMatch(header->Set.of("VOUCHERNUMBER","VOUCHERNO","INVOICENUMBER","INVOICENO").contains(header));
+            boolean hasType=false,typed=false;
+            for(int column=0;column<columnHeaders.size();column++) {
+                var field=normalize(columnHeaders.get(column));var value=column<row.size()?row.get(column).trim():"";
+                if(document && Set.of("VOUCHERTYPE","VOUCHERTYPENAME","INVOICETYPE","TRANSACTIONTYPE","TYPE").contains(field)) {
+                    hasType=true;
+                    if(!value.isBlank()) {
+                        typed=true;acceptVoucherType(value);countElement("VOUCHER");
+                        if(detectedVoucherType(value)==DomainEnums.DetectedFileType.UNKNOWN) uncertainTabularTypes=true;
+                    }
+                }
+                if(Set.of("COMPANY","COMPANYNAME","SOURCECOMPANY","SVCURRENTCOMPANY","CMPNAME").contains(field) && companyName==null && !value.isBlank()) companyName=value;
+                if(Set.of("DATE","VOUCHERDATE","INVOICEDATE","SNAPSHOTDATE","REPORTDATE","FROMDATE","TODATE").contains(field)) {
+                    parseDate(value).ifPresent(date->{dates.add(date);if(document && Set.of("DATE","VOUCHERDATE","INVOICEDATE").contains(field)) voucherDates.add(date);});
+                }
+                if(Set.of("PARTYTYPE","LEDGERTYPE").contains(field) && Set.of("DEBTOR","CREDITOR","CUSTOMER","SUPPLIER").contains(normalize(value))) values.add(normalize(value));
+            }
+            if(document && hasType && !typed) uncertainTabularTypes=true;
         }
 
         private void countElement(String tag) {

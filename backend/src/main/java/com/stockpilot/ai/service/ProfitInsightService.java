@@ -51,7 +51,7 @@ public class ProfitInsightService {
         var today = LocalDate.now(ZoneOffset.UTC);
         var currentStart = today.withDayOfMonth(1);
         var previousStart = currentStart.minusMonths(1);
-        var previousEnd = currentStart.minusDays(1);
+        var previousEnd = previousStart.withDayOfMonth(Math.min(today.getDayOfMonth(),previousStart.lengthOfMonth()));
         return analyze(currentStart, today, previousStart, previousEnd);
     }
 
@@ -90,6 +90,9 @@ public class ProfitInsightService {
         evidence.put("previousMonthGrossProfit", previousProfit);
         evidence.put("currentMonthMarginPercent", currentMargin);
         evidence.put("previousMonthMarginPercent", previousMargin);
+        evidence.put("currentPeriodFrom",currentStart); evidence.put("currentPeriodThrough",currentEnd);
+        evidence.put("previousPeriodFrom",previousStart); evidence.put("previousPeriodThrough",previousEnd);
+        evidence.put("costBasis","Recorded costs may be estimated or incomplete; verify cost provenance before relying on profit.");
         return new ApiDtos.ProfitDropResponse(summary, profitChange, marginChange, reasons.stream().limit(5).toList(), actions, evidence);
     }
 

@@ -30,6 +30,7 @@ import java.util.UUID;
 
 @Service
 public class SmartImportSessionService {
+    private final ImportExecutionGuard executionGuard;
     private static final Set<String> SUPPORTED_EXTENSIONS = Set.of("xml", "csv", "xlsx", "xls", "json");
 
     private final Repositories.ImportSessionRepository sessions;
@@ -55,8 +56,10 @@ public class SmartImportSessionService {
         ImportFileClassifierService classifier,
         ImportPlanBuilderService planBuilder,
         AuditService auditService,
+        ImportExecutionGuard executionGuard,
         @Value("${app.import.max-upload-size:500MB}") DataSize maxUploadSize
     ) {
+        this.executionGuard = executionGuard;
         this.sessions = sessions;
         this.files = files;
         this.plans = plans;
@@ -151,6 +154,7 @@ public class SmartImportSessionService {
 
     @Transactional
     public List<ImportSessionFile> classify(UUID sessionId) {
+        executionGuard.lockAndAuthorize("CLASSIFY", sessionId);
         var session = get(sessionId);
         ensureMutable(session);
         invalidateDryRun(session);

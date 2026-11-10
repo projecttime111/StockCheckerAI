@@ -140,7 +140,7 @@ class AnalyticsReadinessIntegrationTest {
         var response = json.readTree(mvc.perform(post("/api/ai/assistant/chat").header("Authorization", "Bearer " + staff)
             .contentType(MediaType.APPLICATION_JSON).content("{\"message\":\"show summary\"}"))
             .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
-        assertThat(response.path("evidence").path("summary").path("grossProfit").isNull()).isTrue();
+        assertThat(response.path("evidence").path("summary").path("data").path("grossProfit").isNull()).isTrue();
         assertThat(response.path("response").asText()).doesNotContain("gross profit");
         assertThat(getJson(token(f, DomainEnums.Role.OWNER), "/api/dashboard/summary").path("grossProfit").decimalValue()).isEqualByComparingTo("10");
         assertThat(getJson(token(f, DomainEnums.Role.ACCOUNTANT), "/api/dashboard/summary").path("grossProfit").decimalValue()).isEqualByComparingTo("10");

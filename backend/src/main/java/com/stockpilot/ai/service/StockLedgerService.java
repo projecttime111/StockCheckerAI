@@ -338,7 +338,7 @@ public class StockLedgerService {
     }
 
     public BigDecimal latestCost(UUID tenantId, UUID productId, BigDecimal fallback) {
-        return movements.findFirstByTenantIdAndProductIdAndMovementTypeOrderByMovementDateDesc(tenantId, productId, DomainEnums.MovementType.PURCHASE)
+        return movements.latestCurrentCost(tenantId, productId, DomainEnums.MovementType.PURCHASE,org.springframework.data.domain.PageRequest.of(0,1)).stream().findFirst()
             .filter(movement -> movement.baseQuantity != null && movement.baseQuantity.signum() != 0)
             .filter(movement -> movement.quantity != null && movement.rate != null)
             .map(movement -> movement.rate.multiply(movement.quantity.abs())

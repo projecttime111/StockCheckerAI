@@ -50,7 +50,7 @@ public class ReorderEngineService {
         var tenantId = TenantContext.tenantId();
         var rows = new ArrayList<ApiDtos.SmartReorderSuggestion>();
         var today = LocalDate.now(ZoneOffset.UTC);
-        var history = salesHistory.history(tenantId);
+        var history = salesHistory.demandHistory(tenantId,today);
         var warehouseRows = warehouses.findByTenantIdAndActiveTrueOrderByNameAsc(tenantId).stream()
             .sorted(Comparator.comparing(w -> w.id.toString())).toList();
         var pendingPurchases = analytics.findPendingPurchasesByTenantId(tenantId);
@@ -67,8 +67,8 @@ public class ReorderEngineService {
                 var last7 = history.quantity(product.id, warehouse.id, today.minusDays(6), today);
                 var last30 = history.quantity(product.id, warehouse.id, today.minusDays(29), today);
                 var previous30 = history.quantity(product.id, warehouse.id, today.minusDays(59), today.minusDays(30));
-                var avgDaily = history.quantity(product.id, warehouse.id, today.minusDays(89), today).divide(BigDecimal.valueOf(90), 3, RoundingMode.HALF_UP);
-                var recentDaily = last30.divide(BigDecimal.valueOf(30), 3, RoundingMode.HALF_UP);
+                var avgDaily = history.quantity(product.id, warehouse.id, history.windowStart(today,90), history.windowEnd(today)).divide(BigDecimal.valueOf(history.observationDays(today,90)), 3, RoundingMode.HALF_UP);
+                var recentDaily = history.quantity(product.id,warehouse.id,history.windowStart(today,30),history.windowEnd(today)).divide(BigDecimal.valueOf(history.observationDays(today,30)), 3, RoundingMode.HALF_UP);
                 var demand = recentDaily.compareTo(BigDecimal.ZERO) > 0 ? recentDaily : avgDaily;
                 var pendingPo = pendingPurchases.stream()
                     .filter(item -> product.id.equals(item.productId) && warehouse.id.equals(item.warehouseId))
@@ -87,7 +87,8 @@ public class ReorderEngineService {
                 var reasonPrefix = trend.compareTo(BigDecimal.ZERO) > 0
                     ? "Sales increased " + trend + "% in the last 4 weeks"
                     : "Current stock plus pending purchases is near the reorder point";
-                var reason = reasonPrefix
+                var reason = (history.coverageConfirmed()?"":"Provisional estimate: sales-history coverage is unconfirmed. ")+reasonPrefix
+                    + ". Demand window ends " + history.windowEnd(today)
                     + ". Formula: reorder point = avg demand "
                     + demand
                     + " x lead time "

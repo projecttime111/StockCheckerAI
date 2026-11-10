@@ -229,7 +229,10 @@ public final class ApiDtos {
     public record AuditLogResponse(UUID id, UUID actorUserId, String action, String entityType, UUID entityId, Map<String, Object> details, Instant createdAt) {
     }
 
-    public record ForecastResponse(UUID productId, String productName, BigDecimal currentStock, BigDecimal averageDailyDemand, BigDecimal next7DaysDemand, BigDecimal next30DaysDemand, LocalDate stockoutDate, Boolean salesHistoryAvailable) {
+    public record ForecastResponse(UUID productId, String productName, BigDecimal currentStock, BigDecimal averageDailyDemand, BigDecimal next7DaysDemand, BigDecimal next30DaysDemand, LocalDate stockoutDate, Boolean salesHistoryAvailable, Integer coverageDays, Boolean coverageConfirmed, Instant generatedAt) {
+        public ForecastResponse(UUID productId,String productName,BigDecimal currentStock,BigDecimal averageDailyDemand,BigDecimal next7DaysDemand,BigDecimal next30DaysDemand,LocalDate stockoutDate,Boolean salesHistoryAvailable){
+            this(productId,productName,currentStock,averageDailyDemand,next7DaysDemand,next30DaysDemand,stockoutDate,salesHistoryAvailable,null,null,null);
+        }
         public ForecastResponse(UUID productId, String productName, BigDecimal currentStock, BigDecimal averageDailyDemand, BigDecimal next7DaysDemand, BigDecimal next30DaysDemand, LocalDate stockoutDate) {
             this(productId, productName, currentStock, averageDailyDemand, next7DaysDemand, next30DaysDemand, stockoutDate, null);
         }
@@ -308,10 +311,21 @@ public final class ApiDtos {
     public record AccountDeletionResponse(String status, UUID userId) {
     }
 
-    public record ChatRequest(UUID conversationId, @NotBlank String message) {
+    public record ChatRequest(UUID conversationId, @NotBlank @jakarta.validation.constraints.Size(max = 4000) String message, UUID requestId) {
+        public ChatRequest(UUID conversationId, String message) { this(conversationId, message, null); }
     }
 
-    public record ChatResponse(UUID conversationId, String response, Map<String, Object> evidence) {
+    public record ChatResponse(UUID conversationId, String response, Map<String, Object> evidence,
+        UUID messageId, UUID requestId, String status, String provider, String model,
+        java.time.Instant generatedAt, List<String> limitations) {
+        public ChatResponse(UUID conversationId, String response, Map<String, Object> evidence) {
+            this(conversationId, response, evidence, null, null, "COMPLETED", "local", null, java.time.Instant.now(), List.of());
+        }
+    }
+
+    public record AiConversationResponse(UUID id, String title, java.time.Instant createdAt, java.time.Instant updatedAt) { }
+    public record AiMessageResponse(UUID id, String role, String content, Map<String, Object> evidence,
+        java.time.Instant createdAt, boolean restricted, String status, UUID requestId) {
     }
 
     public record ProductCleanupSuggestion(UUID productId, String productName, String normalizedName, String brand, String category, String unitSize, List<String> issues) {

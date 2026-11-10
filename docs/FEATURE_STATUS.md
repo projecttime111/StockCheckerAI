@@ -1,4 +1,6 @@
-# Feature Status
+# Historical MVP Feature Audit
+
+This is an early MVP audit, not the current deployment status. Several missing items below have since been implemented. See [import, analytics and assistant implementation notes](IMPORT_ANALYTICS_AI.md) for the 2026-11-10 changes and validation, and [platform and Clerk setup](PLATFORM_AND_CLERK_SETUP.md) for the newer identity and workspace system.
 
 Status key:
 

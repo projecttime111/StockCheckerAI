@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, RotateCcw, Trash2, UserX, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { FormEvent, useEffect, useState } from "react";
 import { AppShell } from "@/components/AppShell";
 import { BusinessMode, BusinessModeSelector } from "@/components/BusinessModeSelector";
@@ -154,7 +155,7 @@ export default function SettingsPage() {
           </form>
         </Panel>
         <Panel title="Users and Roles">
-          <p className="text-sm text-ink/60">Role-based access is enforced by the backend for OWNER, ADMIN, MANAGER, STAFF, and VIEWER. User invitation management is reserved for the next production hardening pass.</p>
+          <p className="text-sm text-ink/60">Invite teammates, review memberships, and manage their roles from the Team page. Each role has its own workspace permissions.</p><Link className="mt-3 inline-block font-semibold text-moss underline" href="/team">Manage team</Link>
         </Panel>
         <Panel title="Import Templates">
           <p className="text-sm text-ink/60">Saved mapping templates are available through the import API and used by the import workflow for repeat Tally, CSV, Excel, JSON, and XML uploads.</p>

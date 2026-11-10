@@ -157,7 +157,8 @@ public class ImportService {
             var adapter = adapterFor(requestedSource, upload.getOriginalFilename());
             batch.sourceType = adapter.sourceType();
             try (var input = storage.read(storageKey)) {
-                var preview = adapter.parse(new ErpImportAdapter.ImportRequest(tenantId, batch.id, upload.getOriginalFilename(), input));
+                var parsed = adapter.parse(new ErpImportAdapter.ImportRequest(tenantId, batch.id, upload.getOriginalFilename(), input));
+                var preview = new ErpImportAdapter.ImportPreview(CanonicalImportNormalizer.normalize(parsed.rows(), adapter.sourceType().name()));
                 int sourceRow = 1;
                 for (var values : preview.rows()) {
                     var raw = new LegacyImportRawRow();
@@ -388,6 +389,7 @@ public class ImportService {
         var warnedAutoCreateWarehouses = new HashSet<String>();
         for (var row : productRows) {
             var rowErrors = new ArrayList<ImportError>();
+            if (hasRaw(row, "GST Mapping Error")) rowErrors.add(error(tenantId, batchId, row.rowNumber, "PRODUCT", "gstPercentage", "INVALID_GST_MAPPING", raw(row, "GST Mapping Error"), "ERROR", raw(row,"GST Rate Evidence"), "Correct the effective GST duty rates in the export."));
             if (row.productName == null || row.productName.isBlank()) {
                 rowErrors.add(error(tenantId, batchId, row.rowNumber, "PRODUCT", "productName", "PRODUCT_NAME_REQUIRED", "Product name is required", "ERROR", raw(row, "productName", "Product Name", "Item Name"), "Map item name/product name to productName."));
             }
@@ -901,7 +903,7 @@ public class ImportService {
             if (type == DomainEnums.MovementType.SALE && invoiceNumber != null) {
                 var invoice = salesByInvoice.computeIfAbsent(invoiceKey(row, false), ignored -> createImportedSalesInvoice(tenantId, row, warehouse.id));
                 recordCreatedEffect(tenantId, batchId, DomainEnums.ImportEffectEntityType.SALES_INVOICE, invoice.id, false, Map.of("invoiceNumber", invoice.invoiceNumber));
-                addImportedSalesItem(tenantId, invoice, product, row);
+                addImportedSalesItem(tenantId, invoice, product, row, warehouse.id);
                 salesInvoiceItemsCreated++;
                 referenceType = "SALES_INVOICE";
                 referenceId = invoice.id;
@@ -1137,12 +1139,13 @@ public class ImportService {
         return salesInvoices.save(invoice);
     }
 
-    private void addImportedSalesItem(UUID tenantId, SalesInvoice invoice, Product product, StagingStockMovement row) {
+    private void addImportedSalesItem(UUID tenantId, SalesInvoice invoice, Product product, StagingStockMovement row, UUID warehouseId) {
         var quantity = nvl(row.quantity).abs();
         var rate = nvl(row.rate);
         var item = new SalesInvoiceItem();
         item.tenantId = tenantId;
         item.salesInvoiceId = invoice.id;
+        item.warehouseId = warehouseId;
         item.productId = product.id;
         item.quantity = quantity;
         item.unitId = product.baseUnitId;

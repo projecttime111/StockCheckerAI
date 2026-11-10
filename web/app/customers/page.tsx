@@ -12,7 +12,7 @@ import { StatCard } from "@/components/StatCard";
 import { api, localDate, newOperationId, Page } from "@/lib/api";
 import { Permission, useAccess, useMoney } from "@/lib/business";
 
-type Customer = { id: string; name: string; phone?: string; email?: string; gstin?: string; creditLimit: number; outstanding: number };
+type Customer = { id: string; name: string; phone?: string; email?: string; gstin?: string; creditLimit: number; outstanding: number | null };
 type Reminder = {
   id: string;
   customerId: string;

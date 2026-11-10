@@ -6,7 +6,13 @@ import { AppShell } from "@/components/AppShell";
 import { PrimaryButton } from "@/components/FormControls";
 import { Panel } from "@/components/Panel";
 import { apiText } from "@/lib/api";
-import { Permission, useAccess } from "@/lib/business";
+import { useAccess } from "@/lib/business";
+
+const reportPermissions: Record<string, string> = {
+  "products": "products.view", "customers": "customers.view_outstanding", "suppliers": "suppliers.view",
+  "purchases": "purchases.view_cost", "sales": "sales.view", "audit-logs": "audit.view",
+  "reorder-suggestions": "reorder.view", "dead-stock": "dead_stock.view"
+};
 
 const reports = [
   { id: "current-stock", name: "Current Stock", description: "Warehouse-wise quantity and stock value from the ledger." },
@@ -64,10 +70,10 @@ export default function ReportsPage() {
                     <p className="mt-1 min-h-10 text-sm text-ink/55">{report.description}</p>
                   </div>
                 </div>
-                <Permission permission="reports.export"><PrimaryButton className="mt-4 w-full gap-2" onClick={() => download(report.id)} disabled={downloading === report.id}>
+                {can("reports.export") && can(reportPermissions[report.id] ?? "stock.view") ? <PrimaryButton className="mt-4 w-full gap-2" onClick={() => download(report.id)} disabled={downloading === report.id}>
                   <Download size={16} />
                   {downloading === report.id ? "Preparing..." : "Download CSV"}
-                </PrimaryButton></Permission>
+                </PrimaryButton> : <p className="mt-4 text-xs text-ink/55">Your role cannot export this report.</p>}
               </div>
             ))}
           </div>

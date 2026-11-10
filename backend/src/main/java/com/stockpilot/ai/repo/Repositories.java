@@ -136,6 +136,8 @@ public final class Repositories {
         List<StockMovement> findByTenantIdAndTransferLineFingerprint(UUID tenantId, String transferLineFingerprint);
         List<StockMovement> findByTenantIdAndMovementTypeAndMovementDateAfter(UUID tenantId, DomainEnums.MovementType movementType, Instant after);
         Optional<StockMovement> findFirstByTenantIdAndProductIdAndMovementTypeOrderByMovementDateDesc(UUID tenantId, UUID productId, DomainEnums.MovementType movementType);
+        @Query("select m from StockMovement m where m.tenantId=:tenantId and m.productId=:productId and m.movementType=:movementType and (m.decisionReason is null or m.decisionReason<>'SOURCE_REVISION_SUPERSEDED') order by m.movementDate desc,m.createdAt desc")
+        List<StockMovement> latestCurrentCost(@Param("tenantId") UUID tenantId,@Param("productId") UUID productId,@Param("movementType") DomainEnums.MovementType movementType,Pageable pageable);
 
         @Query(value = """
             select coalesce(sum(base_quantity), 0)

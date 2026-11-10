@@ -14,6 +14,8 @@ spring:
   cache:
     type: simple
 app:
+  import-jobs:
+    enabled: false
   jwt:
     secret: test-secret-test-secret-test-secret-test-secret-test-secret-test-secret
     access-token-minutes: 60

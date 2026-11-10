@@ -167,7 +167,7 @@ class LaunchAuditRegressionTest {
         snapshot.snapshotDate = LocalDate.of(2026, 8, 31); snapshot.outstandingAmount = new BigDecimal("570");
         saveSnapshot(snapshot);
         var answer = postJson(token, "/api/ai/assistant/chat", "{\"message\":\"customer outstanding\"}");
-        assertThat(answer.path("evidence").path("customerOutstanding").get(0).path("Snapshot Customer").decimalValue()).isEqualByComparingTo("570");
+        assertThat(answer.path("evidence").path("receivables").path("data").get(0).path("outstanding").decimalValue()).isEqualByComparingTo("570");
     }
 
     @ParameterizedTest

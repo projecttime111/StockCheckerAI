@@ -20,4 +20,8 @@ public class AiMessage extends TenantOwnedEntity {
     public String content;
     @JdbcTypeCode(SqlTypes.JSON)
     public Map<String, Object> evidenceJson = new HashMap<>();
+    public UUID requestId;
+    public String status;
+    @JdbcTypeCode(SqlTypes.JSON)
+    public java.util.Set<String> requiredPermissions = new java.util.HashSet<>();
 }

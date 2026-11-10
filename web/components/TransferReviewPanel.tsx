@@ -5,7 +5,7 @@ import { useState } from "react";
 import { EmptyState } from "@/components/EmptyState";
 import { Field, PrimaryButton, SecondaryButton, TextInput } from "@/components/FormControls";
 import { RecordPicker } from "@/components/RecordPicker";
-import { QueryFeedback } from "@/components/QueryFeedback";
+import { MutationFeedback, QueryFeedback } from "@/components/QueryFeedback";
 import { LoadingState } from "@/components/LoadingState";
 import { api } from "@/lib/api";
 
@@ -76,13 +76,15 @@ export function TransferReviewPanel({ sessionId }: { sessionId: string }) {
   });
 
   if (reviews.isLoading) return <LoadingState label="Loading stock-journal review items..." />;
+  if (reviews.error) return <QueryFeedback queries={[reviews]} />;
   if (!reviews.data?.length) {
-    return <EmptyState label="No stock journals were staged for transfer review." />;
+    return <div className="space-y-3"><MutationFeedback mutation={resolve} success="Transfer review decision saved." /><EmptyState label="No stock journals were staged for transfer review." /></div>;
   }
 
   return (
     <div className="space-y-4">
       <QueryFeedback queries={[warehouses]} />
+      <MutationFeedback mutation={resolve} success="Transfer review decision saved. Refresh the dry run before committing." />
       <p className="text-sm leading-6 text-ink/65">
         Confirm only balanced movement of the same product between two different warehouses.
         Manufacturing and unbalanced journals remain deferred. Posting always creates one linked
@@ -165,7 +167,6 @@ export function TransferReviewPanel({ sessionId }: { sessionId: string }) {
               Keep unresolved
             </SecondaryButton>
           </div>
-          {resolve.error ? <p className="text-sm text-coral sm:col-span-2">{resolve.error.message}</p> : null}
         </div>
       ) : null}
     </div>

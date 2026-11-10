@@ -11,11 +11,14 @@ import java.util.UUID;
 public class SalesInvoiceItem extends TenantOwnedEntity {
     public UUID salesInvoiceId;
     public UUID productId;
+    public UUID warehouseId;
+    @jakarta.persistence.Column(precision = 14, scale = 3)
     public BigDecimal quantity = BigDecimal.ZERO;
     public UUID unitId;
     public BigDecimal rate = BigDecimal.ZERO;
     @jakarta.persistence.Column(precision = 24, scale = 12)
     public BigDecimal costRate = BigDecimal.ZERO;
+    public String costProvenance = "ESTIMATED_CURRENT_COST";
     public BigDecimal taxPercentage = BigDecimal.ZERO;
     public BigDecimal taxAmount = BigDecimal.ZERO;
     public BigDecimal discountAmount = BigDecimal.ZERO;

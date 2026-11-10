@@ -57,7 +57,7 @@ public class GenericExcelImportAdapter implements ErpImportAdapter {
         }
     }
 
-    private String cellValue(org.apache.poi.ss.usermodel.Cell cell, DataFormatter formatter,
+    static String cellValue(org.apache.poi.ss.usermodel.Cell cell, DataFormatter formatter,
                              org.apache.poi.ss.usermodel.FormulaEvaluator evaluator) {
         if (cell == null) return "";
         if (cell.getCellType() == org.apache.poi.ss.usermodel.CellType.FORMULA) evaluator.evaluateFormulaCell(cell);

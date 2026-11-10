@@ -23,4 +23,6 @@ public class ForecastResult extends TenantOwnedEntity {
     public BigDecimal currentStock = BigDecimal.ZERO;
     public LocalDate stockoutDate;
     public Instant generatedAt = Instant.now();
+    public int coverageDays;
+    public boolean coverageConfirmed;
 }

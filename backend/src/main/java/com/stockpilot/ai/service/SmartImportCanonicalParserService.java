@@ -52,7 +52,7 @@ public class SmartImportCanonicalParserService {
             if (adapter == null) {
                 throw new IllegalArgumentException("No parser is available for " + file.originalFileName);
             }
-            return adapter.parse(new ErpImportAdapter.ImportRequest(tenantId, sessionId, file.originalFileName, input)).rows();
+            return CanonicalImportNormalizer.normalize(adapter.parse(new ErpImportAdapter.ImportRequest(tenantId, sessionId, file.originalFileName, input)).rows(), adapter.sourceType().name());
         } catch (Exception ex) {
             throw new IllegalArgumentException("Could not stage " + file.originalFileName + ": " + safeMessage(ex), ex);
         }

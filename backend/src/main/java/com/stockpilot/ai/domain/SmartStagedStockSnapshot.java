@@ -24,12 +24,15 @@ public class SmartStagedStockSnapshot extends TenantOwnedEntity {
     public String unitCode;
     public String warehouseName;
     public LocalDate snapshotDate;
+    @jakarta.persistence.Column(precision=14, scale=3)
     public BigDecimal importedStock = BigDecimal.ZERO;
     public BigDecimal rate;
     public BigDecimal stockValue;
     public UUID matchedProductId;
     public UUID matchedWarehouseId;
+    @jakarta.persistence.Column(precision=14, scale=3)
     public BigDecimal currentStock = BigDecimal.ZERO;
+    @jakarta.persistence.Column(precision=14, scale=3)
     public BigDecimal deltaPreview = BigDecimal.ZERO;
     @Enumerated(EnumType.STRING)
     public DomainEnums.SmartSnapshotAction action = DomainEnums.SmartSnapshotAction.REVIEW_REQUIRED;

@@ -32,8 +32,9 @@ public class CustomerController {
     private final AuditService audit;
     private final OutstandingService outstanding;
     private final com.stockpilot.ai.service.CustomerPaymentService paymentService;
+    private final com.stockpilot.ai.service.PermissionService permissions;
 
-    public CustomerController(Repositories.CustomerRepository customers, Repositories.SalesInvoiceRepository invoices, Repositories.CustomerPaymentRepository payments, Repositories.PaymentReminderRepository reminders, AuditService audit, OutstandingService outstanding, com.stockpilot.ai.service.CustomerPaymentService paymentService) {
+    public CustomerController(Repositories.CustomerRepository customers, Repositories.SalesInvoiceRepository invoices, Repositories.CustomerPaymentRepository payments, Repositories.PaymentReminderRepository reminders, AuditService audit, OutstandingService outstanding, com.stockpilot.ai.service.CustomerPaymentService paymentService, com.stockpilot.ai.service.PermissionService permissions) {
         this.customers = customers;
         this.invoices = invoices;
         this.payments = payments;
@@ -41,6 +42,7 @@ public class CustomerController {
         this.audit = audit;
         this.outstanding = outstanding;
         this.paymentService = paymentService;
+        this.permissions = permissions;
     }
 
     @GetMapping
@@ -131,7 +133,7 @@ public class CustomerController {
     }
 
     private ApiDtos.CustomerResponse response(Customer customer) {
-        return new ApiDtos.CustomerResponse(customer.id, customer.name, customer.phone, customer.email, customer.gstin, customer.creditLimit, outstandingFor(customer.id));
+        return new ApiDtos.CustomerResponse(customer.id, customer.name, customer.phone, customer.email, customer.gstin, customer.creditLimit, permissions.has("customers.view_outstanding") ? outstandingFor(customer.id) : null);
     }
 
     private ApiDtos.PaymentReminderResponse reminderResponse(PaymentReminder reminder) {

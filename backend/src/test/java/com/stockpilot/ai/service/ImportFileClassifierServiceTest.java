@@ -114,6 +114,54 @@ class ImportFileClassifierServiceTest {
         assertThat(result.confidence()).isLessThan(new BigDecimal("0.50"));
     }
 
+    @Test
+    void classifiesExplicitSalesPurchaseAndMixedRowsInCsvAndExcel() throws Exception {
+        for (boolean excel:new boolean[]{false,true}) {
+            assertThat(tabular(excel,"Sales").detectedFileType()).isEqualTo(DomainEnums.DetectedFileType.SALES_VOUCHERS);
+            assertThat(tabular(excel,"Purchase").detectedFileType()).isEqualTo(DomainEnums.DetectedFileType.PURCHASE_VOUCHERS);
+            var mixed=tabular(excel,"Sales","Purchase");
+            assertThat(mixed.detectedFileType()).isEqualTo(DomainEnums.DetectedFileType.MIXED_TALLY_VOUCHERS);
+            assertThat(mixed.rowCount()).isEqualTo(2);
+            assertThat(mixed.companyName()).isEqualTo("Sales Company");
+            assertThat(mixed.dateRangeStart()).hasToString("2026-06-15");
+        }
+    }
+
+    @Test
+    void unsupportedOrMissingTypesStayUnknownDespiteSalesAndPurchaseInNames() throws Exception {
+        for(boolean excel:new boolean[]{false,true}) {
+            assertThat(tabular(excel,"").detectedFileType()).isEqualTo(DomainEnums.DetectedFileType.UNKNOWN);
+            assertThat(tabular(excel,"Sales","Custom Adjustment").detectedFileType()).isEqualTo(DomainEnums.DetectedFileType.UNKNOWN);
+        }
+    }
+
+    @Test
+    void quotedCsvNewlinesDoNotShiftVoucherTypeOrDateColumns() throws Exception {
+        var text="Voucher Number,Product Name,Voucher Type,Date,Party Name,Quantity,Rate,Amount,Unit,Warehouse\nS-1,\"Purchase widget\nextra name\",Sales,2026-06-15,Buyer,2,15,30,PCS,Main\n";
+        var result=classifier.classify("export.csv",new java.io.ByteArrayInputStream(text.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        assertThat(result.detectedFileType()).isEqualTo(DomainEnums.DetectedFileType.SALES_VOUCHERS);
+        assertThat(result.rowCount()).isEqualTo(1);
+    }
+
+    private ImportFileClassifierService.DetectionResult tabular(boolean excel,String... types) throws Exception {
+        var headers=new String[]{"Voucher Number","Notes","Voucher Type","Date","Party Name","Product Name","Quantity","Rate","Amount","Unit","Warehouse","Company Name"};
+        if(!excel) {
+            var text=new StringBuilder(String.join(",",headers)+"\n");
+            for(int i=0;i<types.length;i++) text.append("V-").append(i).append(",,").append(types[i]).append(",2026-06-15,Buyer,Purchase Widget,2,15,30,PCS,Main,Sales Company\n");
+            return classifier.classify("export.csv",new java.io.ByteArrayInputStream(text.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        }
+        try(var workbook=new org.apache.poi.xssf.usermodel.XSSFWorkbook();var bytes=new java.io.ByteArrayOutputStream()) {
+            var sheet=workbook.createSheet();var header=sheet.createRow(0);
+            for(int c=0;c<headers.length;c++)header.createCell(c).setCellValue(headers[c]);
+            for(int i=0;i<types.length;i++) {
+                var row=sheet.createRow(i+1);row.createCell(0).setCellValue("V-"+i); // Column1 deliberately absent.
+                row.createCell(2).setCellValue(types[i]);row.createCell(3).setCellValue("2026-06-15");row.createCell(4).setCellValue("Buyer");row.createCell(5).setCellValue("Purchase Widget");
+                row.createCell(6).setCellValue(2);row.createCell(7).setCellValue(15);row.createCell(8).setCellFormula("G"+(i+2)+"*H"+(i+2));row.createCell(9).setCellValue("PCS");row.createCell(10).setCellValue("Main");row.createCell(11).setCellValue("Sales Company");
+            }
+            workbook.write(bytes);return classifier.classify("export.xlsx",new java.io.ByteArrayInputStream(bytes.toByteArray()));
+        }
+    }
+
     private ImportFileClassifierService.DetectionResult classify(String fileName) throws Exception {
         try (InputStream input = getClass().getResourceAsStream("/import-fixtures/smart-session/" + fileName)) {
             assertThat(input).as(fileName).isNotNull();
